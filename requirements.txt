@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+websockets
+langgraph
+langchain-google-genai
+langchain-ollama
+langchain-community
+python-dotenv
+duckduckgo-search
+googlesearch-python
+python-jose[cryptography]
+passlib[bcrypt]
+python-docx
+python-pptx
+markdown
+beautifulsoup4

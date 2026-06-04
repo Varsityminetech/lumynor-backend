@@ -1,0 +1,11 @@
+{
+  "enabled": false,
+  "niche": "Agentic AI & Web Development",
+  "frequency": "Daily",
+  "last_posted_at": null,
+  "keywords": "AI agent, SaaS development, automation",
+  "llmProvider": "local",
+  "llmModelName": "qwen2.5:latest",
+  "llmApiKey": "",
+  "llmBaseUrl": "http://localhost:11434"
+}

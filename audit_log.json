@@ -1,0 +1,209 @@
+[
+  {
+    "timestamp": "2026-04-16T20:04:24.961779",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "R&D",
+    "note": "R&D"
+  },
+  {
+    "timestamp": "2026-04-16T20:04:39.943876",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "Design",
+    "note": "Design"
+  },
+  {
+    "timestamp": "2026-04-16T20:05:05.400176",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "Engineering",
+    "note": "Engineering"
+  },
+  {
+    "timestamp": "2026-04-16T20:11:30.175441",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "REJECTED",
+    "department": "R&D",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-16T20:25:14.885670",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "R&D",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-16T20:25:21.758230",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "Design",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-16T20:25:26.934617",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "Engineering",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-16T20:25:33.167088",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "Security & Legal",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-16T20:25:38.737437",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "Marketing",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-16T20:25:44.197850",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "Content Creator",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-16T21:11:48.587188",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "REJECTED",
+    "department": "R&D",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-16T21:19:37.810635",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "REJECTED",
+    "department": "R&D",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-23T20:09:28.686406",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "REJECTED",
+    "department": "R&D",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-23T20:37:38.652280",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "R&D",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-23T20:51:51.086257",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "R&D",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-23T20:53:09.272606",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "Design",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-23T20:54:44.704877",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "Engineering",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-23T20:57:33.589787",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "Security & Legal",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-23T20:59:42.028108",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "Marketing",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-23T21:19:34.113647",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "R&D",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-23T21:22:30.029628",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "APPROVED",
+    "department": "Design",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-23T21:29:29.914474",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "REJECTED",
+    "department": "R&D",
+    "note": ""
+  },
+  {
+    "timestamp": "2026-04-23T21:58:19.453692",
+    "user_email": "admin@lumynor.com",
+    "user_name": "CEO",
+    "user_role": "ceo",
+    "action": "REJECTED",
+    "department": "R&D",
+    "note": ""
+  }
+]
