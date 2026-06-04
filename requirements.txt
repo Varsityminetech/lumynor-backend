@@ -9,7 +9,7 @@ python-dotenv
 duckduckgo-search
 googlesearch-python
 python-jose[cryptography]
-passlib[bcrypt]
+bcrypt
 python-docx
 python-pptx
 markdown

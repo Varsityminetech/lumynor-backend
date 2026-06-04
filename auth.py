@@ -1,15 +1,13 @@
 import json
 import os
+import bcrypt
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 
 SECRET_KEY = os.getenv("SECRET_KEY", "lumynor-super-secret-key-change-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 8
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 USERS_FILE = os.path.join(os.path.dirname(__file__), "users.json")
 AUDIT_FILE = os.path.join(os.path.dirname(__file__), "audit_log.json")
@@ -20,6 +18,15 @@ DEFAULT_USERS = [
     {"email": "observer2@lumynor.com", "name": "Observer 2", "role": "observer", "password": "lumynor_obs2_2024"},
 ]
 
+def _hash(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+def _verify(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
 def seed_users():
     if not os.path.exists(USERS_FILE):
         hashed = []
@@ -28,7 +35,7 @@ def seed_users():
                 "email": u["email"],
                 "name":  u["name"],
                 "role":  u["role"],
-                "hashed_password": pwd_context.hash(u["password"])
+                "hashed_password": _hash(u["password"])
             })
         with open(USERS_FILE, "w") as f:
             json.dump(hashed, f, indent=2)
@@ -50,7 +57,7 @@ def update_user_credentials(old_email: str, new_email: str, new_password: str = 
         if user["email"] == old_email:
             user["email"] = new_email
             if new_password:
-                user["hashed_password"] = pwd_context.hash(new_password)
+                user["hashed_password"] = _hash(new_password)
             updated = True
             break
     if updated:
@@ -59,12 +66,12 @@ def update_user_credentials(old_email: str, new_email: str, new_password: str = 
     return updated
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    return _verify(plain, hashed)
 
 def authenticate_user(email: str, password: str) -> Optional[dict]:
     users = load_users()
     for user in users:
-        if user["email"] == email and verify_password(password, user["hashed_password"]):
+        if user["email"] == email and _verify(password, user["hashed_password"]):
             return user
     return None
 
