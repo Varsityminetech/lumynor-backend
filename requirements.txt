@@ -6,6 +6,7 @@ langchain-google-genai
 langchain-ollama
 langchain-community
 python-dotenv
+ddgs
 duckduckgo-search
 googlesearch-python
 python-jose[cryptography]

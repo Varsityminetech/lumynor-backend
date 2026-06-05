@@ -576,6 +576,27 @@ def update_blog(blog_id: str, req: BlogSaveRequest):
             return {"status": "success", "blog": updated}
     raise HTTPException(status_code=404, detail="Blog post not found")
 
+@app.patch("/api/blogs/{blog_id}")
+def patch_blog(blog_id: str, req: dict):
+    """
+    Partial update — merges provided fields into the existing blog without
+    losing AI-generated metadata (faq, references, images, seoScore, tags).
+    Use this to manually insert backlinks / affiliate links into content,
+    toggle published status, or tweak any single field — even after publishing.
+    """
+    blogs = read_json_file(BLOGS_FILE, [])
+    for idx, blog in enumerate(blogs):
+        if blog.get("id") == blog_id:
+            # Only update provided keys; preserve everything else
+            for key, value in req.items():
+                if key not in ("id", "created_at"):
+                    blog[key] = value
+            blog["updated_at"] = datetime.utcnow().isoformat()
+            blogs[idx] = blog
+            write_json_file(BLOGS_FILE, blogs)
+            return {"status": "success", "blog": blog}
+    raise HTTPException(status_code=404, detail="Blog post not found")
+
 @app.delete("/api/blogs/{blog_id}")
 def delete_blog(blog_id: str):
     blogs = read_json_file(BLOGS_FILE, [])
@@ -863,7 +884,10 @@ def update_auto_blog_settings(req: AutoBlogSettingsUpdateRequest):
 
 def fetch_trending_search(niche: str):
     try:
-        from duckduckgo_search import DDGS
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
         with DDGS() as ddgs:
             results = ddgs.text(f"{niche} industry news 2026", max_results=3)
             if results:
@@ -1049,6 +1073,205 @@ async def auto_blogger_daemon():
                 
         except Exception as e:
             print(f"\U0001f525 Auto-Blogger Daemon Error: {e}")
+
+# ── ENHANCED AUTO-BLOG PIPELINE ENDPOINTS ──────────────────────────────────────
+
+from auto_blogger import run_auto_blog_pipeline, research_trending_topics
+
+class AutoBlogRunRequest(BaseModel):
+    niche: str = ""
+    keywords: str = ""
+    author: str = ""
+    category: str = ""
+    auto_publish: bool = False
+    nanobanana_key: str = ""
+    nanobanana_url: str = ""
+    gemini_api_key: str = ""
+
+@app.post("/api/blogs/auto-generate")
+async def auto_generate_blog(req: AutoBlogRunRequest):
+    """Full auto-blog pipeline: trending research → keyword research → longform writing → images → SEO."""
+    # Merge request with saved settings
+    settings = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
+
+    merged_settings = {
+        "niche": req.niche or settings.get("niche", "Technology"),
+        "keywords": req.keywords or settings.get("topics", ""),
+        "author": req.author or settings.get("author", "Lumynor Team"),
+        "category": req.category or settings.get("category", "Technology"),
+        "auto_publish": req.auto_publish if req.auto_publish else settings.get("auto_publish", False),
+        "nanobanana_key": req.nanobanana_key or settings.get("nanobanana_key", ""),
+        "nanobanana_url": req.nanobanana_url or settings.get("nanobanana_url", ""),
+    }
+
+    gemini_key = req.gemini_api_key or settings.get("llmApiKey") or os.getenv("GEMINI_API_KEY")
+    if not gemini_key:
+        raise HTTPException(status_code=400, detail="Gemini API key is required. Set it in Settings or provide in request.")
+
+    try:
+        loop = asyncio.get_event_loop()
+        blog_object = await loop.run_in_executor(None, run_auto_blog_pipeline, merged_settings, gemini_key)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Auto-blog pipeline failed: {str(e)}")
+
+    # Save to blogs.json
+    blogs = read_json_file(BLOGS_FILE, [])
+    new_blog = {
+        "id": str(uuid.uuid4()),
+        **blog_object,
+        "created_at": datetime.utcnow().isoformat(),
+        "is_auto_posted": True,
+    }
+    blogs.append(new_blog)
+    write_json_file(BLOGS_FILE, blogs)
+
+    # Update auto-blog runtime settings
+    settings["last_run"] = datetime.utcnow().isoformat()
+    settings["run_count"] = settings.get("run_count", 0) + 1
+    write_json_file(AUTO_BLOG_SETTINGS_FILE, settings)
+
+    await manager.broadcast({
+        "type": "blog_published",
+        "blog": new_blog,
+        "message": f"📰 Auto-Blogger published: '{new_blog['title']}' (SEO Score: {new_blog.get('seoScore', 'N/A')}/100)"
+    })
+
+    return {
+        "status": "success",
+        "blog": new_blog,
+        "pipeline_log": blog_object.get("pipelineLog", []),
+        "seo_report": {
+            "score": new_blog.get("seoScore"),
+            "grade": new_blog.get("seoGrade"),
+            "word_count": new_blog.get("wordCount"),
+        }
+    }
+
+
+@app.get("/api/blogs/trending")
+async def get_trending_topics(niche: str = "Technology", keywords: str = ""):
+    """Get trending topic suggestions for a niche without generating a full blog."""
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_key:
+        raise HTTPException(status_code=400, detail="GEMINI_API_KEY not set")
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, research_trending_topics, niche, keywords, gemini_key)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ImageGenerateRequest(BaseModel):
+    prompt: str
+    width: int = 1200
+    height: int = 630
+    nanobanana_key: str = ""
+    nanobanana_url: str = ""
+
+@app.post("/api/images/generate")
+def generate_image(req: ImageGenerateRequest):
+    """Generate an AI image via Nanobanana (or fallback placeholder)."""
+    import urllib.parse
+    nanobanana_key = req.nanobanana_key or os.getenv("NANOBANANA_API_KEY", "")
+    nanobanana_url = req.nanobanana_url or os.getenv("NANOBANANA_API_URL", "")
+    image_url = None
+
+    if nanobanana_key and nanobanana_url:
+        try:
+            api_endpoint = nanobanana_url.rstrip("/")
+            payload = json.dumps({
+                "prompt": req.prompt,
+                "width": req.width,
+                "height": req.height,
+            }).encode("utf-8")
+            http_req = urllib.request.Request(
+                f"{api_endpoint}/generate",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {nanobanana_key}"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(http_req, timeout=30) as resp:
+                resp_data = json.loads(resp.read().decode())
+                image_url = resp_data.get("url") or resp_data.get("image_url") or resp_data.get("data", {}).get("url")
+        except Exception as e:
+            print(f"[image_gen] Nanobanana error: {e}")
+
+    if not image_url:
+        encoded = urllib.parse.quote(req.prompt[:80])
+        image_url = f"https://placehold.co/{req.width}x{req.height}/0a0e1a/00f0ff?text={encoded}"
+
+    return {"url": image_url, "prompt": req.prompt}
+
+
+# ── PATCH: update auto-blog settings to include Nanobanana fields ──────────────
+# Override the existing AutoBlogSettingsUpdateRequest to include new fields
+class AutoBlogSettingsUpdateRequestV2(BaseModel):
+    enabled: bool = False
+    niche: str = "Agentic AI & Software Development"
+    topics: str = ""
+    keywords: str = ""
+    frequency_hours: int = 24
+    author: str = "Danish"
+    category: str = "Agentic AI"
+    auto_publish: bool = True
+    tone: str = "Technical Expert"
+    llmProvider: str = "api"
+    llmApiName: str = "gemini"
+    llmModelName: str = "gemini-2.5-flash"
+    llmApiKey: str = ""
+    llmBaseUrl: str = ""
+    nanobanana_key: str = ""
+    nanobanana_url: str = ""
+
+@app.post("/api/system/auto-blog-settings/v2")
+def update_auto_blog_settings_v2(req: AutoBlogSettingsUpdateRequestV2):
+    existing = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
+    updated = {**existing, **req.dict()}
+    write_json_file(AUTO_BLOG_SETTINGS_FILE, updated)
+    return updated
+
+
+# ── ENHANCED GENERATE_AND_POST to use the new pipeline ─────────────────────────
+async def generate_and_post_auto_blog_v2(settings: dict):
+    """Enhanced auto-blog posting using the full pipeline."""
+    gemini_key = settings.get("llmApiKey") or os.getenv("GEMINI_API_KEY")
+    if not gemini_key:
+        print("[auto_blogger] No Gemini key — falling back to legacy generator")
+        await generate_and_post_auto_blog(settings)
+        return
+
+    try:
+        loop = asyncio.get_event_loop()
+        blog_object = await loop.run_in_executor(None, run_auto_blog_pipeline, settings, gemini_key)
+
+        blogs = read_json_file(BLOGS_FILE, [])
+        new_blog = {
+            "id": str(uuid.uuid4()),
+            **blog_object,
+            "created_at": datetime.utcnow().isoformat(),
+            "is_auto_posted": True,
+        }
+        blogs.append(new_blog)
+        write_json_file(BLOGS_FILE, blogs)
+
+        settings["last_run"] = datetime.utcnow().isoformat()
+        settings["run_count"] = settings.get("run_count", 0) + 1
+        write_json_file(AUTO_BLOG_SETTINGS_FILE, settings)
+
+        await manager.broadcast({
+            "type": "blog_published",
+            "blog": new_blog,
+            "message": f"📰 Auto-Blogger published: '{new_blog['title']}' (SEO: {new_blog.get('seoScore')}/100)"
+        })
+        print(f"[auto_blogger] Published: {new_blog['title']} (SEO {new_blog.get('seoScore')}/100)")
+    except Exception as e:
+        print(f"[auto_blogger_v2] Error: {e} — falling back to legacy")
+        await generate_and_post_auto_blog(settings)
+
 
 @app.on_event("startup")
 async def startup_event():
