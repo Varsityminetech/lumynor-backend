@@ -530,8 +530,15 @@ def validate_seo(blog: dict) -> dict:
     else:
         issues.append("No outbound links / references")
 
-    # Images
-    if "img" in content or blog.get("cover_image"):
+    # Images (check content, cover, or generated image_prompts/images array)
+    has_images = (
+        "<img" in content
+        or blog.get("cover_image")
+        or blog.get("coverImage")
+        or blog.get("images")
+        or blog.get("image_prompts")
+    )
+    if has_images:
         score += 5
     else:
         issues.append("No images found")
@@ -549,6 +556,61 @@ def validate_seo(blog: dict) -> dict:
         "issues": issues,
         "fixes": fixes
     }
+
+
+# ── STAGE 6b: SEO REFINEMENT (auto-fix to hit 90+) ────────────────────────────
+
+def refine_blog_seo(blog: dict, seo_report: dict, gemini_key: str) -> dict:
+    """Run one targeted Gemini pass to fix SEO issues and push score to 90+."""
+    issues = seo_report.get("issues", [])
+    if not issues:
+        return blog
+
+    primary_kw = blog.get("primary_keyword", "")
+    issues_text = "\n".join([f"- {i}" for i in issues])
+
+    prompt = f"""You are an SEO editor. A blog post scored {seo_report.get('score')}/100. Fix ONLY these specific SEO issues while keeping the content's voice, quality, and human tone intact:
+
+ISSUES TO FIX:
+{issues_text}
+
+PRIMARY KEYWORD: {primary_kw}
+
+CURRENT TITLE: {blog.get('title', '')}
+CURRENT META DESCRIPTION: {blog.get('meta_description', '')}
+
+SEO RULES TO ENFORCE:
+1. Title: 40-60 chars, MUST contain "{primary_kw}"
+2. Meta description: 130-160 chars, MUST contain "{primary_kw}" + a call-to-action
+3. Primary keyword density 0.8-2.0% (appears naturally, not stuffed)
+4. Primary keyword in first paragraph and in at least 2 H2 headings
+5. At least 4 H2 headings
+6. Keep all existing references, links, and structure
+
+CURRENT CONTENT HTML:
+{blog.get('content_html', '')[:6000]}
+
+Respond ONLY with JSON containing the FIXED versions:
+{{
+  "title": "fixed SEO title (40-60 chars with keyword)",
+  "meta_description": "fixed meta description (130-160 chars with keyword + CTA)",
+  "content_html": "the FULL fixed HTML content with keyword optimizations applied"
+}}"""
+
+    try:
+        result = _gemini(prompt, gemini_key, json_mode=True, timeout=90)
+        fixed = json.loads(result)
+        if fixed.get("title"):
+            blog["title"] = fixed["title"]
+        if fixed.get("meta_description"):
+            blog["meta_description"] = fixed["meta_description"]
+        if fixed.get("content_html") and len(fixed["content_html"]) > 500:
+            # Preserve the references section if it was appended
+            blog["content_html"] = fixed["content_html"]
+        return blog
+    except Exception as e:
+        print(f"[refine_seo] Error: {e}")
+        return blog
 
 
 # ── MASTER PIPELINE ───────────────────────────────────────────────────────────
@@ -602,6 +664,7 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
     image_prompts = blog_content.get("image_prompts", [])
     log.append(f"🖼️ Generating {len(image_prompts)} images...")
     images = generate_blog_images(image_prompts, nanobanana_key, nanobanana_url)
+    blog_content["images"] = images  # so SEO validator sees them
 
     # Set cover image
     cover_image = ""
@@ -610,9 +673,26 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
             cover_image = img["url"]
             break
 
-    # Stage 6: SEO validation
+    # Stage 6: SEO validation + refinement loop (target 90+)
     seo_report = validate_seo(blog_content)
-    log.append(f"✅ SEO Score: {seo_report['score']}/100 (Grade {seo_report['grade']})")
+    log.append(f"📊 Initial SEO Score: {seo_report['score']}/100 (Grade {seo_report['grade']})")
+
+    if seo_report["score"] < 90 and seo_report.get("issues"):
+        log.append(f"🔧 Refining SEO ({len(seo_report['issues'])} issues to fix)...")
+        blog_content = refine_blog_seo(blog_content, seo_report, gemini_key)
+        # Re-inject references if refinement stripped them
+        refs = research.get("references", [])
+        if refs and "References" not in blog_content.get("content_html", ""):
+            ref_html = "<h2>References &amp; Sources</h2><ol>"
+            for r in refs[:6]:
+                ref_html += f'<li><a href="{r["url"]}" target="_blank" rel="noopener noreferrer">{r["title"]}</a></li>'
+            ref_html += "</ol>"
+            blog_content["content_html"] = blog_content["content_html"].rstrip() + "\n" + ref_html
+        word_count = len(re.sub('<[^>]+>', '', blog_content.get("content_html", "")).split())
+        seo_report = validate_seo(blog_content)
+        log.append(f"✅ Refined SEO Score: {seo_report['score']}/100 (Grade {seo_report['grade']})")
+    else:
+        log.append(f"✅ SEO Score: {seo_report['score']}/100 (Grade {seo_report['grade']})")
 
     # Build final blog object
     now = datetime.utcnow()
