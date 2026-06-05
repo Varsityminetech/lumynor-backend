@@ -489,28 +489,38 @@ def validate_seo(blog: dict) -> dict:
     primary_kw = blog.get("primary_keyword", "").lower()
     faq = blog.get("faq", [])
 
+    # Keyword presence helper: exact phrase OR all significant component words present
+    def _kw_present(text):
+        t = text.lower()
+        if not primary_kw:
+            return False
+        if primary_kw in t:
+            return True
+        kw_words = [w for w in primary_kw.split() if len(w) > 2]
+        return bool(kw_words) and all(w in t for w in kw_words)
+
     # Title checks
-    if primary_kw in title.lower():
+    if _kw_present(title):
         score += 15
     else:
         issues.append("Primary keyword missing from title")
         fixes.append(f"Add '{primary_kw}' to title")
 
-    if 40 <= len(title) <= 65:
+    if 35 <= len(title) <= 70:
         score += 5
     else:
-        issues.append(f"Title length {len(title)} (ideal: 40-65)")
+        issues.append(f"Title length {len(title)} (ideal: 35-70)")
 
     # Meta description
-    if meta_desc and primary_kw in meta_desc.lower():
+    if meta_desc and _kw_present(meta_desc):
         score += 10
     else:
         issues.append("Primary keyword missing from meta description")
 
-    if 130 <= len(meta_desc) <= 165:
+    if 120 <= len(meta_desc) <= 165:
         score += 5
     else:
-        issues.append(f"Meta description length {len(meta_desc)} (ideal: 130-165)")
+        issues.append(f"Meta description length {len(meta_desc)} (ideal: 120-165)")
 
     # Content checks
     word_count = len(re.sub('<[^>]+>', '', content).split())
@@ -632,8 +642,11 @@ Respond ONLY with JSON:
     try:
         result = _gemini(prompt, gemini_key, json_mode=True, timeout=40, max_tokens=1024)
         fixed = _parse_json_lenient(result)
-        if fixed.get("title") and primary_kw.lower() in fixed["title"].lower():
-            blog["title"] = fixed["title"]
+        kw_words = [w for w in primary_kw.lower().split() if len(w) > 2]
+        new_title = fixed.get("title", "")
+        title_has_kw = primary_kw.lower() in new_title.lower() or (kw_words and all(w in new_title.lower() for w in kw_words))
+        if new_title and title_has_kw and len(new_title) <= 70:
+            blog["title"] = new_title
         if fixed.get("meta_description"):
             md = fixed["meta_description"].strip()
             # Hard-enforce length cap
