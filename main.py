@@ -1148,7 +1148,7 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
     }
 
 
-@app.get("/api/blogs/trending")
+@app.get("/api/trending-topics")
 async def get_trending_topics(niche: str = "Technology", keywords: str = ""):
     """Get trending topic suggestions for a niche without generating a full blog."""
     gemini_key = os.getenv("GEMINI_API_KEY")
