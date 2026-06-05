@@ -7,13 +7,15 @@ import os
 import json
 import urllib.request
 import urllib.parse
+import urllib.error
 import re
 from datetime import datetime
 
 # ── GEMINI HELPER ──────────────────────────────────────────────────────────────
 
 def _gemini(prompt: str, api_key: str, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192) -> str:
-    """Call Gemini 2.5 Flash and return text response."""
+    """Call Gemini 2.5 Flash with retry/backoff on transient errors (429/503)."""
+    import time
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -27,10 +29,29 @@ def _gemini(prompt: str, api_key: str, json_mode: bool = False, timeout: int = 6
         payload["generationConfig"]["temperature"] = 0.5
 
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        result = json.loads(resp.read().decode())
-        return result["candidates"][0]["content"]["parts"][0]["text"].strip()
+    last_err = None
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                result = json.loads(resp.read().decode())
+                return result["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in (429, 503, 500) and attempt < 3:
+                wait = (2 ** attempt) * 8  # 8s, 16s, 32s backoff
+                print(f"[gemini] {e.code} on attempt {attempt+1}, retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt < 3:
+                time.sleep(5)
+                continue
+            raise
+    if last_err:
+        raise last_err
 
 
 def _parse_json_lenient(text: str) -> dict:
