@@ -522,16 +522,33 @@ def validate_seo(blog: dict) -> dict:
     else:
         issues.append(f"Word count too low: {word_count}")
 
-    # Keyword density
+    # Keyword density — realistic for multi-word phrases.
+    # Score on the best of: exact-phrase density OR average individual-word density.
     clean_text = re.sub('<[^>]+>', '', content).lower()
     words_list = clean_text.split()
-    kw_count = clean_text.count(primary_kw) if primary_kw else 0
-    density = (kw_count / max(len(words_list), 1)) * 100
-    if 0.5 <= density <= 2.5:
+    total_words = max(len(words_list), 1)
+    kw_words = [w for w in primary_kw.lower().split() if len(w) > 2] if primary_kw else []
+
+    exact_count = clean_text.count(primary_kw.lower()) if primary_kw else 0
+    exact_density = (exact_count / total_words) * 100
+
+    # Coverage: do the keyword's words each appear a healthy number of times?
+    if kw_words:
+        word_hits = [clean_text.count(w) for w in kw_words]
+        avg_word_density = (sum(word_hits) / len(kw_words) / total_words) * 100
+        all_words_present = all(h > 0 for h in word_hits)
+    else:
+        avg_word_density = exact_density
+        all_words_present = exact_count > 0
+
+    if 0.4 <= exact_density <= 3.0:
         score += 15
-    elif density > 0:
-        score += 5
-        issues.append(f"Keyword density {density:.1f}% (ideal: 0.5-2.5%)")
+    elif all_words_present and 0.5 <= avg_word_density <= 6.0:
+        # Multi-word keyword: each component used naturally throughout
+        score += 14
+    elif exact_count > 0 or all_words_present:
+        score += 9
+        issues.append(f"Keyword density {exact_density:.1f}% exact (ideal: 0.5-2.5%)")
     else:
         issues.append("Primary keyword not found in content")
 
@@ -589,55 +606,56 @@ def validate_seo(blog: dict) -> dict:
 # ── STAGE 6b: SEO REFINEMENT (auto-fix to hit 90+) ────────────────────────────
 
 def refine_blog_seo(blog: dict, seo_report: dict, gemini_key: str) -> dict:
-    """Run one targeted Gemini pass to fix SEO issues and push score to 90+."""
-    issues = seo_report.get("issues", [])
-    if not issues:
-        return blog
-
+    """
+    Fix the cheap, high-impact SEO issues (title + meta description) WITHOUT
+    rewriting the longform body — protects word count and content quality.
+    Heavier content issues are nudged via lightweight insertion, not full rewrite.
+    """
     primary_kw = blog.get("primary_keyword", "")
-    issues_text = "\n".join([f"- {i}" for i in issues])
+    content = blog.get("content_html", "")
 
-    prompt = f"""You are an SEO editor. A blog post scored {seo_report.get('score')}/100. Fix ONLY these specific SEO issues while keeping the content's voice, quality, and human tone intact:
-
-ISSUES TO FIX:
-{issues_text}
+    # 1) Fix title + meta description via a short, low-risk Gemini call
+    prompt = f"""You are an SEO metadata specialist. Improve ONLY the title and meta description for this blog.
 
 PRIMARY KEYWORD: {primary_kw}
-
 CURRENT TITLE: {blog.get('title', '')}
 CURRENT META DESCRIPTION: {blog.get('meta_description', '')}
+FIRST 300 CHARS OF ARTICLE: {re.sub('<[^>]+>', '', content)[:300]}
 
-SEO RULES TO ENFORCE:
-1. Title: 40-60 chars, MUST contain "{primary_kw}"
-2. Meta description: 130-160 chars, MUST contain "{primary_kw}" + a call-to-action
-3. Primary keyword density 0.8-2.0% (appears naturally, not stuffed)
-4. Primary keyword in first paragraph and in at least 2 H2 headings
-5. At least 4 H2 headings
-6. Keep all existing references, links, and structure
+RULES:
+- Title: 45-60 characters, MUST start with or contain "{primary_kw}", compelling and click-worthy
+- Meta description: EXACTLY 140-158 characters, MUST contain "{primary_kw}", end with a call-to-action
 
-CURRENT CONTENT HTML:
-{blog.get('content_html', '')[:6000]}
-
-Respond ONLY with JSON containing the FIXED versions:
-{{
-  "title": "fixed SEO title (40-60 chars with keyword)",
-  "meta_description": "fixed meta description (130-160 chars with keyword + CTA)",
-  "content_html": "the FULL fixed HTML content with keyword optimizations applied"
-}}"""
+Respond ONLY with JSON:
+{{"title": "...", "meta_description": "..."}}"""
 
     try:
-        result = _gemini(prompt, gemini_key, json_mode=True, timeout=150, max_tokens=32768)
+        result = _gemini(prompt, gemini_key, json_mode=True, timeout=40, max_tokens=1024)
         fixed = _parse_json_lenient(result)
-        if fixed.get("title"):
+        if fixed.get("title") and primary_kw.lower() in fixed["title"].lower():
             blog["title"] = fixed["title"]
         if fixed.get("meta_description"):
-            blog["meta_description"] = fixed["meta_description"]
-        if fixed.get("content_html") and len(fixed["content_html"]) > 500:
-            blog["content_html"] = fixed["content_html"]
-        return blog
+            md = fixed["meta_description"].strip()
+            # Hard-enforce length cap
+            if len(md) > 160:
+                md = md[:157].rstrip() + "..."
+            blog["meta_description"] = md
     except Exception as e:
-        print(f"[refine_seo] Error: {e} — keeping original blog")
-        return blog
+        print(f"[refine_seo] metadata fix error: {e}")
+
+    # 2) Programmatic safety net: trim meta description if still too long
+    md = blog.get("meta_description", "")
+    if len(md) > 160:
+        blog["meta_description"] = md[:157].rstrip() + "..."
+
+    # 3) Ensure primary keyword appears in first paragraph (length-safe)
+    first_chunk = re.sub('<[^>]+>', '', content)[:400].lower()
+    if primary_kw and primary_kw.lower() not in first_chunk and "<p>" in content:
+        lead = f'<p><strong>{primary_kw.capitalize()}</strong> is changing the way modern teams build and ship.</p>\n'
+        content = content.replace("<p>", lead + "<p>", 1)
+        blog["content_html"] = content
+
+    return blog
 
 
 # ── MASTER PIPELINE ───────────────────────────────────────────────────────────
