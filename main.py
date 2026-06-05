@@ -439,9 +439,29 @@ async def websocket_endpoint(websocket: WebSocket):
 import urllib.request
 import json
 
-LEADS_FILE = os.path.join(os.path.dirname(__file__), "leads.json")
-BLOGS_FILE = os.path.join(os.path.dirname(__file__), "blogs.json")
-COMMENTS_FILE = os.path.join(os.path.dirname(__file__), "comments.json")
+# DATA_DIR: persistent storage path (Railway volume). Falls back to script dir locally.
+DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(__file__))
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def _seed_data_file(filename, default):
+    """Ensure a data file exists in DATA_DIR, seeding from committed copy if present."""
+    target = os.path.join(DATA_DIR, filename)
+    if not os.path.exists(target):
+        committed = os.path.join(os.path.dirname(__file__), filename)
+        if os.path.exists(committed) and committed != target:
+            try:
+                with open(committed) as src, open(target, "w") as dst:
+                    dst.write(src.read())
+                return target
+            except Exception as e:
+                print(f"[seed] {filename}: {e}")
+        with open(target, "w") as f:
+            json.dump(default, f)
+    return target
+
+LEADS_FILE = _seed_data_file("leads.json", [])
+BLOGS_FILE = _seed_data_file("blogs.json", [])
+COMMENTS_FILE = _seed_data_file("comments.json", {})
 
 def read_json_file(filepath, default_val):
     if not os.path.exists(filepath):
@@ -832,7 +852,7 @@ def optimize_seo_blog(req: BlogSeoOptimizeRequest):
     return result_json
 
 # ── AUTO-BLOGGER SETTINGS & DAEMON ─────────────────────────────────────────────
-AUTO_BLOG_SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "auto_blog_settings.json")
+AUTO_BLOG_SETTINGS_FILE = _seed_data_file("auto_blog_settings.json", {})
 
 class AutoBlogSettingsUpdateRequest(BaseModel):
     enabled: bool = False

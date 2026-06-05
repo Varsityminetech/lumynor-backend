@@ -9,8 +9,10 @@ SECRET_KEY = os.getenv("SECRET_KEY", "lumynor-super-secret-key-change-in-product
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 8
 
-USERS_FILE = os.path.join(os.path.dirname(__file__), "users.json")
-AUDIT_FILE = os.path.join(os.path.dirname(__file__), "audit_log.json")
+_DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(__file__))
+os.makedirs(_DATA_DIR, exist_ok=True)
+USERS_FILE = os.path.join(_DATA_DIR, "users.json")
+AUDIT_FILE = os.path.join(_DATA_DIR, "audit_log.json")
 
 DEFAULT_USERS = [
     {"email": "admin@lumynor.com",     "name": "CEO",        "role": "ceo",      "password": "lumynor_ceo_2024"},
