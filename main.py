@@ -511,6 +511,22 @@ def subscribe_lead(req: LeadSubscribeRequest):
     write_json_file(LEADS_FILE, leads)
     return {"status": "success", "lead": new_lead}
 
+@app.post("/api/leads/chat")
+def chat_lead(req: dict):
+    leads = read_json_file(LEADS_FILE, [])
+    new_lead = {
+        "id": str(uuid.uuid4()),
+        "source": req.get("source", "chatbot"),
+        "query": req.get("query", ""),
+        "features": req.get("features", ""),
+        "budget": req.get("budget", ""),
+        "contact": req.get("contact", ""),
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    leads.append(new_lead)
+    write_json_file(LEADS_FILE, leads)
+    return {"status": "success", "lead": new_lead}
+
 @app.get("/api/leads/all")
 def get_leads():
     return read_json_file(LEADS_FILE, [])
