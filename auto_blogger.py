@@ -12,14 +12,14 @@ from datetime import datetime
 
 # ── GEMINI HELPER ──────────────────────────────────────────────────────────────
 
-def _gemini(prompt: str, api_key: str, json_mode: bool = False, timeout: int = 60) -> str:
+def _gemini(prompt: str, api_key: str, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192) -> str:
     """Call Gemini 2.5 Flash and return text response."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.85,
-            "maxOutputTokens": 8192,
+            "maxOutputTokens": max_tokens,
         }
     }
     if json_mode:
@@ -31,6 +31,34 @@ def _gemini(prompt: str, api_key: str, json_mode: bool = False, timeout: int = 6
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         result = json.loads(resp.read().decode())
         return result["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
+def _parse_json_lenient(text: str) -> dict:
+    """Parse JSON, attempting repair if truncated (e.g. hit token limit)."""
+    text = text.strip()
+    # Strip markdown code fences if present
+    if text.startswith("```"):
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Attempt repair of truncated JSON: close open string/braces
+        repaired = text
+        # If ends mid-string, close the quote
+        quote_count = repaired.count('"') - repaired.count('\\"')
+        if quote_count % 2 == 1:
+            repaired += '"'
+        # Balance braces/brackets
+        open_braces = repaired.count('{') - repaired.count('}')
+        open_brackets = repaired.count('[') - repaired.count(']')
+        repaired += ']' * max(0, open_brackets)
+        repaired += '}' * max(0, open_braces)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            # Last resort: extract the largest valid prefix object
+            raise
 
 
 def _get_ddgs():
@@ -374,11 +402,11 @@ OUTPUT FORMAT — Respond ONLY with this exact JSON structure:
   "tags": ["tag1", "tag2", "tag3", "tag4"]
 }}"""
 
-    result = _gemini(prompt, gemini_key, json_mode=True, timeout=120)
+    result = _gemini(prompt, gemini_key, json_mode=True, timeout=180, max_tokens=32768)
     try:
-        blog = json.loads(result)
+        blog = _parse_json_lenient(result)
         # Inject references into the HTML content
-        if refs and "content_html" in blog:
+        if refs and blog.get("content_html"):
             ref_html = "<h2>References &amp; Sources</h2><ol>"
             for r in refs[:6]:
                 ref_html += f'<li><a href="{r["url"]}" target="_blank" rel="noopener noreferrer">{r["title"]}</a></li>'
@@ -598,18 +626,17 @@ Respond ONLY with JSON containing the FIXED versions:
 }}"""
 
     try:
-        result = _gemini(prompt, gemini_key, json_mode=True, timeout=90)
-        fixed = json.loads(result)
+        result = _gemini(prompt, gemini_key, json_mode=True, timeout=150, max_tokens=32768)
+        fixed = _parse_json_lenient(result)
         if fixed.get("title"):
             blog["title"] = fixed["title"]
         if fixed.get("meta_description"):
             blog["meta_description"] = fixed["meta_description"]
         if fixed.get("content_html") and len(fixed["content_html"]) > 500:
-            # Preserve the references section if it was appended
             blog["content_html"] = fixed["content_html"]
         return blog
     except Exception as e:
-        print(f"[refine_seo] Error: {e}")
+        print(f"[refine_seo] Error: {e} — keeping original blog")
         return blog
 
 
@@ -654,9 +681,13 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
     research = research_topic_facts(topic, keywords, gemini_key)
     log.append(f"📊 Found {len(research.get('key_statistics', []))} statistics, {len(research.get('references', []))} references")
 
-    # Stage 4: Write blog
+    # Stage 4: Write blog (retry once on parse failure)
     log.append("✍️ Writing longform blog post...")
-    blog_content = write_longform_blog(topic, angle, keywords, research, target_audience, gemini_key)
+    try:
+        blog_content = write_longform_blog(topic, angle, keywords, research, target_audience, gemini_key)
+    except Exception as e:
+        log.append(f"⚠️ First write attempt failed ({str(e)[:60]}), retrying...")
+        blog_content = write_longform_blog(topic, angle, keywords, research, target_audience, gemini_key)
     word_count = len(re.sub('<[^>]+>', '', blog_content.get("content_html", "")).split())
     log.append(f"📝 Blog written: {word_count} words")
 
