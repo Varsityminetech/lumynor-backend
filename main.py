@@ -1107,6 +1107,9 @@ class AutoBlogRunRequest(BaseModel):
     nanobanana_key: str = ""
     nanobanana_url: str = ""
     gemini_api_key: str = ""
+    image_source: str = ""      # "web" (default) or "ai"
+    unsplash_key: str = ""
+    pexels_key: str = ""
 
 @app.post("/api/blogs/auto-generate")
 async def auto_generate_blog(req: AutoBlogRunRequest):
@@ -1122,6 +1125,9 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
         "auto_publish": req.auto_publish if req.auto_publish else settings.get("auto_publish", False),
         "nanobanana_key": req.nanobanana_key or settings.get("nanobanana_key", ""),
         "nanobanana_url": req.nanobanana_url or settings.get("nanobanana_url", ""),
+        "image_source": req.image_source or settings.get("image_source", "web"),
+        "unsplash_key": req.unsplash_key or settings.get("unsplash_key", ""),
+        "pexels_key": req.pexels_key or settings.get("pexels_key", ""),
     }
 
     gemini_key = req.gemini_api_key or settings.get("llmApiKey") or os.getenv("GEMINI_API_KEY")

@@ -439,24 +439,107 @@ OUTPUT FORMAT — Respond ONLY with this exact JSON structure:
         raise
 
 
-# ── STAGE 5: AI IMAGE GENERATION ──────────────────────────────────────────────
+# ── STAGE 5: IMAGE SOURCING (web search + optional AI gen) ─────────────────────
 
-def generate_blog_images(image_prompts: list, nanobanana_key: str = "", nanobanana_url: str = "") -> list:
+def _image_query(img: dict) -> str:
+    """Build a concise web-search query from an image prompt's alt/prompt."""
+    q = (img.get("alt") or img.get("prompt") or "").strip()
+    # Strip AI-prompt filler words to get a clean photo query
+    for junk in ["detailed", "illustration of", "an image of", "a photo of",
+                 "photorealistic", "high quality", "digital art", "3d render",
+                 "vector", "minimalist", "concept art"]:
+        q = q.replace(junk, "")
+    q = re.sub(r'\s+', ' ', q).strip()
+    return q[:80] or "technology abstract"
+
+
+def _search_unsplash(query: str, key: str) -> str:
+    """Unsplash API — high quality, commercial-safe license. Needs UNSPLASH_ACCESS_KEY."""
+    try:
+        url = f"https://api.unsplash.com/search/photos?query={urllib.parse.quote(query)}&per_page=1&orientation=landscape"
+        req = urllib.request.Request(url, headers={"Authorization": f"Client-ID {key}"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode())
+            results = data.get("results", [])
+            if results:
+                return results[0]["urls"].get("regular") or results[0]["urls"].get("full")
+    except Exception as e:
+        print(f"[unsplash] {e}")
+    return None
+
+
+def _search_pexels(query: str, key: str) -> str:
+    """Pexels API — free, commercial-safe license. Needs PEXELS_API_KEY."""
+    try:
+        url = f"https://api.pexels.com/v1/search?query={urllib.parse.quote(query)}&per_page=1&orientation=landscape"
+        req = urllib.request.Request(url, headers={"Authorization": key})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode())
+            photos = data.get("photos", [])
+            if photos:
+                return photos[0]["src"].get("large") or photos[0]["src"].get("original")
+    except Exception as e:
+        print(f"[pexels] {e}")
+    return None
+
+
+def _search_openverse(query: str) -> str:
+    """Openverse — Creative Commons licensed images, NO API key needed. Safe to publish."""
+    try:
+        url = f"https://api.openverse.org/v1/images/?q={urllib.parse.quote(query)}&page_size=1&license_type=commercial&mature=false"
+        req = urllib.request.Request(url, headers={"User-Agent": "LumynorBlog/1.0"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode())
+            results = data.get("results", [])
+            if results:
+                return results[0].get("url") or results[0].get("thumbnail")
+    except Exception as e:
+        print(f"[openverse] {e}")
+    return None
+
+
+def _search_ddg_images(query: str) -> str:
+    """DuckDuckGo image search — last-resort web image (licensing varies)."""
+    DDGS = _get_ddgs()
+    if DDGS is None:
+        return None
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.images(query, max_results=1))
+        if results:
+            return results[0].get("image")
+    except Exception as e:
+        print(f"[ddg_images] {e}")
+    return None
+
+
+def generate_blog_images(
+    image_prompts: list,
+    nanobanana_key: str = "",
+    nanobanana_url: str = "",
+    image_source: str = "web",
+    unsplash_key: str = "",
+    pexels_key: str = "",
+) -> list:
     """
-    Generate images using Nanobanana API.
-    Falls back to placeholder SVG URLs if API not configured.
+    Source images for the blog.
+    image_source: "web" (search Unsplash/Pexels/Openverse) or "ai" (Nanobanana).
+    Priority: AI (if image_source='ai' + key) → Unsplash → Pexels → Openverse → DDG → placeholder.
     """
+    unsplash_key = unsplash_key or os.getenv("UNSPLASH_ACCESS_KEY", "")
+    pexels_key = pexels_key or os.getenv("PEXELS_API_KEY", "")
     generated = []
 
     for img in image_prompts:
         placement = img.get("placement", "cover")
         prompt_text = img.get("prompt", "")
         alt = img.get("alt", "")
-
+        query = _image_query(img)
         image_url = None
+        source_used = None
 
-        # Try Nanobanana API if configured
-        if nanobanana_key and nanobanana_url:
+        # 1. AI generation (only if explicitly chosen and configured)
+        if image_source == "ai" and nanobanana_key and nanobanana_url:
             try:
                 api_endpoint = nanobanana_url.rstrip("/")
                 payload = json.dumps({
@@ -466,31 +549,47 @@ def generate_blog_images(image_prompts: list, nanobanana_key: str = "", nanobana
                     "style": "photorealistic",
                 }).encode("utf-8")
                 req = urllib.request.Request(
-                    f"{api_endpoint}/generate",
-                    data=payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {nanobanana_key}"
-                    },
-                    method="POST"
-                )
+                    f"{api_endpoint}/generate", data=payload,
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {nanobanana_key}"},
+                    method="POST")
                 with urllib.request.urlopen(req, timeout=30) as resp:
-                    resp_data = json.loads(resp.read().decode())
-                    image_url = resp_data.get("url") or resp_data.get("image_url") or resp_data.get("data", {}).get("url")
+                    rd = json.loads(resp.read().decode())
+                    image_url = rd.get("url") or rd.get("image_url") or rd.get("data", {}).get("url")
+                    source_used = "nanobanana"
             except Exception as e:
-                print(f"[image_gen] Nanobanana error for {placement}: {e}")
+                print(f"[image_gen] Nanobanana error: {e}")
 
-        # Fallback: use a descriptive placeholder
+        # 2. Web image search chain
+        if not image_url and unsplash_key:
+            image_url = _search_unsplash(query, unsplash_key)
+            if image_url:
+                source_used = "unsplash"
+        if not image_url and pexels_key:
+            image_url = _search_pexels(query, pexels_key)
+            if image_url:
+                source_used = "pexels"
         if not image_url:
-            encoded_prompt = urllib.parse.quote(prompt_text[:80])
-            # Use a free placeholder service
-            image_url = f"https://placehold.co/1200x630/0a0e1a/00f0ff?text={encoded_prompt}"
+            image_url = _search_openverse(query)
+            if image_url:
+                source_used = "openverse"
+        if not image_url:
+            image_url = _search_ddg_images(query)
+            if image_url:
+                source_used = "ddg"
+
+        # 3. Placeholder fallback
+        if not image_url:
+            encoded = urllib.parse.quote(query[:60])
+            image_url = f"https://placehold.co/1200x630/0a0e1a/00f0ff?text={encoded}"
+            source_used = "placeholder"
 
         generated.append({
             "placement": placement,
             "url": image_url,
             "alt": alt,
-            "prompt": prompt_text
+            "prompt": prompt_text,
+            "query": query,
+            "source": source_used,
         })
 
     return generated
@@ -712,6 +811,10 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
     category = settings.get("category", "Technology")
     nanobanana_key = settings.get("nanobanana_key", "") or os.getenv("NANOBANANA_API_KEY", "")
     nanobanana_url = settings.get("nanobanana_url", "") or os.getenv("NANOBANANA_API_URL", "")
+    # Image source: "web" (search Unsplash/Pexels/Openverse) or "ai" (Nanobanana)
+    image_source = settings.get("image_source", "web")
+    unsplash_key = settings.get("unsplash_key", "") or os.getenv("UNSPLASH_ACCESS_KEY", "")
+    pexels_key = settings.get("pexels_key", "") or os.getenv("PEXELS_API_KEY", "")
 
     log = []
 
@@ -743,18 +846,45 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
     word_count = len(re.sub('<[^>]+>', '', blog_content.get("content_html", "")).split())
     log.append(f"📝 Blog written: {word_count} words")
 
-    # Stage 5: Generate images
+    # Stage 5: Source images (web search by default, AI if configured)
     image_prompts = blog_content.get("image_prompts", [])
-    log.append(f"🖼️ Generating {len(image_prompts)} images...")
-    images = generate_blog_images(image_prompts, nanobanana_key, nanobanana_url)
+    log.append(f"🖼️ Sourcing {len(image_prompts)} images (mode: {image_source})...")
+    images = generate_blog_images(
+        image_prompts, nanobanana_key, nanobanana_url,
+        image_source=image_source, unsplash_key=unsplash_key, pexels_key=pexels_key,
+    )
     blog_content["images"] = images  # so SEO validator sees them
+    sources = ", ".join(sorted(set(i.get("source", "?") for i in images)))
+    log.append(f"   Image sources: {sources}")
 
-    # Set cover image
+    # Set cover image + embed section images into the article body
     cover_image = ""
+    section_imgs = []
     for img in images:
         if img["placement"] == "cover":
             cover_image = img["url"]
-            break
+        else:
+            section_imgs.append(img)
+
+    # Embed each non-cover image after successive H2 headings (graphic illustration in-body)
+    content_html = blog_content.get("content_html", "")
+    if section_imgs and "<h2" in content_html:
+        parts = re.split(r'(<h2[^>]*>.*?</h2>)', content_html, flags=re.DOTALL)
+        out, h2_seen, img_idx = [], 0, 0
+        for seg in parts:
+            out.append(seg)
+            if seg.strip().lower().startswith("<h2") and img_idx < len(section_imgs):
+                h2_seen += 1
+                # Skip the very first H2 (intro) — place images deeper in the article
+                if h2_seen >= 2:
+                    im = section_imgs[img_idx]
+                    out.append(
+                        f'<figure class="blog-figure"><img src="{im["url"]}" alt="{im.get("alt","")}" '
+                        f'loading="lazy" style="width:100%;height:auto;border-radius:0;" />'
+                        f'<figcaption>{im.get("alt","")}</figcaption></figure>'
+                    )
+                    img_idx += 1
+        blog_content["content_html"] = "".join(out)
 
     # Stage 6: SEO validation + refinement loop (target 90+)
     seo_report = validate_seo(blog_content)
