@@ -498,6 +498,127 @@ def ensure_html_content(text: str) -> str:
         print(f"[ensure_html_content] markdown conversion failed: {e}")
         return text
 
+
+# ── UNIFIED MULTI-PROVIDER LLM ROUTER ──────────────────────────────────────────
+# One raw-HTTP entry point for every supported text LLM. Returns the model's raw
+# text output (expected to be a JSON string for blog generation). The whole app
+# uses urllib (no LLM SDK), so every provider — including Anthropic — goes through
+# raw HTTP here for a single, uniform code path.
+
+# OpenAI-compatible providers share one request/response shape (chat/completions).
+_OPENAI_COMPATIBLE = {
+    "openai":     "https://api.openai.com/v1/chat/completions",
+    "deepseek":   "https://api.deepseek.com/v1/chat/completions",
+    "openrouter": "https://openrouter.ai/api/v1/chat/completions",
+}
+# Default model per cloud provider (used when the configured model is empty or is
+# the local Ollama default that doesn't apply to a cloud provider).
+_LLM_DEFAULT_MODEL = {
+    "gemini":     "gemini-2.5-flash",
+    "openai":     "gpt-4o",
+    "anthropic":  "claude-opus-4-8",
+    "openrouter": "openai/gpt-4o",
+    "deepseek":   "deepseek-chat",
+}
+# Where to find each provider's API key in the environment (first match wins).
+_LLM_ENV_KEYS = {
+    "gemini":     ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    "openai":     ("OPENAI_API_KEY",),
+    "anthropic":  ("ANTHROPIC_API_KEY",),
+    "openrouter": ("OPENROUTER_API_KEY",),
+    "deepseek":   ("DEEPSEEK_API_KEY",),
+}
+
+def _http_post_json(url, payload, headers=None, timeout=90):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json", **(headers or {})},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+def _strip_code_fences(text: str) -> str:
+    import re as _re
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = _re.sub(r'^```(?:json)?\s*', '', t)
+        t = _re.sub(r'\s*```$', '', t)
+    return t.strip()
+
+def call_llm_text(provider, api_name, model, api_key, base_url, system, user, timeout=90):
+    """Call any configured LLM and return its raw text output.
+
+    provider:  "api" (cloud) or "local" (Ollama)
+    api_name:  gemini | openai | anthropic | openrouter | deepseek
+    Routing preserves prior behavior: cloud when provider=="api" OR api_name=="gemini"
+    (the historical default), local Ollama otherwise.
+    """
+    name = (api_name or "gemini").lower()
+    use_cloud = provider == "api" or name == "gemini"
+    full_prompt = f"{system}\n\n{user}"
+
+    if not use_cloud:
+        base = (base_url or "http://localhost:11434").rstrip("/")
+        resp = _http_post_json(
+            f"{base}/api/generate",
+            {"model": model or "qwen2.5:latest", "prompt": full_prompt, "format": "json", "stream": False},
+            timeout=timeout,
+        )
+        return _strip_code_fences(resp.get("response", ""))
+
+    # Resolve the key from the request or the environment.
+    if not api_key:
+        for env in _LLM_ENV_KEYS.get(name, ()):
+            api_key = os.getenv(env, "")
+            if api_key:
+                break
+    if not api_key:
+        raise ValueError(f"No API key configured for provider '{name}'. Set it in Settings or as an environment variable.")
+
+    # A configured Ollama model name doesn't apply to a cloud provider.
+    m = model if (model and model != "qwen2.5:latest") else _LLM_DEFAULT_MODEL.get(name, "")
+
+    if name == "gemini":
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={api_key}"
+        resp = _http_post_json(
+            url,
+            {"contents": [{"parts": [{"text": full_prompt}]}],
+             "generationConfig": {"responseMimeType": "application/json"}},
+            timeout=timeout,
+        )
+        return _strip_code_fences(resp["candidates"][0]["content"]["parts"][0]["text"])
+
+    if name in _OPENAI_COMPATIBLE:
+        headers = {"Authorization": f"Bearer {api_key}"}
+        if name == "openrouter":
+            headers["HTTP-Referer"] = "https://lumynor.com"
+            headers["X-Title"] = "Lumynor Auto-Blogger"
+        resp = _http_post_json(
+            _OPENAI_COMPATIBLE[name],
+            {"model": m,
+             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+             "response_format": {"type": "json_object"}},
+            headers=headers, timeout=timeout,
+        )
+        return _strip_code_fences(resp["choices"][0]["message"]["content"])
+
+    if name == "anthropic":
+        # Anthropic has no native JSON mode — instruct via prompt, then parse.
+        sys_text = system + "\n\nRespond with ONLY the raw JSON object — no markdown code fences, no prose before or after."
+        resp = _http_post_json(
+            "https://api.anthropic.com/v1/messages",
+            {"model": m, "max_tokens": 8192, "system": sys_text,
+             "messages": [{"role": "user", "content": user}]},
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+            timeout=timeout,
+        )
+        parts = [b.get("text", "") for b in resp.get("content", []) if b.get("type") == "text"]
+        return _strip_code_fences("".join(parts))
+
+    raise ValueError(f"Unknown LLM provider '{name}'.")
+
 class LeadSubscribeRequest(BaseModel):
     name: str
     email: str
@@ -711,59 +832,17 @@ def generate_blog_draft(req: BlogGenerateRequest):
     )
 
     result_json = None
-
-    if req.llmProvider == "api" or req.llmApiName == "gemini":
-        # API Provider (Gemini fallback using langchain-google-genai or direct request)
-        # We can construct a direct HTTP request to Gemini API to avoid dependency issues, or use langchain
-        api_key = req.llmApiKey or os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=400, detail="Gemini API Key is not set.")
-        
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-            payload = {
-                "contents": [{
-                    "parts": [{"text": f"{system_instruction}\n\n{user_prompt}"}]
-                }],
-                "generationConfig": {
-                    "responseMimeType": "application/json"
-                }
-            }
-            req_data = json.dumps(payload).encode("utf-8")
-            http_req = urllib.request.Request(
-                url, data=req_data, headers={"Content-Type": "application/json"}, method="POST"
-            )
-            with urllib.request.urlopen(http_req, timeout=30.0) as response:
-                resp_data = json.loads(response.read().decode())
-                text_content = resp_data["candidates"][0]["content"]["parts"][0]["text"]
-                result_json = json.loads(text_content.strip())
-        except Exception as e:
-            print(f"Gemini generation error: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to generate draft with Gemini: {str(e)}")
-
-    else:
-        # Local Provider (Ollama)
-        base_url = req.llmBaseUrl or "http://localhost:11434"
-        model_name = req.llmModelName or "qwen2.5:latest"
-        try:
-            url = f"{base_url.rstrip('/')}/api/generate"
-            payload = {
-                "model": model_name,
-                "prompt": f"{system_instruction}\n\n{user_prompt}",
-                "format": "json",
-                "stream": False
-            }
-            req_data = json.dumps(payload).encode("utf-8")
-            http_req = urllib.request.Request(
-                url, data=req_data, headers={"Content-Type": "application/json"}, method="POST"
-            )
-            with urllib.request.urlopen(http_req, timeout=60.0) as response:
-                resp_data = json.loads(response.read().decode())
-                text_content = resp_data.get("response", "")
-                result_json = json.loads(text_content.strip())
-        except Exception as e:
-            print(f"Ollama generation error: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to generate draft with local Ollama: {str(e)}")
+    try:
+        text_content = call_llm_text(
+            req.llmProvider, req.llmApiName, req.llmModelName, req.llmApiKey, req.llmBaseUrl,
+            system_instruction, user_prompt, timeout=90,
+        )
+        result_json = json.loads(text_content.strip())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"[generate_blog_draft] {req.llmApiName} error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate draft with {req.llmApiName}: {str(e)}")
 
     if not result_json or "title" not in result_json or "content" not in result_json:
         # Fallback response
@@ -815,55 +894,17 @@ def optimize_seo_blog(req: BlogSeoOptimizeRequest):
     )
 
     result_json = None
-
-    if req.llmProvider == "api" or req.llmApiName == "gemini":
-        api_key = req.llmApiKey or os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=400, detail="Gemini API Key is not set.")
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-            payload = {
-                "contents": [{
-                    "parts": [{"text": f"{system_instruction}\n\n{user_prompt}"}]
-                }],
-                "generationConfig": {
-                    "responseMimeType": "application/json"
-                }
-            }
-            req_data = json.dumps(payload).encode("utf-8")
-            http_req = urllib.request.Request(
-                url, data=req_data, headers={"Content-Type": "application/json"}, method="POST"
-            )
-            with urllib.request.urlopen(http_req, timeout=35.0) as response:
-                resp_data = json.loads(response.read().decode())
-                text_content = resp_data["candidates"][0]["content"]["parts"][0]["text"]
-                result_json = json.loads(text_content.strip())
-        except Exception as e:
-            print(f"Gemini SEO optimization error: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to optimize with Gemini: {str(e)}")
-
-    else:
-        base_url = req.llmBaseUrl or "http://localhost:11434"
-        model_name = req.llmModelName or "qwen2.5:latest"
-        try:
-            url = f"{base_url.rstrip('/')}/api/generate"
-            payload = {
-                "model": model_name,
-                "prompt": f"{system_instruction}\n\n{user_prompt}",
-                "format": "json",
-                "stream": False
-            }
-            req_data = json.dumps(payload).encode("utf-8")
-            http_req = urllib.request.Request(
-                url, data=req_data, headers={"Content-Type": "application/json"}, method="POST"
-            )
-            with urllib.request.urlopen(http_req, timeout=60.0) as response:
-                resp_data = json.loads(response.read().decode())
-                text_content = resp_data.get("response", "")
-                result_json = json.loads(text_content.strip())
-        except Exception as e:
-            print(f"Ollama SEO optimization error: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to optimize with Ollama: {str(e)}")
+    try:
+        text_content = call_llm_text(
+            req.llmProvider, req.llmApiName, req.llmModelName, req.llmApiKey, req.llmBaseUrl,
+            system_instruction, user_prompt, timeout=120,
+        )
+        result_json = json.loads(text_content.strip())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"[optimize_seo] {req.llmApiName} error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to optimize with {req.llmApiName}: {str(e)}")
 
     if not result_json or "title" not in result_json or "content" not in result_json:
         return {
@@ -888,6 +929,7 @@ class AutoBlogSettingsUpdateRequest(BaseModel):
     tone: str = "Technical Expert"
     # LLM passthrough (optional, uses system env if omitted)
     llmProvider: str = "local"
+    llmApiName: str = "gemini"   # gemini | openai | anthropic | openrouter | deepseek
     llmModelName: str = "qwen2.5:latest"
     llmApiKey: str = ""
     llmBaseUrl: str = ""
@@ -906,6 +948,7 @@ def get_auto_blog_settings():
         "auto_publish": True,
         "tone": "Technical Expert",
         "llmProvider": "local",
+        "llmApiName": "gemini",
         "llmModelName": "qwen2.5:latest",
         "llmApiKey": "",
         "llmBaseUrl": "",
@@ -972,59 +1015,22 @@ async def generate_and_post_auto_blog(settings):
     
     result_json = None
     provider = settings.get("llmProvider", "local")
-    api_name = "gemini" if provider == "api" else "local"
+    api_name = settings.get("llmApiName", "gemini")
     model_name = settings.get("llmModelName", "qwen2.5:latest")
-    api_key = settings.get("llmApiKey") or os.getenv("GEMINI_API_KEY")
+    api_key = settings.get("llmApiKey", "")
     base_url = settings.get("llmBaseUrl", "http://localhost:11434")
-    
-    if provider == "api" or api_name == "gemini":
-        if api_key:
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-                payload = {
-                    "contents": [{
-                        "parts": [{"text": f"{system_instruction}\n\n{user_prompt}"}]
-                    }],
-                    "generationConfig": {
-                        "responseMimeType": "application/json"
-                    }
-                }
-                req_data = json.dumps(payload).encode("utf-8")
-                http_req = urllib.request.Request(
-                    url, data=req_data, headers={"Content-Type": "application/json"}, method="POST"
-                )
-                loop = asyncio.get_event_loop()
-                def run_request():
-                    with urllib.request.urlopen(http_req, timeout=45.0) as response:
-                        return json.loads(response.read().decode())
-                resp_data = await loop.run_in_executor(None, run_request)
-                text_content = resp_data["candidates"][0]["content"]["parts"][0]["text"]
-                result_json = json.loads(text_content.strip())
-            except Exception as e:
-                print(f"Auto-Blogger Gemini error: {e}")
-    else:
-        try:
-            url = f"{base_url.rstrip('/')}/api/generate"
-            payload = {
-                "model": model_name,
-                "prompt": f"{system_instruction}\n\n{user_prompt}",
-                "format": "json",
-                "stream": False
-            }
-            req_data = json.dumps(payload).encode("utf-8")
-            http_req = urllib.request.Request(
-                url, data=req_data, headers={"Content-Type": "application/json"}, method="POST"
-            )
-            loop = asyncio.get_event_loop()
-            def run_request():
-                with urllib.request.urlopen(http_req, timeout=90.0) as response:
-                    return json.loads(response.read().decode())
-            resp_data = await loop.run_in_executor(None, run_request)
-            text_content = resp_data.get("response", "")
-            result_json = json.loads(text_content.strip())
-        except Exception as e:
-            print(f"Auto-Blogger Ollama error: {e}")
-            
+
+    try:
+        loop = asyncio.get_event_loop()
+        text_content = await loop.run_in_executor(
+            None,
+            lambda: call_llm_text(provider, api_name, model_name, api_key, base_url,
+                                  system_instruction, user_prompt, timeout=90),
+        )
+        result_json = json.loads(text_content.strip())
+    except Exception as e:
+        print(f"Auto-Blogger {api_name} error: {e}")
+
     if not result_json or "title" not in result_json or "content" not in result_json:
         result_json = {
             "title": f"The Future of {niche} in 2026",
