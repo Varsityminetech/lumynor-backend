@@ -479,6 +479,25 @@ def write_json_file(filepath, data):
     except Exception as e:
         print(f"Error writing to {filepath}: {e}")
 
+def ensure_html_content(text: str) -> str:
+    """Blog `content` must be HTML — the website renders it with
+    dangerouslySetInnerHTML and styles it via `.prose`. Some generators emit
+    raw Markdown, which then shows literal `#`/`**`/`*` on the page. Convert
+    Markdown → HTML, but leave content that's already HTML untouched (idempotent).
+    """
+    import re as _re
+    if not text or not text.strip():
+        return text
+    # Already HTML? (has a block-level tag) — don't double-process.
+    if _re.search(r'<(h[1-6]|p|ul|ol|div|section|article|blockquote|figure)\b', text, _re.I):
+        return text
+    try:
+        import markdown as _markdown
+        return _markdown.markdown(text, extensions=["fenced_code", "tables", "sane_lists"])
+    except Exception as e:
+        print(f"[ensure_html_content] markdown conversion failed: {e}")
+        return text
+
 class LeadSubscribeRequest(BaseModel):
     name: str
     email: str
@@ -576,6 +595,7 @@ def get_single_blog(slug_or_id: str):
 def create_blog(req: BlogSaveRequest):
     blogs = read_json_file(BLOGS_FILE, [])
     new_blog = req.dict()
+    new_blog["content"] = ensure_html_content(new_blog.get("content", ""))
     new_blog["id"] = str(uuid.uuid4())
     new_blog["created_at"] = datetime.utcnow().isoformat()
     blogs.append(new_blog)
@@ -588,6 +608,7 @@ def update_blog(blog_id: str, req: BlogSaveRequest):
     for idx, blog in enumerate(blogs):
         if blog.get("id") == blog_id:
             updated = req.dict()
+            updated["content"] = ensure_html_content(updated.get("content", ""))
             updated["id"] = blog_id
             updated["created_at"] = blog.get("created_at", datetime.utcnow().isoformat())
             updated["updated_at"] = datetime.utcnow().isoformat()
@@ -749,9 +770,11 @@ def generate_blog_draft(req: BlogGenerateRequest):
         return {
             "title": f"Draft: {req.prompt[:40]}",
             "summary": f"A draft post about {req.prompt}.",
-            "content": f"# {req.prompt}\n\nThis is a fallback generated draft post covering the primary keyword '{req.primaryKeyword}'.\n\n### Frequently Asked Questions\n**Q: What is this?**\n*A: This is a placeholder blog post draft.*\n\n### References\n- [Lumynor Systems Official Website](https://lumynor.com)"
+            "content": ensure_html_content(f"# {req.prompt}\n\nThis is a fallback generated draft post covering the primary keyword '{req.primaryKeyword}'.\n\n### Frequently Asked Questions\n**Q: What is this?**\n*A: This is a placeholder blog post draft.*\n\n### References\n- [Lumynor Systems Official Website](https://lumynor.com)")
         }
 
+    # The website renders content as HTML — make sure Markdown drafts become HTML.
+    result_json["content"] = ensure_html_content(result_json.get("content", ""))
     return result_json
 
 # ── SEO OPTIMIZATION ENDPOINT ──────────────────────────────────────────────────
@@ -1020,7 +1043,7 @@ async def generate_and_post_auto_blog(settings):
         "category": category,
         "author": author,
         "summary": result_json.get("summary", ""),
-        "content": result_json["content"],
+        "content": ensure_html_content(result_json["content"]),
         "published": auto_publish,
         "coverImage": "",
         "primaryKeyword": topics.split(",")[0].strip() if topics else "",
@@ -1089,7 +1112,10 @@ async def auto_blogger_daemon():
                     
             if should_post:
                 print("Auto-Blogger: Time to generate a new post!")
-                await generate_and_post_auto_blog(settings)
+                # Use the full HTML pipeline (v2). It produces clean HTML content,
+                # structured FAQ/references, images and SEO scoring. It falls back
+                # to the legacy generator only if there's no Gemini key or on error.
+                await generate_and_post_auto_blog_v2(settings)
                 
         except Exception as e:
             print(f"\U0001f525 Auto-Blogger Daemon Error: {e}")
