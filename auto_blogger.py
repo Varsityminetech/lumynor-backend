@@ -453,11 +453,16 @@ def _image_query(img: dict) -> str:
     return q[:80] or "technology abstract"
 
 
+# Stock-photo APIs (Pexels especially) reject the default Python-urllib
+# User-Agent with HTTP 403, so every image request must set a real UA.
+_IMG_UA = "LumynorBlog/1.0 (+https://lumynor.com)"
+
+
 def _search_unsplash(query: str, key: str) -> str:
     """Unsplash API — high quality, commercial-safe license. Needs UNSPLASH_ACCESS_KEY."""
     try:
         url = f"https://api.unsplash.com/search/photos?query={urllib.parse.quote(query)}&per_page=1&orientation=landscape"
-        req = urllib.request.Request(url, headers={"Authorization": f"Client-ID {key}"})
+        req = urllib.request.Request(url, headers={"Authorization": f"Client-ID {key}", "User-Agent": _IMG_UA})
         with urllib.request.urlopen(req, timeout=12) as resp:
             data = json.loads(resp.read().decode())
             results = data.get("results", [])
@@ -472,7 +477,7 @@ def _search_pexels(query: str, key: str) -> str:
     """Pexels API — free, commercial-safe license. Needs PEXELS_API_KEY."""
     try:
         url = f"https://api.pexels.com/v1/search?query={urllib.parse.quote(query)}&per_page=1&orientation=landscape"
-        req = urllib.request.Request(url, headers={"Authorization": key})
+        req = urllib.request.Request(url, headers={"Authorization": key, "User-Agent": _IMG_UA})
         with urllib.request.urlopen(req, timeout=12) as resp:
             data = json.loads(resp.read().decode())
             photos = data.get("photos", [])
