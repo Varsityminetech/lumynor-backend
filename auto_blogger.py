@@ -498,16 +498,64 @@ def _search_openverse(query: str) -> str:
     return None
 
 
+# ── IMAGE VETTING GATEWAY ──────────────────────────────────────────────────────
+# Every candidate image URL must pass _vet_image_url() before it can be used on
+# the blog. Two independent blocklists + an optional trusted-host allowlist.
+
+# Adult / NSFW sources — never publish.
+_NSFW_URL_MARKERS = (
+    "xhcdn", "xhamster", "pornhub", "phncdn", "xvideos", "xnxx", "redtube",
+    "youporn", "spankbang", "tnaflix", "rule34", "e621", "onlyfans",
+    "/porn", "porn.", "-porn", "nsfw", "sex.com", "escort", "hentai", "xxx",
+)
+
+# Paid-stock preview hosts — these serve WATERMARKED, licensed images we can't use.
+_WATERMARK_STOCK_MARKERS = (
+    "ftcdn.net", "stock.adobe", "adobestock", "shutterstock", "dreamstime",
+    "istockphoto", "media.istockphoto", "gettyimages", "alamy", "123rf",
+    "depositphotos", "vecteezy", "stockphoto", "watermark", "bigstock",
+    "canstockphoto", "agefotostock", "stocklib", "shutter_stock",
+)
+
+# Hosts we trust to serve clean, license-clear, watermark-free images.
+_TRUSTED_IMAGE_HOSTS = (
+    "images.unsplash.com", "unsplash.com",
+    "images.pexels.com", "pexels.com",
+    "upload.wikimedia.org", "commons.wikimedia.org",
+    "live.staticflickr.com", "staticflickr.com",
+    "placehold.co",
+)
+
+def _vet_image_url(url: str, require_trusted: bool = False) -> bool:
+    """The image gateway. Reject empty, NSFW, and watermarked-stock URLs.
+    When require_trusted=True, also require the host to be on the allowlist
+    (used for untrusted sources like web image search)."""
+    if not url or not url.lower().startswith(("http://", "https://")):
+        return False
+    u = url.lower()
+    if any(m in u for m in _NSFW_URL_MARKERS):
+        return False
+    if any(m in u for m in _WATERMARK_STOCK_MARKERS):
+        return False
+    if require_trusted and not any(h in u for h in _TRUSTED_IMAGE_HOSTS):
+        return False
+    return True
+
+
 def _search_ddg_images(query: str) -> str:
-    """DuckDuckGo image search — last-resort web image (licensing varies)."""
+    """DuckDuckGo image search — last-resort. Strict safesearch AND the image
+    must come from a trusted host, since web search otherwise returns NSFW,
+    watermarked-stock, and copyrighted results unfit for a company blog."""
     DDGS = _get_ddgs()
     if DDGS is None:
         return None
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.images(query, max_results=1))
-        if results:
-            return results[0].get("image")
+            results = list(ddgs.images(query, max_results=12, safesearch="on"))
+        for r in results:
+            url = r.get("image")
+            if _vet_image_url(url, require_trusted=True):
+                return url
     except Exception as e:
         print(f"[ddg_images] {e}")
     return None
@@ -559,25 +607,34 @@ def generate_blog_images(
             except Exception as e:
                 print(f"[image_gen] Nanobanana error: {e}")
 
-        # 2. Web image search chain
-        if not image_url and unsplash_key:
-            image_url = _search_unsplash(query, unsplash_key)
-            if image_url:
-                source_used = "unsplash"
-        if not image_url and pexels_key:
-            image_url = _search_pexels(query, pexels_key)
-            if image_url:
-                source_used = "pexels"
-        if not image_url:
-            image_url = _search_openverse(query)
-            if image_url:
-                source_used = "openverse"
-        if not image_url:
-            image_url = _search_ddg_images(query)
-            if image_url:
-                source_used = "ddg"
+        # AI result must also pass the gateway.
+        if image_url and not _vet_image_url(image_url):
+            print(f"[image_gateway] rejected AI image: {image_url}")
+            image_url, source_used = None, None
 
-        # 3. Placeholder fallback
+        # 2. Web image search chain — each result passes through the gateway;
+        #    rejected ones fall through to the next source.
+        if not image_url and unsplash_key:
+            cand = _search_unsplash(query, unsplash_key)
+            if cand and _vet_image_url(cand):
+                image_url, source_used = cand, "unsplash"
+        if not image_url and pexels_key:
+            cand = _search_pexels(query, pexels_key)
+            if cand and _vet_image_url(cand):
+                image_url, source_used = cand, "pexels"
+        if not image_url:
+            cand = _search_openverse(query)
+            if cand and _vet_image_url(cand):
+                image_url, source_used = cand, "openverse"
+        if not image_url:
+            # Web image search (DDG) is the riskiest source — only accept
+            # trusted-host results. Often returns nothing, which is fine.
+            cand = _search_ddg_images(query)
+            if cand and _vet_image_url(cand, require_trusted=True):
+                image_url, source_used = cand, "ddg"
+
+        # 3. Placeholder fallback — a clean branded placeholder always beats
+        #    an unsafe or watermarked image.
         if not image_url:
             encoded = urllib.parse.quote(query[:60])
             image_url = f"https://placehold.co/1200x630/0a0e1a/00f0ff?text={encoded}"
