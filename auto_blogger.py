@@ -458,16 +458,63 @@ def _image_query(img: dict) -> str:
 _IMG_UA = "LumynorBlog/1.0 (+https://lumynor.com)"
 
 
-def _search_unsplash(query: str, key: str) -> str:
-    """Unsplash API — high quality, commercial-safe license. Needs UNSPLASH_ACCESS_KEY."""
+# Unsplash app name — must match the registered app; used in the required UTM
+# attribution links per the Unsplash API Guidelines.
+_UNSPLASH_APP_NAME = "Lumynor"
+_UNSPLASH_UTM = f"utm_source={_UNSPLASH_APP_NAME}&utm_medium=referral"
+
+
+def _trigger_unsplash_download(download_location: str, key: str) -> None:
+    """Unsplash Guidelines require pinging a photo's download_location endpoint
+    whenever the photo is used in the app. Fire-and-forget; non-fatal."""
+    if not download_location:
+        return
     try:
-        url = f"https://api.unsplash.com/search/photos?query={urllib.parse.quote(query)}&per_page=1&orientation=landscape"
-        req = urllib.request.Request(url, headers={"Authorization": f"Client-ID {key}", "User-Agent": _IMG_UA})
+        sep = "&" if "?" in download_location else "?"
+        req = urllib.request.Request(
+            f"{download_location}{sep}client_id={key}",
+            headers={"User-Agent": _IMG_UA},
+        )
+        urllib.request.urlopen(req, timeout=8).close()
+    except Exception as e:
+        print(f"[unsplash] download trigger failed: {e}")
+
+
+def _search_unsplash(query: str, key: str):
+    """Unsplash API → {url, attribution_html} or None.
+
+    Compliant with the Unsplash API Guidelines: hotlinks the Unsplash CDN URL
+    (no re-hosting), triggers the required download event, and builds the
+    required 'Photo by <name> on Unsplash' attribution with UTM-tagged links.
+    """
+    try:
+        url = (f"https://api.unsplash.com/search/photos?query={urllib.parse.quote(query)}"
+               "&per_page=1&orientation=landscape&content_filter=high")
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Client-ID {key}", "User-Agent": _IMG_UA, "Accept-Version": "v1",
+        })
         with urllib.request.urlopen(req, timeout=12) as resp:
             data = json.loads(resp.read().decode())
-            results = data.get("results", [])
-            if results:
-                return results[0]["urls"].get("regular") or results[0]["urls"].get("full")
+        results = data.get("results", [])
+        if not results:
+            return None
+        photo = results[0]
+        img_url = photo.get("urls", {}).get("regular") or photo.get("urls", {}).get("full")
+        if not img_url:
+            return None
+        # Required: register the download.
+        _trigger_unsplash_download(photo.get("links", {}).get("download_location", ""), key)
+        # Required: attribution with UTM-tagged links to photographer + Unsplash.
+        user = photo.get("user", {}) or {}
+        name = user.get("name") or "Unsplash"
+        username = user.get("username", "")
+        photog = (f"https://unsplash.com/@{username}?{_UNSPLASH_UTM}" if username
+                  else f"https://unsplash.com/?{_UNSPLASH_UTM}")
+        attribution_html = (
+            f'Photo by <a href="{photog}" target="_blank" rel="noopener noreferrer">{name}</a> '
+            f'on <a href="https://unsplash.com/?{_UNSPLASH_UTM}" target="_blank" rel="noopener noreferrer">Unsplash</a>'
+        )
+        return {"url": img_url, "attribution_html": attribution_html}
     except Exception as e:
         print(f"[unsplash] {e}")
     return None
@@ -590,6 +637,7 @@ def generate_blog_images(
         query = _image_query(img)
         image_url = None
         source_used = None
+        attribution = ""   # required for Unsplash; empty for other sources
 
         # 1. AI generation (only if explicitly chosen and configured)
         if image_source == "ai" and nanobanana_key and nanobanana_url:
@@ -621,8 +669,8 @@ def generate_blog_images(
         #    rejected ones fall through to the next source.
         if not image_url and unsplash_key:
             cand = _search_unsplash(query, unsplash_key)
-            if cand and _vet_image_url(cand):
-                image_url, source_used = cand, "unsplash"
+            if cand and _vet_image_url(cand["url"]):
+                image_url, source_used, attribution = cand["url"], "unsplash", cand["attribution_html"]
         if not image_url and pexels_key:
             cand = _search_pexels(query, pexels_key)
             if cand and _vet_image_url(cand):
@@ -652,6 +700,7 @@ def generate_blog_images(
             "prompt": prompt_text,
             "query": query,
             "source": source_used,
+            "attribution": attribution,
         })
 
     return generated
@@ -921,10 +970,12 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
 
     # Set cover image + embed section images into the article body
     cover_image = ""
+    cover_attribution = ""
     section_imgs = []
     for img in images:
         if img["placement"] == "cover":
             cover_image = img["url"]
+            cover_attribution = img.get("attribution", "")
         else:
             section_imgs.append(img)
 
@@ -940,10 +991,14 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
                 # Skip the very first H2 (intro) — place images deeper in the article
                 if h2_seen >= 2:
                     im = section_imgs[img_idx]
+                    caption = im.get("alt", "")
+                    attr = im.get("attribution", "")
+                    if attr:
+                        caption = f'{caption} <span class="blog-credit">{attr}</span>' if caption else attr
                     out.append(
                         f'<figure class="blog-figure"><img src="{im["url"]}" alt="{im.get("alt","")}" '
                         f'loading="lazy" style="width:100%;height:auto;border-radius:0;" />'
-                        f'<figcaption>{im.get("alt","")}</figcaption></figure>'
+                        f'<figcaption>{caption}</figcaption></figure>'
                     )
                     img_idx += 1
         blog_content["content_html"] = "".join(out)
@@ -982,6 +1037,7 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
         "content": blog_content.get("content_html", ""),
         "published": auto_publish,
         "coverImage": cover_image,
+        "coverImageAttribution": cover_attribution,
         "primaryKeyword": keywords.get("primary_keyword", ""),
         "secondaryKeywords": ", ".join(keywords.get("secondary_keywords", [])),
         "metaTitle": blog_content.get("title", topic),
