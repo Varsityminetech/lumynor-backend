@@ -117,7 +117,9 @@ def _ollama_generate(prompt: str, cfg: dict, json_mode: bool = False, timeout: i
     Uses the standard Ollama /api/chat shape with Bearer auth + format=json."""
     import time
     host = (cfg.get("ollama_host") or "https://ollama.com").rstrip("/")
-    model = model or cfg.get("model") or _OLLAMA_DEFAULT_MODEL
+    # Ollama model names are lowercase; normalize so a config typo (e.g.
+    # "GPT-OSS:120B") doesn't 404 as "model not found".
+    model = (model or cfg.get("model") or _OLLAMA_DEFAULT_MODEL).strip().lower()
     key = cfg.get("ollama_key", "")
     payload = {
         "model": model,
