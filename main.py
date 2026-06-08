@@ -1297,8 +1297,13 @@ def update_auto_blog_settings_v2(req: AutoBlogSettingsUpdateRequestV2):
 async def generate_and_post_auto_blog_v2(settings: dict):
     """Enhanced auto-blog posting using the full pipeline."""
     gemini_key = settings.get("llmApiKey") or os.getenv("GEMINI_API_KEY")
-    if not gemini_key:
-        print("[auto_blogger] No Gemini key — falling back to legacy generator")
+    # The pipeline can run on Ollama Cloud too; only fall back to the legacy
+    # generator if NO provider key is available at all.
+    ollama_key = os.getenv("OLLAMA_API_KEY") or (
+        settings.get("llmApiKey") if (settings.get("llmApiName") or "").lower() in ("ollama_cloud", "ollama") else ""
+    )
+    if not gemini_key and not ollama_key:
+        print("[auto_blogger] No LLM key (Gemini or Ollama) — falling back to legacy generator")
         await generate_and_post_auto_blog(settings)
         return
 

@@ -11,9 +11,46 @@ import urllib.error
 import re
 from datetime import datetime
 
-# ── GEMINI HELPER ──────────────────────────────────────────────────────────────
+# ── LLM HELPERS (Gemini + Ollama Cloud) ─────────────────────────────────────────
+# Every pipeline stage calls _llm(prompt, llm_cfg, ...). llm_cfg is either a bare
+# Gemini API key string (back-compat) or a config dict from _build_llm_cfg().
 
-def _gemini(prompt: str, api_key: str, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192) -> str:
+# Best Ollama Cloud model for long-form blog writing with reliable JSON output.
+_OLLAMA_DEFAULT_MODEL = "gpt-oss:120b"  # alternatives: deepseek-v3.1:671b, glm-4.6, kimi-k2
+
+
+def _build_llm_cfg(settings: dict, gemini_key: str) -> dict:
+    """Decide which LLM the pipeline uses. If an Ollama Cloud key is present
+    (settings or OLLAMA_API_KEY env), use Ollama Cloud; otherwise Gemini."""
+    name = (settings.get("llmApiName") or "").lower()
+    ollama_key = (settings.get("llmApiKey", "") if name in ("ollama_cloud", "ollama") else "") \
+        or os.getenv("OLLAMA_API_KEY", "")
+    if ollama_key:
+        model = settings.get("llmModelName") or ""
+        if not model or model == "qwen2.5:latest":   # generic/local default doesn't apply to cloud
+            model = os.getenv("OLLAMA_MODEL") or _OLLAMA_DEFAULT_MODEL
+        return {
+            "provider": "ollama_cloud",
+            "model": model,
+            "ollama_key": ollama_key,
+            "ollama_host": settings.get("llmBaseUrl") or os.getenv("OLLAMA_HOST") or "https://ollama.com",
+        }
+    return {
+        "provider": "gemini",
+        "gemini_key": gemini_key or settings.get("llmApiKey", "") or os.getenv("GEMINI_API_KEY", ""),
+    }
+
+
+def _llm(prompt: str, llm_cfg, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192) -> str:
+    """Dispatch a text-generation call to the configured provider."""
+    if isinstance(llm_cfg, str):  # back-compat: bare Gemini key
+        llm_cfg = {"provider": "gemini", "gemini_key": llm_cfg}
+    if llm_cfg.get("provider") in ("ollama_cloud", "ollama"):
+        return _ollama_generate(prompt, llm_cfg, json_mode, timeout, max_tokens)
+    return _gemini_generate(prompt, llm_cfg.get("gemini_key", ""), json_mode, timeout, max_tokens)
+
+
+def _gemini_generate(prompt: str, api_key: str, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192) -> str:
     """Call Gemini 2.5 Flash with retry/backoff on transient errors (429/503)."""
     import time
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
@@ -41,6 +78,50 @@ def _gemini(prompt: str, api_key: str, json_mode: bool = False, timeout: int = 6
             if e.code in (429, 503, 500) and attempt < 3:
                 wait = (2 ** attempt) * 8  # 8s, 16s, 32s backoff
                 print(f"[gemini] {e.code} on attempt {attempt+1}, retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt < 3:
+                time.sleep(5)
+                continue
+            raise
+    if last_err:
+        raise last_err
+
+
+def _ollama_generate(prompt: str, cfg: dict, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192) -> str:
+    """Call an Ollama Cloud model (https://ollama.com) with retry/backoff.
+    Uses the standard Ollama /api/chat shape with Bearer auth + format=json."""
+    import time
+    host = (cfg.get("ollama_host") or "https://ollama.com").rstrip("/")
+    model = cfg.get("model") or _OLLAMA_DEFAULT_MODEL
+    key = cfg.get("ollama_key", "")
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "options": {"temperature": 0.5 if json_mode else 0.85, "num_predict": max_tokens},
+    }
+    if json_mode:
+        payload["format"] = "json"
+    data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    last_err = None
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(f"{host}/api/chat", data=data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                result = json.loads(resp.read().decode())
+                return (result.get("message", {}).get("content", "") or "").strip()
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in (429, 502, 503, 500) and attempt < 3:
+                wait = (2 ** attempt) * 5
+                print(f"[ollama_cloud] {e.code} on attempt {attempt+1}, retrying in {wait}s...")
                 time.sleep(wait)
                 continue
             raise
@@ -160,7 +241,7 @@ Respond ONLY with JSON:
   "search_intent": "informational | transactional | navigational | commercial"
 }}"""
 
-    result = _gemini(prompt, gemini_key, json_mode=True)
+    result = _llm(prompt, gemini_key, json_mode=True)
     try:
         return json.loads(result)
     except:
@@ -203,7 +284,7 @@ Conduct keyword research and respond ONLY with JSON:
   "meta_description": "SEO description 140-160 chars with primary keyword and CTA"
 }}"""
 
-    result = _gemini(prompt, gemini_key, json_mode=True)
+    result = _llm(prompt, gemini_key, json_mode=True)
     try:
         return json.loads(result)
     except:
@@ -301,7 +382,7 @@ Organize this into a research brief. Respond ONLY with JSON:
   ]
 }}"""
 
-    result = _gemini(prompt, gemini_key, json_mode=True, timeout=45)
+    result = _llm(prompt, gemini_key, json_mode=True, timeout=45)
     try:
         research = json.loads(result)
         research["references"] = all_refs[:8]
@@ -423,7 +504,7 @@ OUTPUT FORMAT — Respond ONLY with this exact JSON structure:
   "tags": ["tag1", "tag2", "tag3", "tag4"]
 }}"""
 
-    result = _gemini(prompt, gemini_key, json_mode=True, timeout=180, max_tokens=32768)
+    result = _llm(prompt, gemini_key, json_mode=True, timeout=180, max_tokens=32768)
     try:
         blog = _parse_json_lenient(result)
         # Inject references into the HTML content
@@ -871,7 +952,7 @@ Respond ONLY with JSON:
 {{"title": "...", "meta_description": "..."}}"""
 
     try:
-        result = _gemini(prompt, gemini_key, json_mode=True, timeout=40, max_tokens=1024)
+        result = _llm(prompt, gemini_key, json_mode=True, timeout=40, max_tokens=1024)
         fixed = _parse_json_lenient(result)
         kw_words = [w for w in primary_kw.lower().split() if len(w) > 2]
         new_title = fixed.get("title", "")
@@ -927,7 +1008,12 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
     unsplash_key = settings.get("unsplash_key", "") or os.getenv("UNSPLASH_ACCESS_KEY", "")
     pexels_key = settings.get("pexels_key", "") or os.getenv("PEXELS_API_KEY", "")
 
+    # Resolve the LLM provider once; every stage receives this config. Prefers
+    # Ollama Cloud when a key is configured, else Gemini.
+    gemini_key = _build_llm_cfg(settings, gemini_key)
+
     log = []
+    log.append(f"🧠 LLM: {gemini_key.get('provider')} ({gemini_key.get('model', 'gemini-2.5-flash')})")
 
     # Stage 1: Trending topic
     log.append("🔍 Researching trending topics...")
