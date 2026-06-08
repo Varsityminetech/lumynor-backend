@@ -26,12 +26,18 @@ def _build_llm_cfg(settings: dict, gemini_key: str) -> dict:
     ollama_key = (settings.get("llmApiKey", "") if name in ("ollama_cloud", "ollama") else "") \
         or os.getenv("OLLAMA_API_KEY", "")
     if ollama_key:
-        model = settings.get("llmModelName") or ""
-        if not model or model == "qwen2.5:latest":   # generic/local default doesn't apply to cloud
-            model = os.getenv("OLLAMA_MODEL") or _OLLAMA_DEFAULT_MODEL
+        # Per-task model routing. Heavy writing uses a quality-first fallback
+        # chain (each tried in order until one succeeds — handles models that
+        # need a higher plan, e.g. deepseek 403s and skips to the next). Light
+        # JSON stages use a small fast model.
+        writing_models = [m.strip() for m in (os.getenv("OLLAMA_WRITING_MODELS", "") or "").split(",") if m.strip()] \
+            or ["glm-4.6", "deepseek-v3.1:671b", "gpt-oss:120b"]
+        fast_model = os.getenv("OLLAMA_MODEL_FAST") or "gpt-oss:20b"
         return {
             "provider": "ollama_cloud",
-            "model": model,
+            "model": writing_models[0],           # default / non-task calls
+            "writing_models": writing_models,     # quality-first fallback chain
+            "fast_model": fast_model,             # light structured/JSON stages
             "ollama_key": ollama_key,
             "ollama_host": settings.get("llmBaseUrl") or os.getenv("OLLAMA_HOST") or "https://ollama.com",
         }
@@ -41,12 +47,27 @@ def _build_llm_cfg(settings: dict, gemini_key: str) -> dict:
     }
 
 
-def _llm(prompt: str, llm_cfg, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192) -> str:
-    """Dispatch a text-generation call to the configured provider."""
+def _llm(prompt: str, llm_cfg, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192, task: str = "fast") -> str:
+    """Dispatch a text-generation call to the configured provider.
+    task="writing" uses the quality-first fallback chain; otherwise a fast model."""
     if isinstance(llm_cfg, str):  # back-compat: bare Gemini key
         llm_cfg = {"provider": "gemini", "gemini_key": llm_cfg}
     if llm_cfg.get("provider") in ("ollama_cloud", "ollama"):
-        return _ollama_generate(prompt, llm_cfg, json_mode, timeout, max_tokens)
+        if task == "writing":
+            models = llm_cfg.get("writing_models") or [llm_cfg.get("model")]
+        else:
+            models = [llm_cfg.get("fast_model") or llm_cfg.get("model")]
+        last_err = None
+        for m in [x for x in models if x]:
+            try:
+                return _ollama_generate(prompt, llm_cfg, json_mode, timeout, max_tokens, model=m)
+            except Exception as e:
+                last_err = e
+                print(f"[ollama_cloud] model '{m}' failed ({str(e)[:80]}); trying next in chain...")
+                continue
+        if last_err:
+            raise last_err
+        raise RuntimeError("No Ollama Cloud model available")
     return _gemini_generate(prompt, llm_cfg.get("gemini_key", ""), json_mode, timeout, max_tokens)
 
 
@@ -91,12 +112,12 @@ def _gemini_generate(prompt: str, api_key: str, json_mode: bool = False, timeout
         raise last_err
 
 
-def _ollama_generate(prompt: str, cfg: dict, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192) -> str:
+def _ollama_generate(prompt: str, cfg: dict, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192, model: str = None) -> str:
     """Call an Ollama Cloud model (https://ollama.com) with retry/backoff.
     Uses the standard Ollama /api/chat shape with Bearer auth + format=json."""
     import time
     host = (cfg.get("ollama_host") or "https://ollama.com").rstrip("/")
-    model = cfg.get("model") or _OLLAMA_DEFAULT_MODEL
+    model = model or cfg.get("model") or _OLLAMA_DEFAULT_MODEL
     key = cfg.get("ollama_key", "")
     payload = {
         "model": model,
@@ -504,7 +525,7 @@ OUTPUT FORMAT — Respond ONLY with this exact JSON structure:
   "tags": ["tag1", "tag2", "tag3", "tag4"]
 }}"""
 
-    result = _llm(prompt, gemini_key, json_mode=True, timeout=180, max_tokens=32768)
+    result = _llm(prompt, gemini_key, json_mode=True, timeout=180, max_tokens=32768, task="writing")
     try:
         blog = _parse_json_lenient(result)
         # Inject references into the HTML content
@@ -1013,7 +1034,10 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
     gemini_key = _build_llm_cfg(settings, gemini_key)
 
     log = []
-    log.append(f"🧠 LLM: {gemini_key.get('provider')} ({gemini_key.get('model', 'gemini-2.5-flash')})")
+    if gemini_key.get("provider") in ("ollama_cloud", "ollama"):
+        log.append(f"🧠 LLM: ollama_cloud · writing={'/'.join(gemini_key.get('writing_models', []))} · fast={gemini_key.get('fast_model')}")
+    else:
+        log.append("🧠 LLM: gemini (gemini-2.5-flash)")
 
     # Stage 1: Trending topic
     log.append("🔍 Researching trending topics...")
