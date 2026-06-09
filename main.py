@@ -1,7 +1,8 @@
 import asyncio
 import os
+import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -1078,11 +1079,50 @@ async def generate_and_post_auto_blog(settings):
     })
     print(f"\U0001f4f0 Auto-Blogger published post: {new_blog['title']}")
 
+_last_purge_ts = 0
+
+def purge_expired_blogs():
+    """Auto-delete blog posts older than BLOG_EXPIRY_DAYS (clamped to 180-365,
+    i.e. 6 months - 1 year). Keeps the daily-published blog from growing forever."""
+    days = max(180, min(365, int(os.getenv("BLOG_EXPIRY_DAYS", "270"))))
+    blogs = read_json_file(BLOGS_FILE, [])
+    if not blogs:
+        return 0
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    kept, removed = [], []
+    for b in blogs:
+        ts = b.get("created_at") or b.get("generatedAt")
+        created = None
+        if ts:
+            try:
+                created = datetime.fromisoformat(str(ts).replace("Z", ""))
+            except Exception:
+                created = None
+        (removed if (created and created < cutoff) else kept).append(b)
+    if removed:
+        write_json_file(BLOGS_FILE, kept)
+        comments = read_json_file(COMMENTS_FILE, {})
+        if any(b.get("id") in comments for b in removed):
+            for b in removed:
+                comments.pop(b.get("id"), None)
+            write_json_file(COMMENTS_FILE, comments)
+        print(f"\U0001f5d1️  Purged {len(removed)} blog(s) older than {days} days")
+    return len(removed)
+
+
 async def auto_blogger_daemon():
     print("\U0001f916 Auto-Blogger Daemon started.")
     while True:
         try:
             await asyncio.sleep(10)
+            # Expire old posts (throttled to ~6h) regardless of auto-blog enabled state.
+            global _last_purge_ts
+            if time.time() - _last_purge_ts > 21600:
+                _last_purge_ts = time.time()
+                try:
+                    purge_expired_blogs()
+                except Exception as e:
+                    print(f"[purge] error: {e}")
             settings = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
             if not settings.get("enabled", False):
                 continue
