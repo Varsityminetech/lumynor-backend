@@ -273,6 +273,52 @@ Respond ONLY with JSON:
 
 # ── STAGE 2: SEO KEYWORD RESEARCH ─────────────────────────────────────────────
 
+_STOPWORDS = {
+    "the", "a", "an", "of", "in", "on", "for", "to", "and", "or", "with", "by",
+    "is", "are", "this", "that", "your", "you", "how", "what", "why", "best",
+    "top", "guide", "future", "2024", "2025", "2026",
+}
+
+
+def _keyword_from_topic(topic: str) -> str:
+    """Derive a meaningful 2-3 word keyword from a topic (drops stopwords)."""
+    words = re.findall(r"[A-Za-z0-9]+", topic or "")
+    kept = [w for w in words if w.lower() not in _STOPWORDS]
+    return " ".join(kept[:3]) if kept else (topic or "technology").strip()
+
+
+def _clean_primary_keyword(kw: str, topic: str) -> str:
+    """Reject empty/stopword/garbage primary keywords; fall back to the topic."""
+    kw = (kw or "").strip().strip(".,;:!?\"'")
+    words = kw.split()
+    if not kw or len(kw) < 3 or len(words) > 5 or all(w.lower() in _STOPWORDS for w in words):
+        return _keyword_from_topic(topic)
+    return kw
+
+
+def _clean_keyword_list(items) -> list:
+    """Trim, de-punctuate, drop empties, and de-dupe (case-insensitive)."""
+    out, seen = [], set()
+    for it in (items or []):
+        k = str(it).strip().strip(".,;:!?\"'")
+        if k and k.lower() not in seen:
+            seen.add(k.lower())
+            out.append(k)
+    return out
+
+
+def _clamp_summary(text: str, hi: int = 160) -> str:
+    """Trim a meta description/summary to the SEO sweet spot (<=160 chars),
+    cutting on a word boundary with an ellipsis."""
+    s = re.sub(r'\s+', ' ', (text or '').strip())
+    if len(s) <= hi:
+        return s
+    cut = s[:hi - 1]
+    if ' ' in cut:
+        cut = cut[:cut.rfind(' ')]
+    return cut.rstrip(' .,;:') + '…'
+
+
 def do_keyword_research(topic: str, niche: str, gemini_key: str) -> dict:
     """Research primary + secondary + LSI keywords for SEO."""
 
@@ -307,20 +353,27 @@ Conduct keyword research and respond ONLY with JSON:
   "meta_description": "SEO description 140-160 chars with primary keyword and CTA"
 }}"""
 
-    result = _llm(prompt, gemini_key, json_mode=True)
+    # Keyword research drives the whole article's SEO targeting — use the strong
+    # writing model (not the tiny fast one, which produced garbage keywords).
+    result = _llm(prompt, gemini_key, json_mode=True, task="writing")
     try:
-        return json.loads(result)
-    except:
-        return {
-            "primary_keyword": topic.lower().split()[0],
-            "secondary_keywords": [topic, niche],
+        data = json.loads(result)
+    except Exception:
+        data = {
+            "primary_keyword": _keyword_from_topic(topic),
+            "secondary_keywords": [niche, topic],
             "lsi_keywords": [],
             "search_volume": "1K-10K",
             "keyword_difficulty": "medium",
             "people_also_ask": [],
             "meta_title": topic[:60],
-            "meta_description": f"Learn about {topic} in this comprehensive guide."
+            "meta_description": f"Learn about {topic} in this comprehensive guide.",
         }
+    # Sanitize regardless of source: never let a stopword/garbage keyword through.
+    data["primary_keyword"] = _clean_primary_keyword(data.get("primary_keyword", ""), topic)
+    data["secondary_keywords"] = _clean_keyword_list(data.get("secondary_keywords"))
+    data["lsi_keywords"] = _clean_keyword_list(data.get("lsi_keywords"))
+    return data
 
 
 # ── STAGE 3: WEB RESEARCH & FACT GATHERING ────────────────────────────────────
@@ -813,138 +866,84 @@ def generate_blog_images(
 # ── STAGE 6: SEO VALIDATION ────────────────────────────────────────────────────
 
 def validate_seo(blog: dict) -> dict:
-    """Score the blog against Google SEO guidelines. Returns score + fixes."""
-    score = 0
+    """Score the blog with the SAME rubric as the on-page SEO checker in the
+    admin (Settings.jsx getSeoReport), so the stored score matches what the user
+    sees. Starts at 100 and deducts per failed check (exact-phrase keyword,
+    strict title/summary lengths, FAQ/References headings in the HTML)."""
+    title = blog.get("title", "") or ""
+    summary = blog.get("summary", "") or blog.get("meta_description", "") or ""
+    content = blog.get("content_html", "") or ""
+    primary = (blog.get("primary_keyword", "") or "").strip()
+
+    sec_raw = blog.get("secondary_keywords", "")
+    if isinstance(sec_raw, str):
+        secondary = [k.strip() for k in sec_raw.split(",") if k.strip()]
+    else:
+        secondary = [str(k).strip() for k in (sec_raw or []) if str(k).strip()]
+
+    clean = re.sub(r'<[^>]*>', ' ', content)
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    words = [w for w in clean.split(' ') if w]
+    word_count = len(words)
+
+    if not primary:
+        return {"score": 0, "grade": "F", "word_count": word_count,
+                "issues": ["No primary keyword set"], "fixes": []}
+
+    score = 100
     issues = []
-    fixes = []
+    p = primary.lower()
 
-    title = blog.get("title", "")
-    meta_desc = blog.get("meta_description", "")
-    content = blog.get("content_html", "")
-    primary_kw = blog.get("primary_keyword", "").lower()
-    faq = blog.get("faq", [])
+    def deduct(pts, msg):
+        nonlocal score
+        score -= pts
+        issues.append(f"-{pts}: {msg}")
 
-    # Keyword presence helper: exact phrase OR all significant component words present
-    def _kw_present(text):
-        t = text.lower()
-        if not primary_kw:
-            return False
-        if primary_kw in t:
-            return True
-        kw_words = [w for w in primary_kw.split() if len(w) > 2]
-        return bool(kw_words) and all(w in t for w in kw_words)
+    if p not in title.lower():
+        deduct(15, "primary keyword missing from title")
+    if not (30 <= len(title) <= 60):
+        deduct(10, f"title length {len(title)} (need 30-60)")
+    if p not in summary.lower():
+        deduct(10, "primary keyword missing from summary")
+    if not (120 <= len(summary) <= 160):
+        deduct(10, f"summary length {len(summary)} (need 120-160)")
+    if word_count < 600:
+        deduct(10, f"word count {word_count} (<600)")
 
-    # Title checks
-    if _kw_present(title):
-        score += 15
-    else:
-        issues.append("Primary keyword missing from title")
-        fixes.append(f"Add '{primary_kw}' to title")
+    occ = len(re.findall(re.escape(primary), content, re.I))
+    density = (occ * 100 / word_count) if word_count else 0
+    if not (0.6 <= density <= 2.2):
+        deduct(15, f"keyword density {density:.1f}% ({occ}x, need 0.6-2.2%)")
 
-    if 35 <= len(title) <= 70:
-        score += 5
-    else:
-        issues.append(f"Title length {len(title)} (ideal: 35-70)")
+    intro = ' '.join(words[:200]).lower()
+    if p not in intro:
+        deduct(10, "primary keyword not in first paragraph")
 
-    # Meta description
-    if meta_desc and _kw_present(meta_desc):
-        score += 10
-    else:
-        issues.append("Primary keyword missing from meta description")
+    if secondary:
+        found = [s for s in secondary if s.lower() in content.lower()]
+        if not found:
+            deduct(15, "no secondary keywords present")
+        elif len(found) < len(secondary):
+            deduct(5 * (len(secondary) - len(found)), f"secondary keywords {len(found)}/{len(secondary)}")
 
-    if 120 <= len(meta_desc) <= 165:
-        score += 5
-    else:
-        issues.append(f"Meta description length {len(meta_desc)} (ideal: 120-165)")
+    headings = re.findall(r'<h[23][^>]*>(.*?)</h[23]>', content, re.I | re.S)
+    if not any(p in h.lower() for h in headings):
+        deduct(10, "primary keyword not in any H2/H3 subheading")
 
-    # Content checks
-    word_count = len(re.sub('<[^>]+>', '', content).split())
-    if word_count >= 1500:
-        score += 15
-    elif word_count >= 800:
-        score += 8
-        issues.append(f"Word count {word_count} — aim for 1500+")
-    else:
-        issues.append(f"Word count too low: {word_count}")
+    if not re.search(r'<h[23][^>]*>[^<]*(FAQ|Frequently Asked Questions)', content, re.I):
+        deduct(10, "no FAQ section heading in content")
+    if not re.search(r'<h[23][^>]*>[^<]*(References|Sources|Citations)', content, re.I):
+        deduct(10, "no References section heading in content")
+    if not re.search(r'<a\s+[^>]*href=["\']https?://', content, re.I):
+        deduct(5, "no external/citation links")
 
-    # Keyword density — realistic for multi-word phrases.
-    # Score on the best of: exact-phrase density OR average individual-word density.
-    clean_text = re.sub('<[^>]+>', '', content).lower()
-    words_list = clean_text.split()
-    total_words = max(len(words_list), 1)
-    kw_words = [w for w in primary_kw.lower().split() if len(w) > 2] if primary_kw else []
-
-    exact_count = clean_text.count(primary_kw.lower()) if primary_kw else 0
-    exact_density = (exact_count / total_words) * 100
-
-    # Coverage: do the keyword's words each appear a healthy number of times?
-    if kw_words:
-        word_hits = [clean_text.count(w) for w in kw_words]
-        avg_word_density = (sum(word_hits) / len(kw_words) / total_words) * 100
-        all_words_present = all(h > 0 for h in word_hits)
-    else:
-        avg_word_density = exact_density
-        all_words_present = exact_count > 0
-
-    if 0.4 <= exact_density <= 3.0:
-        score += 15
-    elif all_words_present and 0.5 <= avg_word_density <= 6.0:
-        # Multi-word keyword: each component used naturally throughout
-        score += 14
-    elif exact_count > 0 or all_words_present:
-        score += 9
-        issues.append(f"Keyword density {exact_density:.1f}% exact (ideal: 0.5-2.5%)")
-    else:
-        issues.append("Primary keyword not found in content")
-
-    # Headings
-    h2_count = content.count("<h2")
-    h3_count = content.count("<h3")
-    if h2_count >= 3:
-        score += 10
-    else:
-        issues.append(f"Only {h2_count} H2 headings (aim for 4+)")
-
-    # FAQ
-    if len(faq) >= 5:
-        score += 10
-    elif len(faq) >= 3:
-        score += 6
-        issues.append("FAQ has fewer than 5 questions")
-    else:
-        issues.append("Missing FAQ section")
-
-    # References
-    if "<a " in content and ("href=" in content):
-        score += 5
-    else:
-        issues.append("No outbound links / references")
-
-    # Images (check content, cover, or generated image_prompts/images array)
-    has_images = (
-        "<img" in content
-        or blog.get("cover_image")
-        or blog.get("coverImage")
-        or blog.get("images")
-        or blog.get("image_prompts")
-    )
-    if has_images:
-        score += 5
-    else:
-        issues.append("No images found")
-
-    # Lists
-    if "<ul" in content or "<ol" in content:
-        score += 5
-    else:
-        issues.append("No bullet or numbered lists")
-
+    score = max(0, min(100, score))
     return {
-        "score": min(score, 100),
+        "score": score,
         "grade": "A" if score >= 90 else "B" if score >= 75 else "C" if score >= 60 else "D",
         "word_count": word_count,
         "issues": issues,
-        "fixes": fixes
+        "fixes": issues,
     }
 
 
@@ -1115,6 +1114,26 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
                     img_idx += 1
         blog_content["content_html"] = "".join(out)
 
+    # Embed the FAQ as a real <h2> section in the article body — good for SEO and
+    # so the on-page SEO checker credits it. The separate faq array is cleared in
+    # the final object so the Q&A doesn't render twice on the page.
+    faq_items = blog_content.get("faq", []) or []
+    ch = blog_content.get("content_html", "").rstrip()
+    if faq_items and not re.search(r'<h[23][^>]*>[^<]*(FAQ|Frequently Asked)', ch, re.I):
+        faq_html = "<h2>Frequently Asked Questions</h2>"
+        for it in faq_items:
+            q = (it.get("question") or "").strip()
+            a = (it.get("answer") or "").strip()
+            if q and a:
+                faq_html += f"<h3>{q}</h3><p>{a}</p>"
+        blog_content["content_html"] = ch + "\n" + faq_html
+
+    # Enforce a <=160 char meta description / summary (SEO sweet spot).
+    summary = _clamp_summary(blog_content.get("summary") or blog_content.get("meta_description") or "")
+    blog_content["summary"] = summary
+    if not blog_content.get("meta_description"):
+        blog_content["meta_description"] = summary
+
     # Stage 6: SEO validation + refinement loop (target 90+)
     seo_report = validate_seo(blog_content)
     log.append(f"📊 Initial SEO Score: {seo_report['score']}/100 (Grade {seo_report['grade']})")
@@ -1156,7 +1175,7 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
         "metaDescription": blog_content.get("meta_description", ""),
         "readTime": blog_content.get("read_time", f"{max(1, word_count // 200)} min read"),
         "tags": blog_content.get("tags", [niche.lower(), category.lower()]),
-        "faq": blog_content.get("faq", []),
+        "faq": [],   # FAQ is embedded in content HTML above; keep this empty to avoid double-render
         "images": images,
         "references": blog_content.get("references", research.get("references", [])),
         "seoScore": seo_report["score"],
