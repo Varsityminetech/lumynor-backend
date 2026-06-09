@@ -704,8 +704,12 @@ def get_all_blogs():
 def get_single_blog(slug_or_id: str):
     blogs = read_json_file(BLOGS_FILE, [])
     # Look by slug first, then ID
-    for blog in blogs:
+    for idx, blog in enumerate(blogs):
         if blog.get("slug") == slug_or_id or blog.get("id") == slug_or_id:
+            # Increment view count (powers "Most Read" on the blog landing).
+            blog["views"] = int(blog.get("views", 0)) + 1
+            blogs[idx] = blog
+            write_json_file(BLOGS_FILE, blogs)
             comments = read_json_file(COMMENTS_FILE, {}).get(blog.get("id"), [])
             blog_copy = dict(blog)
             blog_copy["comments"] = comments

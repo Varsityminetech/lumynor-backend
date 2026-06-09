@@ -319,6 +319,42 @@ def _clamp_summary(text: str, hi: int = 160) -> str:
     return cut.rstrip(' .,;:') + '…'
 
 
+# Internal-link targets, matched by keyword in the anchor text (else round-robin).
+_INTERNAL_LINK_MAP = [
+    (("agent forge", "agentforge", "agent-forge", "scaffold", "build saas", "saas builder"), "/products/agent-forge"),
+    (("district 21", "district21", "ticketing", "event ticket"), "/products/district-21"),
+    (("hotel", "hospitality"), "/products/hotel-os"),
+    (("school", "education", "admission"), "/products/school-os"),
+    (("contact", "get in touch", "talk to", "consultation", "hire", "work with"), "/contact"),
+    (("about", "team", "who we are", "our story"), "/about"),
+    (("blog", "article", "read more", "insights", "guide"), "/blog"),
+]
+_INTERNAL_LINK_ROTATION = ["/contact", "/products/agent-forge", "/blog", "/about"]
+
+
+def _resolve_content_placeholders(content: str) -> str:
+    """Clean up the LLM's leftover markers: drop [IMAGE: ...] (images are
+    embedded as <figure>s) and turn [INTERNAL: text] into real internal links."""
+    if not content:
+        return content
+    import itertools
+    content = re.sub(r'\[IMAGE:[^\]]*\]', '', content, flags=re.I)
+    rot = itertools.cycle(_INTERNAL_LINK_ROTATION)
+
+    def _link(m):
+        text = m.group(1).strip().strip('|').strip()
+        low = text.lower()
+        for kws, url in _INTERNAL_LINK_MAP:
+            if any(k in low for k in kws):
+                return f'<a href="{url}">{text}</a>'
+        return f'<a href="{next(rot)}">{text}</a>'
+
+    content = re.sub(r'\[INTERNAL:\s*([^\]]+)\]', _link, content, flags=re.I)
+    # Strip any other stray [PLACEHOLDER: ...] markers that slipped through.
+    content = re.sub(r'\[[A-Z][A-Z _-]{2,}:[^\]]*\]', '', content)
+    return content
+
+
 def do_keyword_research(topic: str, niche: str, gemini_key: str) -> dict:
     """Research primary + secondary + LSI keywords for SEO."""
 
@@ -549,8 +585,8 @@ SEO RULES:
 1. Primary keyword "{primary_kw}" must appear in: title, first 100 words, at least 2 H2 headings, meta description
 2. Use secondary keywords naturally — never force them
 3. Every H2 must be actionable or curiosity-driving
-4. Include internal linking placeholders: [INTERNAL: link text]
-5. Images get descriptive alt text placeholders: [IMAGE: descriptive caption]
+4. Add 2-4 internal links as real relative anchors to relevant Lumynor pages, e.g. <a href="/products/agent-forge">Agent Forge</a>, <a href="/contact">talk to our team</a>, <a href="/blog">more insights</a>. Use natural anchor text in context.
+5. Write clean HTML only — do NOT output any "[IMAGE: ...]" or "[INTERNAL: ...]" placeholder markers.
 
 OUTPUT FORMAT — Respond ONLY with this exact JSON structure:
 {{
@@ -1113,6 +1149,10 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
                     )
                     img_idx += 1
         blog_content["content_html"] = "".join(out)
+
+    # Clean LLM markers: strip [IMAGE: ...] and convert [INTERNAL: ...] to real
+    # internal links (better SEO + no placeholder text leaking to readers).
+    blog_content["content_html"] = _resolve_content_placeholders(blog_content.get("content_html", ""))
 
     # Embed the FAQ as a real <h2> section in the article body — good for SEO and
     # so the on-page SEO checker credits it. The separate faq array is cleared in
