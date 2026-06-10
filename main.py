@@ -1081,16 +1081,21 @@ async def generate_and_post_auto_blog(settings):
 
 _last_purge_ts = 0
 
-def purge_expired_blogs():
-    """Auto-delete blog posts older than BLOG_EXPIRY_DAYS (clamped to 180-365,
-    i.e. 6 months - 1 year). Keeps the daily-published blog from growing forever."""
+def expire_stale_blogs():
+    """Auto-EXPIRE stale posts by UNPUBLISHING (not deleting) them — preserves
+    the URL/SEO equity and is reversible. A post is retired only if it's BOTH
+    old (> BLOG_EXPIRY_DAYS, clamped 180-365 = 6mo-1yr) AND low-traffic
+    (< BLOG_EXPIRY_MIN_VIEWS). High-traffic old posts stay live."""
     days = max(180, min(365, int(os.getenv("BLOG_EXPIRY_DAYS", "270"))))
+    min_views = int(os.getenv("BLOG_EXPIRY_MIN_VIEWS", "50"))
     blogs = read_json_file(BLOGS_FILE, [])
     if not blogs:
         return 0
     cutoff = datetime.utcnow() - timedelta(days=days)
-    kept, removed = [], []
+    changed = 0
     for b in blogs:
+        if not b.get("published", False):
+            continue  # already hidden
         ts = b.get("created_at") or b.get("generatedAt")
         created = None
         if ts:
@@ -1098,16 +1103,15 @@ def purge_expired_blogs():
                 created = datetime.fromisoformat(str(ts).replace("Z", ""))
             except Exception:
                 created = None
-        (removed if (created and created < cutoff) else kept).append(b)
-    if removed:
-        write_json_file(BLOGS_FILE, kept)
-        comments = read_json_file(COMMENTS_FILE, {})
-        if any(b.get("id") in comments for b in removed):
-            for b in removed:
-                comments.pop(b.get("id"), None)
-            write_json_file(COMMENTS_FILE, comments)
-        print(f"\U0001f5d1️  Purged {len(removed)} blog(s) older than {days} days")
-    return len(removed)
+        if created and created < cutoff and int(b.get("views", 0)) < min_views:
+            b["published"] = False
+            b["expiredAt"] = datetime.utcnow().isoformat()
+            b["expiredReason"] = f"auto-expired: >{days}d old, <{min_views} views"
+            changed += 1
+    if changed:
+        write_json_file(BLOGS_FILE, blogs)
+        print(f"\U0001f4e6 Auto-unpublished {changed} stale low-traffic post(s) (>{days}d, <{min_views} views)")
+    return changed
 
 
 async def auto_blogger_daemon():
@@ -1120,9 +1124,9 @@ async def auto_blogger_daemon():
             if time.time() - _last_purge_ts > 21600:
                 _last_purge_ts = time.time()
                 try:
-                    purge_expired_blogs()
+                    expire_stale_blogs()
                 except Exception as e:
-                    print(f"[purge] error: {e}")
+                    print(f"[expire] error: {e}")
             settings = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
             if not settings.get("enabled", False):
                 continue
