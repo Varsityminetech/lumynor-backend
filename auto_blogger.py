@@ -523,7 +523,7 @@ Organize this into a research brief. Respond ONLY with JSON:
 
 # ── STAGE 4: LONGFORM HUMAN-LIKE BLOG WRITING ─────────────────────────────────
 
-def write_longform_blog(topic: str, angle: str, keywords: dict, research: dict, target_audience: str, gemini_key: str) -> dict:
+def write_longform_blog(topic: str, angle: str, keywords: dict, research: dict, target_audience: str, gemini_key: str, quality_hints: str = None) -> dict:
     """Write a full longform human-like blog post with all SEO elements."""
 
     primary_kw = keywords.get("primary_keyword", topic)
@@ -621,6 +621,9 @@ OUTPUT FORMAT — Respond ONLY with this exact JSON structure:
   "secondary_keywords": "{secondary_kws}",
   "tags": ["tag1", "tag2", "tag3", "tag4"]
 }}"""
+
+    if quality_hints:
+        prompt += f"\n\nPREVIOUS DRAFT ISSUES — FIX ALL OF THESE IN THIS REWRITE:\n{quality_hints}\n"
 
     result = _llm(prompt, gemini_key, json_mode=True, timeout=180, max_tokens=32768, task="writing")
     try:
@@ -1100,28 +1103,37 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
     research = research_topic_facts(topic, keywords, gemini_key)
     log.append(f"📊 Found {len(research.get('key_statistics', []))} statistics, {len(research.get('references', []))} references")
 
-    # Stage 4: Write blog (retry once on parse failure)
+    # Stage 4: Write blog — quality retry loop, always using the best writing model.
+    # If the output is too short (thin content), retry rather than accepting a weak draft.
     log.append("✍️ Writing longform blog post...")
-    try:
-        blog_content = write_longform_blog(topic, angle, keywords, research, target_audience, gemini_key)
-    except Exception as e:
-        log.append(f"⚠️ First write attempt failed ({str(e)[:60]}), retrying...")
-        blog_content = write_longform_blog(topic, angle, keywords, research, target_audience, gemini_key)
+    _min_words = int(os.getenv("BLOG_MIN_WORD_COUNT", "1200"))
+    blog_content = None
+    for _attempt in range(1, 4):
+        try:
+            _draft = write_longform_blog(topic, angle, keywords, research, target_audience, gemini_key)
+            _wc = len(re.sub('<[^>]+>', '', _draft.get("content_html", "")).split())
+            blog_content = _draft
+            if _wc >= _min_words or _attempt == 3:
+                log.append(f"📝 Blog written: {_wc} words" + (f" (attempt {_attempt})" if _attempt > 1 else ""))
+                break
+            log.append(f"⚠️ Attempt {_attempt}: only {_wc} words (min {_min_words}) — rewriting for better quality...")
+        except Exception as e:
+            if _attempt == 3:
+                raise
+            log.append(f"⚠️ Write attempt {_attempt} failed ({str(e)[:60]}), retrying...")
     word_count = len(re.sub('<[^>]+>', '', blog_content.get("content_html", "")).split())
-    log.append(f"📝 Blog written: {word_count} words")
 
-    # Stage 5: Source images (web search by default, AI if configured)
+    # Stage 5: Source images — done ONCE and reused on any quality rewrite below.
     image_prompts = blog_content.get("image_prompts", [])
     log.append(f"🖼️ Sourcing {len(image_prompts)} images (mode: {image_source})...")
     images = generate_blog_images(
         image_prompts, nanobanana_key, nanobanana_url,
         image_source=image_source, unsplash_key=unsplash_key, pexels_key=pexels_key,
     )
-    blog_content["images"] = images  # so SEO validator sees them
+    blog_content["images"] = images
     sources = ", ".join(sorted(set(i.get("source", "?") for i in images)))
     log.append(f"   Image sources: {sources}")
 
-    # Set cover image + embed section images into the article body
     cover_image = ""
     cover_attribution = ""
     section_imgs = []
@@ -1132,72 +1144,89 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
         else:
             section_imgs.append(img)
 
-    # Embed each non-cover image after successive H2 headings (graphic illustration in-body)
-    content_html = blog_content.get("content_html", "")
-    if section_imgs and "<h2" in content_html:
-        parts = re.split(r'(<h2[^>]*>.*?</h2>)', content_html, flags=re.DOTALL)
-        out, h2_seen, img_idx = [], 0, 0
-        for seg in parts:
-            out.append(seg)
-            if seg.strip().lower().startswith("<h2") and img_idx < len(section_imgs):
-                h2_seen += 1
-                # Skip the very first H2 (intro) — place images deeper in the article
-                if h2_seen >= 2:
-                    im = section_imgs[img_idx]
-                    caption = im.get("alt", "")
-                    attr = im.get("attribution", "")
-                    if attr:
-                        caption = f'{caption} <span class="blog-credit">{attr}</span>' if caption else attr
-                    out.append(
-                        f'<figure class="blog-figure"><img src="{im["url"]}" alt="{im.get("alt","")}" '
-                        f'loading="lazy" style="width:100%;height:auto;border-radius:0;" />'
-                        f'<figcaption>{caption}</figcaption></figure>'
-                    )
-                    img_idx += 1
-        blog_content["content_html"] = "".join(out)
+    def _finalize_draft(draft):
+        """Embed images, inject FAQ, resolve placeholders, clamp meta, SEO-validate + refine.
+        Returns (processed_draft, seo_report). Captures section_imgs/research/gemini_key."""
+        # Embed section images after successive H2 headings
+        ch = draft.get("content_html", "")
+        if section_imgs and "<h2" in ch:
+            parts = re.split(r'(<h2[^>]*>.*?</h2>)', ch, flags=re.DOTALL)
+            out, h2_seen, img_idx = [], 0, 0
+            for seg in parts:
+                out.append(seg)
+                if seg.strip().lower().startswith("<h2") and img_idx < len(section_imgs):
+                    h2_seen += 1
+                    if h2_seen >= 2:
+                        im = section_imgs[img_idx]
+                        caption = im.get("alt", "")
+                        attr = im.get("attribution", "")
+                        if attr:
+                            caption = f'{caption} <span class="blog-credit">{attr}</span>' if caption else attr
+                        out.append(
+                            f'<figure class="blog-figure"><img src="{im["url"]}" alt="{im.get("alt","")}" '
+                            f'loading="lazy" style="width:100%;height:auto;border-radius:0;" />'
+                            f'<figcaption>{caption}</figcaption></figure>'
+                        )
+                        img_idx += 1
+            draft["content_html"] = "".join(out)
 
-    # Clean LLM markers: strip [IMAGE: ...] and convert [INTERNAL: ...] to real
-    # internal links (better SEO + no placeholder text leaking to readers).
-    blog_content["content_html"] = _resolve_content_placeholders(blog_content.get("content_html", ""))
+        draft["content_html"] = _resolve_content_placeholders(draft.get("content_html", ""))
 
-    # Embed the FAQ as a real <h2> section in the article body — good for SEO and
-    # so the on-page SEO checker credits it. The separate faq array is cleared in
-    # the final object so the Q&A doesn't render twice on the page.
-    faq_items = blog_content.get("faq", []) or []
-    ch = blog_content.get("content_html", "").rstrip()
-    if faq_items and not re.search(r'<h[23][^>]*>[^<]*(FAQ|Frequently Asked)', ch, re.I):
-        faq_html = "<h2>Frequently Asked Questions</h2>"
-        for it in faq_items:
-            q = (it.get("question") or "").strip()
-            a = (it.get("answer") or "").strip()
-            if q and a:
-                faq_html += f"<h3>{q}</h3><p>{a}</p>"
-        blog_content["content_html"] = ch + "\n" + faq_html
+        faq_items = draft.get("faq", []) or []
+        ch2 = draft.get("content_html", "").rstrip()
+        if faq_items and not re.search(r'<h[23][^>]*>[^<]*(FAQ|Frequently Asked)', ch2, re.I):
+            faq_html = "<h2>Frequently Asked Questions</h2>"
+            for it in faq_items:
+                q = (it.get("question") or "").strip()
+                a = (it.get("answer") or "").strip()
+                if q and a:
+                    faq_html += f"<h3>{q}</h3><p>{a}</p>"
+            draft["content_html"] = ch2 + "\n" + faq_html
 
-    # Enforce a <=160 char meta description / summary (SEO sweet spot).
-    summary = _clamp_summary(blog_content.get("summary") or blog_content.get("meta_description") or "")
-    blog_content["summary"] = summary
-    if not blog_content.get("meta_description"):
-        blog_content["meta_description"] = summary
+        summary = _clamp_summary(draft.get("summary") or draft.get("meta_description") or "")
+        draft["summary"] = summary
+        if not draft.get("meta_description"):
+            draft["meta_description"] = summary
 
-    # Stage 6: SEO validation + refinement loop (target 90+)
-    seo_report = validate_seo(blog_content)
-    log.append(f"📊 Initial SEO Score: {seo_report['score']}/100 (Grade {seo_report['grade']})")
+        # SEO validate + refine (target 90+)
+        seo = validate_seo(draft)
+        if seo["score"] < 90 and seo.get("issues"):
+            draft = refine_blog_seo(draft, seo, gemini_key)
+            refs = research.get("references", [])
+            if refs and "References" not in draft.get("content_html", ""):
+                ref_html = "<h2>References &amp; Sources</h2><ol>"
+                for r in refs[:6]:
+                    ref_html += f'<li><a href="{r["url"]}" target="_blank" rel="noopener noreferrer">{r["title"]}</a></li>'
+                ref_html += "</ol>"
+                draft["content_html"] = draft["content_html"].rstrip() + "\n" + ref_html
+            seo = validate_seo(draft)
+        return draft, seo
 
-    if seo_report["score"] < 90 and seo_report.get("issues"):
-        log.append(f"🔧 Refining SEO ({len(seo_report['issues'])} issues to fix)...")
-        blog_content = refine_blog_seo(blog_content, seo_report, gemini_key)
-        # Re-inject references if refinement stripped them
-        refs = research.get("references", [])
-        if refs and "References" not in blog_content.get("content_html", ""):
-            ref_html = "<h2>References &amp; Sources</h2><ol>"
-            for r in refs[:6]:
-                ref_html += f'<li><a href="{r["url"]}" target="_blank" rel="noopener noreferrer">{r["title"]}</a></li>'
-            ref_html += "</ol>"
-            blog_content["content_html"] = blog_content["content_html"].rstrip() + "\n" + ref_html
-        word_count = len(re.sub('<[^>]+>', '', blog_content.get("content_html", "")).split())
-        seo_report = validate_seo(blog_content)
-        log.append(f"✅ Refined SEO Score: {seo_report['score']}/100 (Grade {seo_report['grade']})")
+    # First finalization pass
+    blog_content, seo_report = _finalize_draft(blog_content)
+    log.append(f"📊 SEO Score: {seo_report['score']}/100 (Grade {seo_report['grade']})")
+
+    # Quality rewrite: if SEO is still weak after refinement, rewrite the full article
+    # body once — passing the specific issues back into the LLM so it can address them.
+    # Images are already sourced above and are reused in _finalize_draft.
+    _min_quality = int(os.getenv("BLOG_MIN_QUALITY_SCORE", "75"))
+    if seo_report["score"] < _min_quality and seo_report.get("issues"):
+        hints = " | ".join(i.lstrip("-0123456789: ") for i in seo_report["issues"])
+        log.append(f"🔄 Quality below {_min_quality} — rewriting with {len(seo_report['issues'])} SEO fixes targeted...")
+        try:
+            _rewrite = write_longform_blog(
+                topic, angle, keywords, research, target_audience, gemini_key,
+                quality_hints=hints,
+            )
+            _rewrite["image_prompts"] = blog_content.get("image_prompts", [])
+            _rewrite, _seo_rewrite = _finalize_draft(_rewrite)
+            if _seo_rewrite["score"] >= seo_report["score"]:
+                blog_content, seo_report = _rewrite, _seo_rewrite
+                log.append(f"✅ Rewrite improved SEO: {seo_report['score']}/100 (Grade {seo_report['grade']})")
+            else:
+                log.append(f"⚠️ Rewrite SEO {_seo_rewrite['score']} not better — keeping original {seo_report['score']}")
+        except Exception as e:
+            log.append(f"⚠️ Quality rewrite failed ({str(e)[:60]}), keeping original")
     else:
         log.append(f"✅ SEO Score: {seo_report['score']}/100 (Grade {seo_report['grade']})")
 

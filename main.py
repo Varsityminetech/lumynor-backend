@@ -1360,20 +1360,28 @@ async def generate_and_post_auto_blog_v2(settings: dict):
         blog_object = await loop.run_in_executor(None, run_auto_blog_pipeline, settings, gemini_key)
 
         # SEO publish gate: only auto-publish posts that clear a minimum score.
-        # Weaker posts are saved as drafts for review instead of going live.
         min_score = int(os.getenv("BLOG_MIN_PUBLISH_SCORE", "60"))
         score = blog_object.get("seoScore") or 0
-        gated = score >= min_score
+        seo_ok = score >= min_score
+
+        # Image gate: a placehold.co URL means every real image source failed.
+        # Don't publish imageless posts — readers expect a cover image.
+        cover = blog_object.get("coverImage") or ""
+        has_real_image = bool(cover and "placehold.co" not in cover)
+
         new_blog = {
             "id": str(uuid.uuid4()),
             **blog_object,
-            "published": bool(blog_object.get("published")) and gated,
+            "published": bool(blog_object.get("published")) and seo_ok and has_real_image,
             "created_at": datetime.utcnow().isoformat(),
             "is_auto_posted": True,
         }
-        if not gated:
+        if not seo_ok:
             new_blog["draftReason"] = f"SEO {score} below publish threshold {min_score}"
             print(f"[auto_blogger] SEO {score} < {min_score} — saved as DRAFT for review")
+        elif not has_real_image:
+            new_blog["draftReason"] = "No real cover image (all sources failed) — add an image before publishing"
+            print(f"[auto_blogger] No real cover image — saved as DRAFT")
         blogs = read_json_file(BLOGS_FILE, [])
         blogs.append(new_blog)
         write_json_file(BLOGS_FILE, blogs)
