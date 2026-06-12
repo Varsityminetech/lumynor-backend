@@ -1359,13 +1359,22 @@ async def generate_and_post_auto_blog_v2(settings: dict):
         loop = asyncio.get_event_loop()
         blog_object = await loop.run_in_executor(None, run_auto_blog_pipeline, settings, gemini_key)
 
-        blogs = read_json_file(BLOGS_FILE, [])
+        # SEO publish gate: only auto-publish posts that clear a minimum score.
+        # Weaker posts are saved as drafts for review instead of going live.
+        min_score = int(os.getenv("BLOG_MIN_PUBLISH_SCORE", "60"))
+        score = blog_object.get("seoScore") or 0
+        gated = score >= min_score
         new_blog = {
             "id": str(uuid.uuid4()),
             **blog_object,
+            "published": bool(blog_object.get("published")) and gated,
             "created_at": datetime.utcnow().isoformat(),
             "is_auto_posted": True,
         }
+        if not gated:
+            new_blog["draftReason"] = f"SEO {score} below publish threshold {min_score}"
+            print(f"[auto_blogger] SEO {score} < {min_score} — saved as DRAFT for review")
+        blogs = read_json_file(BLOGS_FILE, [])
         blogs.append(new_blog)
         write_json_file(BLOGS_FILE, blogs)
 

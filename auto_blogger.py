@@ -53,10 +53,14 @@ def _llm(prompt: str, llm_cfg, json_mode: bool = False, timeout: int = 60, max_t
     if isinstance(llm_cfg, str):  # back-compat: bare Gemini key
         llm_cfg = {"provider": "gemini", "gemini_key": llm_cfg}
     if llm_cfg.get("provider") in ("ollama_cloud", "ollama"):
+        chain = llm_cfg.get("writing_models") or [llm_cfg.get("model")]
         if task == "writing":
-            models = llm_cfg.get("writing_models") or [llm_cfg.get("model")]
+            models = chain
         else:
-            models = [llm_cfg.get("fast_model") or llm_cfg.get("model")]
+            # Fast stage: try the fast model first, then fall back to the writing
+            # chain — so a flaky/404'ing fast model can't crash the whole pipeline.
+            fast = llm_cfg.get("fast_model") or llm_cfg.get("model")
+            models = [fast] + [m for m in chain if m != fast]
         last_err = None
         for m in [x for x in models if x]:
             try:
@@ -142,7 +146,9 @@ def _ollama_generate(prompt: str, cfg: dict, json_mode: bool = False, timeout: i
                 return (result.get("message", {}).get("content", "") or "").strip()
         except urllib.error.HTTPError as e:
             last_err = e
-            if e.code in (429, 502, 503, 500) and attempt < 3:
+            # 404 included: cloud models are occasionally "not found" transiently
+            # (cold/unavailable); a quick retry usually resolves it.
+            if e.code in (404, 429, 500, 502, 503) and attempt < 3:
                 wait = (2 ** attempt) * 5
                 print(f"[ollama_cloud] {e.code} on attempt {attempt+1}, retrying in {wait}s...")
                 time.sleep(wait)
