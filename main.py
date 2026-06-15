@@ -1270,11 +1270,54 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
     if not gemini_key and not ollama_key:
         raise HTTPException(status_code=400, detail="No LLM key configured. Set GEMINI_API_KEY or OLLAMA_API_KEY in Railway environment.")
 
+    llm_cfg = _build_llm_cfg(merged_settings, gemini_key)
+
     try:
         loop = asyncio.get_event_loop()
         blog_object = await loop.run_in_executor(None, run_auto_blog_pipeline, merged_settings, gemini_key)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Auto-blog pipeline failed: {str(e)}")
+
+    # SEO gate: surgical revision if pipeline score < 90
+    min_score = int(os.getenv("BLOG_MIN_PUBLISH_SCORE", "90"))
+    initial_score = blog_object.get("seoScore") or 0
+    revision_result = None
+    if initial_score < min_score:
+        try:
+            initial_audit = validate_seo({
+                "title":              blog_object.get("title", ""),
+                "meta_description":   blog_object.get("metaDescription") or blog_object.get("summary", ""),
+                "content_html":       blog_object.get("content", ""),
+                "primary_keyword":    blog_object.get("primaryKeyword", ""),
+                "secondary_keywords": blog_object.get("secondaryKeywords", ""),
+                "coverImage":         blog_object.get("coverImage", ""),
+                "references":         blog_object.get("references", []),
+                "research_brief":     {"_present": True} if blog_object.get("researchBrief") else {},
+            })
+            stored_rb = blog_object.get("researchBrief") or {}
+            rb = {"core_angle": stored_rb.get("core_angle", ""),
+                  "lumynor_perspective": stored_rb.get("lumynor_perspective", ""),
+                  "main_facts": [], "key_statistics": [], "claims_to_avoid": [], "faqs": []} if stored_rb else {}
+            revision_result = await loop.run_in_executor(
+                None, revise_blog_from_audit,
+                blog_object, initial_audit, rb, llm_cfg,
+                os.getenv("TAVILY_API_KEY", ""), 2,
+            )
+            blog_object = revision_result["revised_blog"]
+            # Ensure content key is correct after revision
+            if blog_object.get("content_html") and not blog_object.get("content"):
+                blog_object["content"] = blog_object["content_html"]
+            blog_object["seoScore"] = revision_result["new_seo_score"]
+            blog_object["seoGrade"] = revision_result["new_seo_grade"]
+        except Exception as e:
+            print(f"[auto_generate] Post-pipeline revision failed: {e}")
+
+    # Publish gate: only auto-publish if score meets threshold and image is real
+    final_score = blog_object.get("seoScore") or 0
+    seo_ok = final_score >= min_score
+    cover = blog_object.get("coverImage") or ""
+    has_real_image = bool(cover and "placehold.co" not in cover)
+    publish = req.auto_publish and seo_ok and has_real_image
 
     # Save to blogs.json
     blogs = read_json_file(BLOGS_FILE, [])
@@ -1283,7 +1326,12 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
         **blog_object,
         "created_at": datetime.utcnow().isoformat(),
         "is_auto_posted": True,
+        "published": publish,
     }
+    if not seo_ok:
+        new_blog["draftReason"] = f"SEO {final_score} below publish threshold {min_score}"
+    elif not has_real_image:
+        new_blog["draftReason"] = "No real cover image — add before publishing"
     blogs.append(new_blog)
     write_json_file(BLOGS_FILE, blogs)
 
@@ -1293,17 +1341,21 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
     write_json_file(AUTO_BLOG_SETTINGS_FILE, settings)
 
     await manager.broadcast({
-        "type": "blog_published",
+        "type": "blog_published" if publish else "blog_draft",
         "blog": new_blog,
-        "message": f"📰 Auto-Blogger published: '{new_blog['title']}' (SEO Score: {new_blog.get('seoScore', 'N/A')}/100)"
+        "message": f"{'📰 Published' if publish else '📝 Saved as draft'}: '{new_blog['title']}' (SEO: {final_score}/100)"
     })
 
     return {
         "status": "success",
         "blog": new_blog,
+        "initial_seo_score": initial_score,
+        "final_seo_score": final_score,
+        "published": publish,
         "pipeline_log": blog_object.get("pipelineLog", []),
+        "revision_notes": revision_result.get("revision_notes", []) if revision_result else [],
         "seo_report": {
-            "score": new_blog.get("seoScore"),
+            "score": final_score,
             "grade": new_blog.get("seoGrade"),
             "word_count": new_blog.get("wordCount"),
         }
