@@ -26,18 +26,14 @@ def _build_llm_cfg(settings: dict, gemini_key: str) -> dict:
     ollama_key = (settings.get("llmApiKey", "") if name in ("ollama_cloud", "ollama") else "") \
         or os.getenv("OLLAMA_API_KEY", "")
     if ollama_key:
-        # Per-task model routing. Heavy writing uses a quality-first fallback
-        # chain (each tried in order until one succeeds — handles models that
-        # need a higher plan, e.g. deepseek 403s and skips to the next). Light
-        # JSON stages use a small fast model.
+        # Best-quality model chain — all tasks use this, no fast/small model.
+        # Override via OLLAMA_WRITING_MODELS env (comma-separated, best first).
         writing_models = [m.strip() for m in (os.getenv("OLLAMA_WRITING_MODELS", "") or "").split(",") if m.strip()] \
-            or ["glm-4.6", "deepseek-v3.1:671b", "gpt-oss:120b"]
-        fast_model = os.getenv("OLLAMA_MODEL_FAST") or "gpt-oss:20b"
+            or ["kimi-k2", "deepseek-v3.1:671b", "glm-4.6", "gpt-oss:120b"]
         return {
             "provider": "ollama_cloud",
-            "model": writing_models[0],           # default / non-task calls
-            "writing_models": writing_models,     # quality-first fallback chain
-            "fast_model": fast_model,             # light structured/JSON stages
+            "model": writing_models[0],
+            "writing_models": writing_models,
             "ollama_key": ollama_key,
             "ollama_host": settings.get("llmBaseUrl") or os.getenv("OLLAMA_HOST") or "https://ollama.com",
         }
@@ -47,22 +43,17 @@ def _build_llm_cfg(settings: dict, gemini_key: str) -> dict:
     return {"provider": "gemini", "gemini_key": _gkey}
 
 
-def _llm(prompt: str, llm_cfg, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192, task: str = "fast") -> str:
+def _llm(prompt: str, llm_cfg, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192) -> str:
     """Dispatch a text-generation call to the configured provider.
-    task="writing" uses the quality-first fallback chain; otherwise a fast model."""
+    For Ollama: always uses the best writing-quality model chain — no fast/small
+    model is ever used. Quality over speed."""
     if isinstance(llm_cfg, str):  # back-compat: bare Gemini key
         llm_cfg = {"provider": "gemini", "gemini_key": llm_cfg}
     if llm_cfg.get("provider") in ("ollama_cloud", "ollama"):
+        # Always use the quality chain for every task — time is not a constraint.
         chain = llm_cfg.get("writing_models") or [llm_cfg.get("model")]
-        if task == "writing":
-            models = chain
-        else:
-            # Fast stage: try the fast model first, then fall back to the writing
-            # chain — so a flaky/404'ing fast model can't crash the whole pipeline.
-            fast = llm_cfg.get("fast_model") or llm_cfg.get("model")
-            models = [fast] + [m for m in chain if m != fast]
         last_err = None
-        for m in [x for x in models if x]:
+        for m in [x for x in chain if x]:
             try:
                 return _ollama_generate(prompt, llm_cfg, json_mode, timeout, max_tokens, model=m)
             except Exception as e:
@@ -385,7 +376,7 @@ Respond ONLY with valid JSON:
   }}
 }}"""
 
-    result = _llm(prompt, llm_cfg, json_mode=True, task="fast")
+    result = _llm(prompt, llm_cfg, json_mode=True)
     try:
         data = json.loads(result)
         return data.get("best_topic", data)
@@ -518,9 +509,7 @@ Conduct keyword research and respond ONLY with JSON:
   "meta_description": "SEO description 140-160 chars with primary keyword and CTA"
 }}"""
 
-    # Keyword research drives the whole article's SEO targeting — use the strong
-    # writing model (not the tiny fast one, which produced garbage keywords).
-    result = _llm(prompt, gemini_key, json_mode=True, task="writing")
+    result = _llm(prompt, gemini_key, json_mode=True)
     try:
         data = json.loads(result)
     except Exception:
@@ -848,7 +837,7 @@ Respond ONLY with valid JSON:
   "external_references": [{{"title": "ref title", "url": "https://..."}}]
 }}"""
 
-    result = _llm(prompt, llm_cfg, json_mode=True, timeout=60, max_tokens=4096, task="fast")
+    result = _llm(prompt, llm_cfg, json_mode=True, timeout=60, max_tokens=4096)
     try:
         brief = json.loads(result)
         if not brief.get("external_references") or len(brief.get("external_references", [])) < 2:
@@ -1027,7 +1016,7 @@ OUTPUT — Respond ONLY with this exact JSON:
     if quality_hints:
         prompt += f"\n\nPREVIOUS DRAFT ISSUES — FIX ALL OF THESE IN THIS REWRITE:\n{quality_hints}\n"
 
-    result = _llm(prompt, gemini_key, json_mode=True, timeout=180, max_tokens=32768, task="writing")
+    result = _llm(prompt, gemini_key, json_mode=True, timeout=300, max_tokens=32768)
     try:
         blog = _parse_json_lenient(result)
         # Inject references into the HTML content
@@ -1483,7 +1472,7 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
 
     log = []
     if llm_cfg.get("provider") in ("ollama_cloud", "ollama"):
-        log.append(f"🧠 LLM: ollama_cloud · writing={'/'.join(llm_cfg.get('writing_models', []))} · fast={llm_cfg.get('fast_model')}")
+        log.append(f"🧠 LLM: ollama_cloud · models={'/'.join(llm_cfg.get('writing_models', []))} (best-quality chain, no fast model)")
     else:
         log.append("🧠 LLM: gemini (gemini-2.5-flash)")
     log.append(f"🔎 Research: {'Tavily (advanced)' if tavily_key else 'DuckDuckGo (fallback)'}")
