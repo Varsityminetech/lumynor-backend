@@ -220,68 +220,184 @@ def _search_web(query: str, num: int = 8) -> list:
         return []
 
 
+# ── TAVILY SEARCH + TRUSTED SOURCE TIERS ─────────────────────────────────────
+# Tavily gives full page content (not just snippets) and date-aware freshness
+# filtering. Falls back to DuckDuckGo when TAVILY_API_KEY is not set.
+
+_TAVILY_URL = "https://api.tavily.com/search"
+
+_TIER1_DOMAINS = (
+    "openai.com", "anthropic.com", "deepmind.google", "blog.google",
+    "ai.meta.com", "mistral.ai", "huggingface.co", "nvidia.com",
+    "blogs.microsoft.com", "research.microsoft.com",
+)
+_TIER2_DOMAINS = (
+    "techcrunch.com", "venturebeat.com", "theverge.com", "wired.com",
+    "technologyreview.mit.edu", "arstechnica.com", "zdnet.com",
+    "the-decoder.com",
+)
+_TIER3_DOMAINS = (
+    "news.ycombinator.com", "reddit.com", "github.com", "producthunt.com",
+)
+
+
+def _tavily_search(query: str, key: str, num: int = 8,
+                   depth: str = "basic", domains: list = None, days: int = 7) -> list:
+    """Tavily AI-powered search — returns full page content, not just snippets."""
+    payload = {
+        "api_key": key, "query": query, "search_depth": depth,
+        "max_results": num, "include_raw_content": False, "include_answer": False,
+    }
+    if domains:
+        payload["include_domains"] = domains
+    if days:
+        payload["days"] = days
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            _TAVILY_URL, data=data,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode()).get("results", [])
+    except Exception as e:
+        print(f"[tavily] {e}")
+        return []
+
+
+def _source_tier(url: str) -> int:
+    """Return 1 / 2 / 3 for known source tiers, 0 for unknown."""
+    u = (url or "").lower()
+    if any(d in u for d in _TIER1_DOMAINS):
+        return 1
+    if any(d in u for d in _TIER2_DOMAINS):
+        return 2
+    if any(d in u for d in _TIER3_DOMAINS):
+        return 3
+    return 0
+
+
 # ── STAGE 1: TRENDING TOPIC RESEARCH ──────────────────────────────────────────
 
-def research_trending_topics(niche: str, keywords: str, gemini_key: str, recent_topics: list = None) -> dict:
-    """Find the best trending blog topic for this niche right now."""
+def research_trending_topics(niche: str, keywords: str, llm_cfg, recent_topics: list = None, tavily_key: str = "") -> dict:
+    """Stage 1: Crawl Tier 1/2 trusted sources, cluster stories into topics,
+    score each cluster on 5 factors, and return the best topic for today."""
+    tavily_key = tavily_key or os.getenv("TAVILY_API_KEY", "")
+    month_year = datetime.now().strftime("%B %Y")
+    today = datetime.now().strftime("%B %d, %Y")
+    all_articles = []
 
-    # Web search for trending topics
-    search_queries = [
-        f"trending topics in {niche} 2025",
-        f"{niche} latest news trends {datetime.now().strftime('%B %Y')}",
-        f"most searched {niche} questions 2025",
-    ]
-
-    all_results = []
-    for q in search_queries:
-        all_results.extend(_search_web(q, 5))
+    if tavily_key:
+        # Tier 1 + Tier 2 crawl via Tavily (full content, date-filtered)
+        tier_queries = [
+            f"latest AI news announcements {month_year}",
+            f"new AI model release agent announcement {month_year}",
+            f"AI automation SaaS update {month_year}",
+            f"{niche} trends news {month_year}",
+            f"OpenAI Anthropic Google DeepMind Microsoft latest update",
+        ]
+        for q in tier_queries:
+            for r in _tavily_search(q, tavily_key, num=5, depth="basic",
+                                    domains=list(_TIER1_DOMAINS) + list(_TIER2_DOMAINS), days=7):
+                r["_tier"] = _source_tier(r.get("url", ""))
+                r["snippet"] = r.get("content") or r.get("snippet", "")
+                all_articles.append(r)
+        # Tier 2 niche-specific search (14-day window for more context)
+        for q in [f"AI SaaS developer news {month_year}", f"agentic AI business impact {month_year}"]:
+            for r in _tavily_search(q, tavily_key, num=4, depth="basic",
+                                    domains=list(_TIER2_DOMAINS), days=14):
+                r["_tier"] = _source_tier(r.get("url", ""))
+                r["snippet"] = r.get("content") or r.get("snippet", "")
+                all_articles.append(r)
+    else:
+        # DDG fallback — general searches
+        for q in [
+            f"latest AI news {month_year}", f"new AI model release {month_year}",
+            f"{niche} trends {month_year}", f"AI agents automation business {month_year}",
+            "OpenAI Anthropic Google DeepMind latest updates",
+        ]:
+            for r in _search_web(q, 5):
+                r["_tier"] = _source_tier(r.get("url", ""))
+                all_articles.append(r)
 
     # Deduplicate by URL
-    seen = set()
-    unique = []
-    for r in all_results:
-        if r["url"] not in seen:
-            seen.add(r["url"])
+    seen, unique = set(), []
+    for r in all_articles:
+        u = r.get("url", "")
+        if u and u not in seen:
+            seen.add(u)
             unique.append(r)
 
-    # Ask Gemini to pick the best topic
-    snippets = "\n".join([f"- [{r['title']}]({r['url']}): {r['snippet'][:200]}" for r in unique[:15]])
+    # Build annotated article list for the LLM
+    articles_text = ""
+    for r in unique[:28]:
+        tier = r.get("_tier", 0)
+        label = f"[T{tier}]" if tier else "[T?]"
+        snip = (r.get("snippet") or "")[:220]
+        articles_text += f"{label} {r.get('title','')} | {r.get('url','')} | {snip}\n"
 
     _avoid_block = ""
     if recent_topics:
-        _avoid_lines = "".join("- " + t + "\n" for t in recent_topics[:15])
-        _avoid_block = "ALREADY PUBLISHED — do NOT repeat or closely overlap these topics:\n" + _avoid_lines
+        _avoid_block = "ALREADY PUBLISHED — do NOT repeat or closely overlap:\n" + "".join(
+            "- " + t + "\n" for t in recent_topics[:15]
+        )
 
-    prompt = f"""You are a content strategist for a tech/digital product company.
-Niche: {niche}
-Additional keywords: {keywords}
-Date: {datetime.now().strftime('%B %Y')}
+    prompt = f"""You are a content strategist for Lumynor Systems — a digital product studio specialising in agentic AI, SaaS development, and AI automation.
 
-Based on these trending web results:
-{snippets}
+Today: {today}  |  Niche: {niche}  |  Keywords: {keywords}
 
-Pick the SINGLE best blog topic that:
-1. Is trending RIGHT NOW
-2. Has high search demand
-3. Can rank with a well-written article
-4. Is relevant to the niche: {niche}
-5. Is NOT similar to any already-published topic listed below
+TRUSTED AI NEWS ({len(unique)} articles):
+(T1 = Official source e.g. OpenAI/Anthropic/Google | T2 = Tech media e.g. TechCrunch/Wired | T? = Other)
+{articles_text}
 
 {_avoid_block}
-Respond ONLY with JSON:
+
+INSTRUCTIONS:
+1. Group articles about the same story into topic clusters
+2. Score each cluster (out of 100) using these EXACT weights:
+   - Freshness        (0-20): News from last 7 days = higher
+   - Source Authority (0-20): T1 coverage = 20, T2 only = 12, T? = 5
+   - Lumynor Relevance(0-25): Helps SaaS builders/agentic AI devs/digital product teams?
+   - SEO Potential    (0-20): High search demand, rankable long-form guide?
+   - Novelty          (0-15): Fresh angle not widely covered yet?
+3. Pick the SINGLE highest-scoring topic Lumynor should write about TODAY
+4. Do NOT pick gossip, viral junk, or duplicates of already-published topics
+
+Respond ONLY with valid JSON:
 {{
-  "topic": "exact blog topic title",
-  "angle": "unique angle or perspective to take",
-  "why_trending": "one sentence why this is trending",
-  "target_audience": "who this blog is for",
-  "search_intent": "informational | transactional | navigational | commercial"
+  "clusters": [
+    {{
+      "topic": "short label",
+      "sources": ["url1"],
+      "scores": {{"freshness": 18, "authority": 15, "relevance": 22, "seo": 17, "novelty": 12}},
+      "total_score": 84
+    }}
+  ],
+  "best_topic": {{
+    "topic": "exact blog topic title",
+    "angle": "unique angle Lumynor should take",
+    "why_trending": "one sentence on why this matters now",
+    "why_best_for_lumynor": "why this fits Lumynor's SaaS/AI audience",
+    "target_audience": "who will read this",
+    "search_intent": "informational | commercial | transactional",
+    "cluster_sources": ["url1", "url2"],
+    "total_score": 84
+  }}
 }}"""
 
-    result = _llm(prompt, gemini_key, json_mode=True)
+    result = _llm(prompt, llm_cfg, json_mode=True, task="fast")
     try:
-        return json.loads(result)
-    except:
-        return {"topic": f"The Future of {niche} in 2025", "angle": "Comprehensive guide", "why_trending": "Growing interest", "target_audience": "professionals", "search_intent": "informational"}
+        data = json.loads(result)
+        return data.get("best_topic", data)
+    except Exception:
+        return {
+            "topic": f"How AI Agents Are Transforming {niche} in 2026",
+            "angle": "Practical guide for SaaS builders",
+            "why_trending": "AI agent adoption accelerating across industries",
+            "target_audience": "SaaS developers and digital product teams",
+            "search_intent": "informational",
+            "cluster_sources": [],
+        }
 
 
 # ── STAGE 2: SEO KEYWORD RESEARCH ─────────────────────────────────────────────
@@ -528,102 +644,381 @@ Organize this into a research brief. Respond ONLY with JSON:
         }
 
 
-# ── STAGE 4: LONGFORM HUMAN-LIKE BLOG WRITING ─────────────────────────────────
+# ── STAGE 3b: DEEP RESEARCH ───────────────────────────────────────────────────
 
-def write_longform_blog(topic: str, angle: str, keywords: dict, research: dict, target_audience: str, gemini_key: str, quality_hints: str = None) -> dict:
-    """Write a full longform human-like blog post with all SEO elements."""
+def deep_research_topic(topic: str, cluster_sources: list, llm_cfg, tavily_key: str = "") -> dict:
+    """Deep-dive research on the chosen topic from multiple angles.
+    Tavily advanced search gives full page content; falls back to DDG."""
+    tavily_key = tavily_key or os.getenv("TAVILY_API_KEY", "")
 
+    angles = [
+        f"{topic} official announcement explanation",
+        f"{topic} business impact SaaS developers teams",
+        f"{topic} technical details how it works",
+        f"{topic} real world examples use cases 2025 2026",
+        f"{topic} limitations risks challenges concerns",
+        f"{topic} vs alternatives comparison",
+        f"{topic} frequently asked questions",
+    ]
+
+    all_content, all_refs = [], []
+
+    # Pull from the original cluster sources first — they are the primary evidence
+    if cluster_sources and tavily_key:
+        src_domains = list({u.split("/")[2] for u in cluster_sources if "/" in u})[:4]
+        if src_domains:
+            for r in _tavily_search(topic, tavily_key, num=4, depth="advanced",
+                                    domains=src_domains, days=30):
+                body = r.get("content") or ""
+                if body:
+                    all_content.append(f"[PRIMARY SOURCE: {r.get('title','')}]({r.get('url','')})\n{body[:600]}")
+                if r.get("url") and r.get("title"):
+                    all_refs.append({"title": r["title"], "url": r["url"]})
+
+    for q in angles:
+        if tavily_key:
+            for r in _tavily_search(q, tavily_key, num=3, depth="advanced", days=30):
+                body = r.get("content") or r.get("raw_content") or ""
+                if body:
+                    all_content.append(f"[{r.get('title','')}]({r.get('url','')})\n{body[:500]}")
+                if r.get("url") and r.get("title"):
+                    all_refs.append({"title": r["title"], "url": r["url"]})
+        else:
+            for r in _search_web(q, 4):
+                if r.get("snippet"):
+                    all_content.append(f"[{r['title']}]({r['url']})\n{r['snippet']}")
+                if r.get("url") and r.get("title"):
+                    all_refs.append({"title": r["title"], "url": r["url"]})
+
+    # Deduplicate refs
+    seen, unique_refs = set(), []
+    for ref in all_refs:
+        if ref["url"] not in seen:
+            seen.add(ref["url"])
+            unique_refs.append(ref)
+
+    research_text = "\n\n".join(all_content[:14])
+
+    prompt = f"""You are a research analyst preparing facts for a blog post.
+TOPIC: {topic}
+
+COLLECTED RESEARCH:
+{research_text[:6000]}
+
+Extract and organise. Respond ONLY with JSON:
+{{
+  "official_explanation": "What this is per primary sources (1-2 paragraphs)",
+  "business_impact": "How this affects SaaS teams and digital product builders",
+  "technical_details": "Key technical aspects or mechanism",
+  "real_examples": ["concrete example 1", "concrete example 2", "concrete example 3"],
+  "limitations_risks": ["limitation or risk 1", "limitation 2"],
+  "key_statistics": ["stat with number and source 1", "stat 2", "stat 3"],
+  "key_facts": ["important fact 1", "fact 2", "fact 3", "fact 4", "fact 5"],
+  "expert_insights": ["expert quote or insight 1", "insight 2"],
+  "faqs": [
+    {{"question": "question 1", "answer": "2-3 sentence answer"}},
+    {{"question": "question 2", "answer": "2-3 sentence answer"}},
+    {{"question": "question 3", "answer": "2-3 sentence answer"}},
+    {{"question": "question 4", "answer": "2-3 sentence answer"}},
+    {{"question": "question 5", "answer": "2-3 sentence answer"}}
+  ],
+  "claims_to_avoid": ["unverified claim 1", "hype statement to skip"],
+  "blog_outline": [
+    {{"section": "Introduction", "key_points": ["hook", "problem", "what reader learns"]}},
+    {{"section": "H2 section title 1", "key_points": ["point1", "point2", "stat or example"]}},
+    {{"section": "H2 section title 2", "key_points": ["point1", "point2"]}},
+    {{"section": "H2 section title 3 with primary keyword", "key_points": ["point1", "point2"]}},
+    {{"section": "H2 section title 4", "key_points": ["point1", "lumynor angle"]}},
+    {{"section": "Frequently Asked Questions", "key_points": []}},
+    {{"section": "Conclusion", "key_points": ["summary", "CTA"]}}
+  ],
+  "references": [{{"title": "source title", "url": "https://..."}}]
+}}"""
+
+    result = _llm(prompt, llm_cfg, json_mode=True, timeout=60, max_tokens=4096)
+    try:
+        deep = json.loads(result)
+        if not deep.get("references"):
+            deep["references"] = unique_refs[:8]
+        # Normalise so old code that reads `expert_insights` still works
+        if not deep.get("expert_insights"):
+            deep["expert_insights"] = deep.get("expert_quotes", [])
+        return deep
+    except Exception as e:
+        print(f"[deep_research] parse error: {e}")
+        return {
+            "official_explanation": "", "business_impact": "", "technical_details": "",
+            "real_examples": [], "limitations_risks": [],
+            "key_statistics": [], "key_facts": [], "expert_insights": [],
+            "faqs": [], "claims_to_avoid": [],
+            "blog_outline": [
+                {"section": "Introduction", "key_points": []},
+                {"section": f"Understanding {topic}", "key_points": []},
+                {"section": f"Impact of {topic}", "key_points": []},
+                {"section": "Conclusion", "key_points": []},
+            ],
+            "references": unique_refs[:8],
+        }
+
+
+# ── STAGE 3c: RESEARCH BRIEF ──────────────────────────────────────────────────
+
+def generate_research_brief(topic: str, angle: str, keywords: dict,
+                             deep_research: dict, niche: str, llm_cfg) -> dict:
+    """Generate the formal research brief — source of truth before the blog is written.
+    Locks in the Lumynor perspective, banned phrases, internal links, and exact outline."""
     primary_kw = keywords.get("primary_keyword", topic)
-    secondary_kws = ", ".join(keywords.get("secondary_keywords", []))
-    lsi_kws = ", ".join(keywords.get("lsi_keywords", []))
-    paa = "\n".join([f"- {q}" for q in keywords.get("people_also_ask", [])])
+    secondary_kws = keywords.get("secondary_keywords", [])
 
-    stats = "\n".join([f"• {s}" for s in research.get("key_statistics", [])])
-    facts = "\n".join([f"• {f}" for f in research.get("key_facts", [])])
-    expert_insights = "\n".join([f"• {e}" for e in research.get("expert_insights", [])])
+    facts_block = "".join("- " + f + "\n" for f in deep_research.get("key_facts", [])[:6])
+    stats_block = "".join("- " + s + "\n" for s in deep_research.get("key_statistics", [])[:4])
+    examples_block = "".join("- " + e + "\n" for e in deep_research.get("real_examples", [])[:4])
+    risks_block = "".join("- " + r + "\n" for r in deep_research.get("limitations_risks", [])[:4])
+    avoid_block = "".join("- " + c + "\n" for c in deep_research.get("claims_to_avoid", [])[:5])
+    outline_block = "".join(
+        f"  {s['section']}: {', '.join(s.get('key_points', []))}\n"
+        for s in deep_research.get("blog_outline", [])
+    )
 
-    outline_text = ""
-    for section in research.get("blog_outline", []):
-        outline_text += f"\n**{section['section']}**\n"
-        for pt in section.get("key_points", []):
-            outline_text += f"  - {pt}\n"
+    prompt = f"""You are a senior content strategist at Lumynor Systems — a digital product studio that builds agentic AI and SaaS platforms.
 
-    refs = research.get("references", [])
-    refs_text = "\n".join([f"- [{r['title']}]({r['url']})" for r in refs[:6]])
-
-    faq_questions = keywords.get("people_also_ask", [])
-
-    prompt = f"""You are a senior content writer with 10+ years of experience writing for major tech publications.
-Write a COMPREHENSIVE, LONGFORM blog post (2000-3000 words) that reads like it was written by a human expert — NOT like AI.
+Create a RESEARCH BRIEF (source of truth) for this blog post.
 
 TOPIC: {topic}
 ANGLE: {angle}
+PRIMARY KEYWORD: {primary_kw}
+SECONDARY KEYWORDS: {', '.join(secondary_kws[:5])}
+NICHE: {niche}
+
+VERIFIED RESEARCH DATA:
+Official Explanation: {(deep_research.get('official_explanation') or '')[:400]}
+Business Impact: {(deep_research.get('business_impact') or '')[:350]}
+Technical Details: {(deep_research.get('technical_details') or '')[:300]}
+Key Statistics:
+{stats_block}
+Key Facts:
+{facts_block}
+Real Examples:
+{examples_block}
+Limitations/Risks:
+{risks_block}
+Claims to Avoid:
+{avoid_block}
+Suggested Outline:
+{outline_block}
+
+Lumynor's products: Agent Forge (SaaS builder), District 21 (event ticketing), Hotel OS, School OS.
+Lumynor's audience: SaaS founders, developers, digital product teams, CTOs.
+Lumynor's voice: Technically confident, no hype, original analysis, speaks to builders.
+
+Respond ONLY with valid JSON:
+{{
+  "topic": "{topic}",
+  "primary_keyword": "{primary_kw}",
+  "secondary_keywords": {json.dumps(secondary_kws[:5])},
+  "search_intent": "informational | commercial | transactional",
+  "target_audience": "specific description",
+  "core_angle": "the unique angle Lumynor takes",
+  "lumynor_perspective": "2-3 sentences — Lumynor's original take, tied to Agent Forge or the company expertise",
+  "business_relevance": "why this matters specifically for SaaS builders and digital product teams",
+  "main_facts": ["verified fact 1", "verified fact 2", "verified fact 3", "verified fact 4", "verified fact 5"],
+  "key_statistics": ["stat with source 1", "stat 2", "stat 3"],
+  "claims_to_avoid": ["unverified claim 1", "hype phrase 2"],
+  "banned_phrases": ["In today's fast-paced digital world", "game-changer", "revolutionize", "leverage", "delve into", "In conclusion", "Firstly", "It is worth noting"],
+  "suggested_outline": [
+    {{"section": "Introduction (hook — never start with clichés)", "key_points": ["hook line", "problem statement", "what reader learns"]}},
+    {{"section": "H2: [specific meaningful title]", "key_points": ["point 1", "stat or example", "insight"]}},
+    {{"section": "H2: [specific meaningful title]", "key_points": ["point 1", "point 2", "real example"]}},
+    {{"section": "H2: [title containing primary keyword]", "key_points": ["point 1", "lumynor angle"]}},
+    {{"section": "H2: Frequently Asked Questions", "key_points": []}},
+    {{"section": "Conclusion + CTA", "key_points": ["key takeaway", "link to Agent Forge or /contact"]}}
+  ],
+  "internal_links": [
+    {{"anchor": "Agent Forge", "url": "/products/agent-forge", "context": "when discussing SaaS builders or scaffolding"}},
+    {{"anchor": "talk to our team", "url": "/contact", "context": "CTA or recommendations"}},
+    {{"anchor": "more AI insights", "url": "/blog", "context": "when referencing other articles"}}
+  ],
+  "faqs": [
+    {{"question": "specific FAQ 1", "answer": "clear 2-3 sentence answer"}},
+    {{"question": "specific FAQ 2", "answer": "clear 2-3 sentence answer"}},
+    {{"question": "specific FAQ 3", "answer": "clear 2-3 sentence answer"}},
+    {{"question": "specific FAQ 4", "answer": "clear 2-3 sentence answer"}},
+    {{"question": "specific FAQ 5", "answer": "clear 2-3 sentence answer"}}
+  ],
+  "external_references": [{{"title": "ref title", "url": "https://..."}}]
+}}"""
+
+    result = _llm(prompt, llm_cfg, json_mode=True, timeout=60, max_tokens=4096, task="fast")
+    try:
+        brief = json.loads(result)
+        if not brief.get("external_references") or len(brief.get("external_references", [])) < 2:
+            brief["external_references"] = deep_research.get("references", [])[:8]
+        return brief
+    except Exception as e:
+        print(f"[research_brief] parse error: {e}")
+        return {
+            "topic": topic, "primary_keyword": primary_kw,
+            "secondary_keywords": secondary_kws,
+            "core_angle": angle,
+            "lumynor_perspective": "Lumynor builds agentic AI platforms that help digital product teams ship faster.",
+            "main_facts": deep_research.get("key_facts", []),
+            "claims_to_avoid": deep_research.get("claims_to_avoid", []),
+            "banned_phrases": ["In today's fast-paced digital world", "game-changer", "revolutionize", "leverage", "delve"],
+            "suggested_outline": deep_research.get("blog_outline", []),
+            "internal_links": [
+                {"anchor": "Agent Forge", "url": "/products/agent-forge"},
+                {"anchor": "talk to our team", "url": "/contact"},
+            ],
+            "faqs": deep_research.get("faqs", []),
+            "external_references": deep_research.get("references", [])[:8],
+        }
+
+
+# ── STAGE 4: LONGFORM HUMAN-LIKE BLOG WRITING ─────────────────────────────────
+
+def write_longform_blog(topic: str, angle: str, keywords: dict, research: dict,
+                         target_audience: str, gemini_key: str,
+                         quality_hints: str = None, research_brief: dict = None) -> dict:
+    """Write a full longform human-like blog post driven by the research brief."""
+
+    primary_kw = (research_brief or keywords).get("primary_keyword") or keywords.get("primary_keyword", topic)
+    secondary_kws_list = keywords.get("secondary_keywords", [])
+    secondary_kws = ", ".join(secondary_kws_list)
+    lsi_kws = ", ".join(keywords.get("lsi_keywords", []))
+
+    # ── Build context blocks ──────────────────────────────────────────────────
+    if research_brief:
+        core_angle = research_brief.get("core_angle") or angle
+        lumynor_pov = research_brief.get("lumynor_perspective", "")
+        business_rel = research_brief.get("business_relevance", "")
+        banned = research_brief.get("banned_phrases", [])
+        avoid_claims = research_brief.get("claims_to_avoid", [])
+
+        facts_block = "".join("• " + f + "\n" for f in research_brief.get("main_facts", []))
+        stats_block = "".join("• " + s + "\n" for s in research_brief.get("key_statistics", []))
+
+        outline_text = ""
+        for s in research_brief.get("suggested_outline", []):
+            outline_text += f"\n**{s['section']}**\n"
+            for pt in s.get("key_points", []):
+                outline_text += f"  - {pt}\n"
+
+        faq_items = research_brief.get("faqs", [])
+        faq_block = "\n".join(f"Q: {f['question']}\nA: {f['answer']}" for f in faq_items[:5])
+
+        int_links = research_brief.get("internal_links", [])
+        links_block = "\n".join(
+            f'  <a href="{l["url"]}">{l["anchor"]}</a> — {l.get("context","")}'
+            for l in int_links
+        )
+
+        refs = research_brief.get("external_references") or research.get("references", [])
+        expert_block = "".join("• " + e + "\n" for e in research.get("expert_insights", []))
+        examples_block = "".join("• " + e + "\n" for e in research.get("real_examples", []))
+
+        banned_str = ", ".join(f'"{p}"' for p in (banned or [
+            "In today's fast-paced digital world", "game-changer", "revolutionize",
+            "leverage", "delve", "in conclusion", "firstly",
+        ]))
+        avoid_str = "\n".join(f"  ✗ {c}" for c in avoid_claims[:5])
+    else:
+        core_angle = angle
+        lumynor_pov = ""
+        business_rel = ""
+        banned_str = '"In today\'s world", "game-changer", "revolutionize", "leverage", "delve", "in conclusion", "firstly"'
+        avoid_str = ""
+        facts_block = "".join("• " + f + "\n" for f in research.get("key_facts", []))
+        stats_block = "".join("• " + s + "\n" for s in research.get("key_statistics", []))
+        expert_block = "".join("• " + e + "\n" for e in research.get("expert_insights", []))
+        examples_block = ""
+        outline_text = ""
+        for section in research.get("blog_outline", []):
+            outline_text += f"\n**{section['section']}**\n"
+            for pt in section.get("key_points", []):
+                outline_text += f"  - {pt}\n"
+        faq_items = keywords.get("people_also_ask", [])
+        faq_block = "\n".join(f"- {q}" for q in faq_items[:5])
+        int_links = []
+        links_block = '<a href="/products/agent-forge">Agent Forge</a>, <a href="/contact">talk to our team</a>, <a href="/blog">more insights</a>'
+        refs = research.get("references", [])
+
+    refs_text = "\n".join(f"- [{r['title']}]({r['url']})" for r in refs[:6])
+
+    prompt = f"""You are a senior writer at Lumynor Systems — a digital product studio building agentic AI and SaaS platforms.
+Write a COMPREHENSIVE LONGFORM blog post (2000-3000 words) with real depth, original analysis, and a strong Lumynor perspective.
+This must read like it was written by a human expert who builds SaaS products — NOT like generic AI output.
+
+═══ RESEARCH BRIEF ═══════════════════════════════════════════════════════════
+TOPIC: {topic}
+ANGLE: {core_angle}
 TARGET AUDIENCE: {target_audience}
 PRIMARY KEYWORD: {primary_kw}
 SECONDARY KEYWORDS: {secondary_kws}
 LSI KEYWORDS: {lsi_kws}
+{("LUMYNOR PERSPECTIVE: " + lumynor_pov) if lumynor_pov else ""}
+{("BUSINESS RELEVANCE: " + business_rel) if business_rel else ""}
 
-RESEARCH DATA TO USE:
-Statistics:
-{stats}
+VERIFIED FACTS:
+{facts_block or "(use research data below)"}
+KEY STATISTICS:
+{stats_block}
+EXPERT INSIGHTS:
+{expert_block}
+REAL EXAMPLES:
+{examples_block}
 
-Key Facts:
-{facts}
-
-Expert Insights:
-{expert_insights}
-
-OUTLINE TO FOLLOW:
+EXACT OUTLINE TO FOLLOW:
 {outline_text}
 
-FAQ QUESTIONS TO ANSWER:
-{paa}
+FAQ TO ANSWER (use these exact questions):
+{faq_block}
 
-REFERENCES TO CITE:
+INTERNAL LINKS TO USE (embed naturally in context):
+{links_block}
+
+EXTERNAL REFERENCES TO CITE:
 {refs_text}
 
-HUMAN WRITING RULES (follow strictly):
-1. Start with a compelling personal hook or real-world scenario — NOT "In today's world" or "In this article"
-2. Use "you" directly — address the reader personally
-3. Vary sentence length dramatically: mix short punchy sentences with longer, nuanced ones
-4. Use contractions naturally (it's, you'll, don't, they're)
-5. Include personal opinions and hedged claims ("In my experience...", "This is worth noting...")
-6. Use transition phrases between sections ("Here's the thing...", "But wait...", "What's fascinating is...")
-7. Include specific numbers, percentages, year-stamped data
-8. Break up text with callout boxes, tips, key takeaways
-9. Write each H2 section as a mini-article with real depth
-10. Avoid: "game-changer", "revolutionize", "leverage", "delve", "in conclusion", "firstly"
+{("CLAIMS TO AVOID — do NOT include these:" + ("" if not avoid_str else (" " + avoid_str))) if avoid_str else ""}
 
-SEO RULES:
-1. Primary keyword "{primary_kw}" must appear in: title, first 100 words, at least 2 H2 headings, meta description
+═══ WRITING RULES ════════════════════════════════════════════════════════════
+1. BANNED PHRASES — never write: {banned_str}
+2. NEVER open with a cliché. Start with a specific scenario, surprising stat, or bold claim
+3. Address the reader as "you" throughout
+4. Mix short punchy sentences with longer analytical ones — vary rhythm constantly
+5. Use contractions (it's, you'll, don't, they're) — sound human
+6. Add hedged original opinions ("In practice...", "Worth noting is...", "The overlooked part is...")
+7. Use transitions between sections ("Here's the thing...", "What changes everything here is...")
+8. Every H2 section must have real depth — 200-350 words, specific data, at least one example
+9. Include <div class="callout-tip"> boxes for key takeaways and tips
+10. Write about what builders and developers ACTUALLY need to know — not surface-level content
+
+═══ SEO RULES ════════════════════════════════════════════════════════════════
+1. Primary keyword "{primary_kw}" MUST appear in: title, first 100 words, ≥2 H2 headings, meta description
 2. Use secondary keywords naturally — never force them
-3. Every H2 must be actionable or curiosity-driving
-4. Add 2-4 internal links as real relative anchors to relevant Lumynor pages, e.g. <a href="/products/agent-forge">Agent Forge</a>, <a href="/contact">talk to our team</a>, <a href="/blog">more insights</a>. Use natural anchor text in context.
-5. Write clean HTML only — do NOT output any "[IMAGE: ...]" or "[INTERNAL: ...]" placeholder markers.
+3. Every H2 title must be specific and actionable, not generic
+4. Use only clean HTML — no [IMAGE: ...] or [INTERNAL: ...] placeholder markers
 
-OUTPUT FORMAT — Respond ONLY with this exact JSON structure:
+OUTPUT — Respond ONLY with this exact JSON:
 {{
-  "title": "SEO optimized title with primary keyword (50-60 chars)",
-  "meta_description": "Compelling 140-155 char description with keyword + CTA",
+  "title": "SEO title with primary keyword (45-60 chars)",
+  "meta_description": "140-155 char description with {primary_kw} + CTA",
   "summary": "Engaging 2-3 sentence excerpt for blog listing",
   "read_time": "X min read",
-  "content_html": "FULL HTML blog post (use <h2>, <h3>, <p>, <ul>, <ol>, <li>, <strong>, <em>, <blockquote>, <div class=\\"callout-tip\\">, <div class=\\"callout-warning\\">)",
+  "content_html": "FULL HTML (h2/h3/p/ul/ol/li/strong/em/blockquote/div.callout-tip/div.callout-warning)",
   "faq": [
-    {{"question": "FAQ question 1", "answer": "Detailed answer 1 (2-3 sentences)"}},
-    {{"question": "FAQ question 2", "answer": "Detailed answer 2"}},
-    {{"question": "FAQ question 3", "answer": "Detailed answer 3"}},
-    {{"question": "FAQ question 4", "answer": "Detailed answer 4"}},
-    {{"question": "FAQ question 5", "answer": "Detailed answer 5"}}
+    {{"question": "FAQ 1", "answer": "2-3 sentence answer"}},
+    {{"question": "FAQ 2", "answer": "2-3 sentence answer"}},
+    {{"question": "FAQ 3", "answer": "2-3 sentence answer"}},
+    {{"question": "FAQ 4", "answer": "2-3 sentence answer"}},
+    {{"question": "FAQ 5", "answer": "2-3 sentence answer"}}
   ],
   "image_prompts": [
-    {{"placement": "cover", "prompt": "detailed AI image prompt for cover image", "alt": "alt text for SEO"}},
-    {{"placement": "section_1", "prompt": "detailed AI image prompt for first section illustration", "alt": "alt text"}},
-    {{"placement": "section_2", "prompt": "detailed AI image prompt for second section illustration", "alt": "alt text"}}
+    {{"placement": "cover", "prompt": "photorealistic cover image concept", "alt": "SEO alt text"}},
+    {{"placement": "section_1", "prompt": "illustration for section 1", "alt": "alt text"}},
+    {{"placement": "section_2", "prompt": "illustration for section 2", "alt": "alt text"}}
   ],
-  "references": [
-    {{"title": "Reference title", "url": "https://reference-url.com"}},
-    {{"title": "Reference title 2", "url": "https://reference-url2.com"}}
-  ],
+  "references": [{{"title": "...", "url": "https://..."}}],
   "primary_keyword": "{primary_kw}",
   "secondary_keywords": "{secondary_kws}",
   "tags": ["tag1", "tag2", "tag3", "tag4"]
@@ -1061,72 +1456,86 @@ Respond ONLY with JSON:
 
 def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list = None) -> dict:
     """
-    Full auto-blog pipeline:
-    1. Research trending topic
-    2. Keyword research
-    3. Web research + outline
-    4. Write longform blog
-    5. Generate images
-    6. SEO validate
-    7. Return complete blog object ready to save
+    Full auto-blog pipeline (guide-aligned):
+    1. Crawl Tier 1/2 trusted sources, cluster + score topics → pick best
+    2. SEO keyword research
+    3a. Deep research (multi-angle Tavily/DDG dive on chosen topic)
+    3b. Generate formal research brief (Lumynor perspective, banned phrases, outline)
+    4. Write longform blog from brief (quality retry loop)
+    5. Source images (once; reused on rewrite)
+    6. SEO validate + refine + quality rewrite if needed
     """
     niche = settings.get("niche", "Technology")
-    keywords_hint = settings.get("keywords", "")
+    keywords_hint = (settings.get("keywords", "") or "")[:300]
     auto_publish = settings.get("auto_publish", False)
     author = settings.get("author", "Lumynor Team")
     category = settings.get("category", "Technology")
     nanobanana_key = settings.get("nanobanana_key", "") or os.getenv("NANOBANANA_API_KEY", "")
     nanobanana_url = settings.get("nanobanana_url", "") or os.getenv("NANOBANANA_API_URL", "")
-    # Image source: "web" (search Unsplash/Pexels/Openverse) or "ai" (Nanobanana)
     image_source = settings.get("image_source", "web")
     unsplash_key = settings.get("unsplash_key", "") or os.getenv("UNSPLASH_ACCESS_KEY", "")
     pexels_key = settings.get("pexels_key", "") or os.getenv("PEXELS_API_KEY", "")
+    tavily_key = settings.get("tavily_key", "") or os.getenv("TAVILY_API_KEY", "")
 
-    # Resolve the LLM provider once; every stage receives this config. Prefers
-    # Ollama Cloud when a key is configured, else Gemini.
-    gemini_key = _build_llm_cfg(settings, gemini_key)
+    llm_cfg = _build_llm_cfg(settings, gemini_key)
+    # Use llm_cfg everywhere; keep name gemini_key as alias for internal helpers
+    gemini_key = llm_cfg
 
     log = []
-    if gemini_key.get("provider") in ("ollama_cloud", "ollama"):
-        log.append(f"🧠 LLM: ollama_cloud · writing={'/'.join(gemini_key.get('writing_models', []))} · fast={gemini_key.get('fast_model')}")
+    if llm_cfg.get("provider") in ("ollama_cloud", "ollama"):
+        log.append(f"🧠 LLM: ollama_cloud · writing={'/'.join(llm_cfg.get('writing_models', []))} · fast={llm_cfg.get('fast_model')}")
     else:
         log.append("🧠 LLM: gemini (gemini-2.5-flash)")
+    log.append(f"🔎 Research: {'Tavily (advanced)' if tavily_key else 'DuckDuckGo (fallback)'}")
 
-    # Truncate keywords_hint to avoid 3000-char keyword dumps polluting prompts
-    keywords_hint = (keywords_hint or "")[:300]
-
-    # Stage 1: Trending topic
-    log.append("🔍 Researching trending topics...")
-    topic_data = research_trending_topics(niche, keywords_hint, gemini_key, recent_topics=recent_topics)
+    # Stage 1: Crawl trusted sources, cluster stories, score + pick best topic
+    log.append("🔍 Crawling trusted AI sources and scoring topics...")
+    topic_data = research_trending_topics(
+        niche, keywords_hint, llm_cfg,
+        recent_topics=recent_topics, tavily_key=tavily_key,
+    )
     topic = topic_data.get("topic", f"AI Trends in {niche}")
     angle = topic_data.get("angle", "Comprehensive guide")
-    target_audience = topic_data.get("target_audience", "professionals")
-    log.append(f"📌 Topic selected: {topic}")
+    target_audience = topic_data.get("target_audience", "SaaS developers and digital product teams")
+    cluster_sources = topic_data.get("cluster_sources", [])
+    log.append(f"📌 Topic selected: {topic} (score: {topic_data.get('total_score','?')})")
 
-    # Stage 2: Keyword research
+    # Stage 2: SEO keyword research
     log.append("🔑 Running SEO keyword research...")
-    keywords = do_keyword_research(topic, niche, gemini_key)
+    keywords = do_keyword_research(topic, niche, llm_cfg)
     log.append(f"🎯 Primary keyword: {keywords.get('primary_keyword')}")
 
-    # Stage 3: Web research
-    log.append("📚 Gathering research and facts...")
-    research = research_topic_facts(topic, keywords, gemini_key)
-    log.append(f"📊 Found {len(research.get('key_statistics', []))} statistics, {len(research.get('references', []))} references")
+    # Stage 3a: Deep research — multi-angle dive with Tavily or DDG
+    log.append("🔬 Running deep research on topic...")
+    research = deep_research_topic(topic, cluster_sources, llm_cfg, tavily_key=tavily_key)
+    log.append(
+        f"📊 Deep research: {len(research.get('key_facts', []))} facts, "
+        f"{len(research.get('key_statistics', []))} stats, "
+        f"{len(research.get('references', []))} references"
+    )
 
-    # Stage 4: Write blog — quality retry loop, always using the best writing model.
-    # If the output is too short (thin content), retry rather than accepting a weak draft.
-    log.append("✍️ Writing longform blog post...")
+    # Stage 3b: Generate research brief — source of truth before writing
+    log.append("📋 Generating research brief...")
+    research_brief = generate_research_brief(topic, angle, keywords, research, niche, llm_cfg)
+    log.append(f"📋 Brief ready: {len(research_brief.get('suggested_outline', []))} sections, "
+               f"{len(research_brief.get('faqs', []))} FAQs")
+
+    # Stage 4: Write blog from brief — quality retry loop, best model only
+    log.append("✍️ Writing longform blog from research brief...")
     _min_words = int(os.getenv("BLOG_MIN_WORD_COUNT", "1200"))
     blog_content = None
     for _attempt in range(1, 4):
         try:
-            _draft = write_longform_blog(topic, angle, keywords, research, target_audience, gemini_key)
+            _draft = write_longform_blog(
+                topic, angle, keywords, research, target_audience, llm_cfg,
+                research_brief=research_brief,
+            )
             _wc = len(re.sub('<[^>]+>', '', _draft.get("content_html", "")).split())
             blog_content = _draft
             if _wc >= _min_words or _attempt == 3:
                 log.append(f"📝 Blog written: {_wc} words" + (f" (attempt {_attempt})" if _attempt > 1 else ""))
                 break
-            log.append(f"⚠️ Attempt {_attempt}: only {_wc} words (min {_min_words}) — rewriting for better quality...")
+            log.append(f"⚠️ Attempt {_attempt}: only {_wc} words (min {_min_words}) — rewriting...")
         except Exception as e:
             if _attempt == 3:
                 raise
@@ -1226,7 +1635,7 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
         try:
             _rewrite = write_longform_blog(
                 topic, angle, keywords, research, target_audience, gemini_key,
-                quality_hints=hints,
+                quality_hints=hints, research_brief=research_brief,
             )
             _rewrite["image_prompts"] = blog_content.get("image_prompts", [])
             _rewrite, _seo_rewrite = _finalize_draft(_rewrite)
@@ -1269,6 +1678,11 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
         "generatedAt": now.isoformat(),
         "date": now.strftime("%B %d, %Y"),
         "topicData": topic_data,
+        "researchBrief": {
+            "core_angle": research_brief.get("core_angle", ""),
+            "lumynor_perspective": research_brief.get("lumynor_perspective", ""),
+            "sections": len(research_brief.get("suggested_outline", [])),
+        },
         "pipelineLog": log
     }
 
