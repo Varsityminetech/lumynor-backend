@@ -692,6 +692,61 @@ def chat_lead(req: dict):
 def get_leads():
     return read_json_file(LEADS_FILE, [])
 
+
+# ── Alert helpers (fire-and-forget; env vars gate them) ───────────────────────
+
+def _send_email_alert(subject: str, body: str):
+    """Send plain-text email via SMTP SSL.
+    Requires env vars: ALERT_EMAIL_TO, ALERT_SMTP_HOST, ALERT_SMTP_USER, ALERT_SMTP_PASS.
+    Silently no-ops when any of those are missing."""
+    import smtplib, email.mime.text, email.mime.multipart, threading
+    to   = os.getenv("ALERT_EMAIL_TO", "")
+    host = os.getenv("ALERT_SMTP_HOST", "")
+    user = os.getenv("ALERT_SMTP_USER", "")
+    pwd  = os.getenv("ALERT_SMTP_PASS", "")
+    if not (to and host and user and pwd):
+        return
+    def _send():
+        try:
+            msg = email.mime.multipart.MIMEMultipart()
+            msg["From"] = user
+            msg["To"]   = to
+            msg["Subject"] = f"[Lumynor Blog] {subject}"
+            msg.attach(email.mime.text.MIMEText(body, "plain"))
+            with smtplib.SMTP_SSL(host, 465, timeout=15) as srv:
+                srv.login(user, pwd)
+                srv.sendmail(user, to, msg.as_string())
+        except Exception as _e:
+            print(f"[email_alert] {_e}")
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def _fire_publish_webhook(blog: dict):
+    """POST to PUBLISH_WEBHOOK_URL on every blog publish (fire-and-forget).
+    Set PUBLISH_WEBHOOK_URL in Railway env to enable (e.g. Zapier, n8n, Slack webhook)."""
+    import threading
+    url = os.getenv("PUBLISH_WEBHOOK_URL", "")
+    if not url:
+        return
+    payload = {
+        "id":       blog.get("id", ""),
+        "title":    blog.get("title", ""),
+        "slug":     blog.get("slug", ""),
+        "seoScore": blog.get("seoScore"),
+        "url":      f"/blog/{blog.get('slug', '')}",
+    }
+    def _post():
+        try:
+            import urllib.request, json as _json
+            data = _json.dumps(payload).encode()
+            req  = urllib.request.Request(url, data=data,
+                                          headers={"Content-Type": "application/json"}, method="POST")
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as _e:
+            print(f"[publish_webhook] {_e}")
+    threading.Thread(target=_post, daemon=True).start()
+
+
 @app.get("/api/blogs")
 def get_published_blogs():
     blogs = read_json_file(BLOGS_FILE, [])
@@ -700,6 +755,22 @@ def get_published_blogs():
 @app.get("/api/blogs/admin")
 def get_all_blogs():
     return read_json_file(BLOGS_FILE, [])
+
+
+@app.get("/api/blogs/review-queue")
+def get_review_queue():
+    """Return auto-posted draft blogs that need human review before publishing.
+    Sorted by SEO score descending — highest-quality drafts first."""
+    blogs = read_json_file(BLOGS_FILE, [])
+    queue = [
+        b for b in blogs
+        if not b.get("published")
+        and b.get("is_auto_posted")
+        and b.get("seoScore", 0) >= 50
+    ]
+    queue.sort(key=lambda b: b.get("seoScore", 0), reverse=True)
+    return {"count": len(queue), "blogs": queue}
+
 
 @app.get("/api/blogs/{slug_or_id}")
 def get_single_blog(slug_or_id: str):
@@ -1272,9 +1343,15 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
 
     llm_cfg = _build_llm_cfg(merged_settings, gemini_key)
 
+    _all_blogs_ag  = read_json_file(BLOGS_FILE, [])
+    _pub_blogs_ag  = [b for b in _all_blogs_ag if b.get("published")]
+    _recent_ag     = [b["title"] for b in _all_blogs_ag if b.get("title")][-20:]
+
     try:
         loop = asyncio.get_event_loop()
-        blog_object = await loop.run_in_executor(None, run_auto_blog_pipeline, merged_settings, gemini_key)
+        blog_object = await loop.run_in_executor(
+            None, run_auto_blog_pipeline, merged_settings, gemini_key, _recent_ag, _pub_blogs_ag
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Auto-blog pipeline failed: {str(e)}")
 
@@ -1301,7 +1378,7 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
             revision_result = await loop.run_in_executor(
                 None, revise_blog_from_audit,
                 blog_object, initial_audit, rb, llm_cfg,
-                os.getenv("TAVILY_API_KEY", ""), 2,
+                os.getenv("TAVILY_API_KEY", ""), 2, _pub_blogs_ag,
             )
             blog_object = revision_result["revised_blog"]
             # Ensure content key is correct after revision
@@ -1339,6 +1416,19 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
     settings["last_run"] = datetime.utcnow().isoformat()
     settings["run_count"] = settings.get("run_count", 0) + 1
     write_json_file(AUTO_BLOG_SETTINGS_FILE, settings)
+
+    if publish:
+        _fire_publish_webhook(new_blog)
+        _send_email_alert(
+            f"Published: {new_blog['title']}",
+            f"SEO score: {final_score}/100\nSlug: {new_blog.get('slug')}\nURL: /blog/{new_blog.get('slug')}"
+        )
+    elif new_blog.get("draftReason"):
+        _send_email_alert(
+            f"Draft saved for review: {new_blog.get('title', 'Untitled')}",
+            f"Reason: {new_blog['draftReason']}\nSEO score: {final_score}/100\n"
+            f"Review queue: /api/blogs/review-queue"
+        )
 
     await manager.broadcast({
         "type": "blog_published" if publish else "blog_draft",
@@ -1470,11 +1560,12 @@ async def generate_and_post_auto_blog_v2(settings: dict):
     # Pass recently published titles so Stage 1 picks a fresh, unique topic.
     _recent_blogs = read_json_file(BLOGS_FILE, [])
     _recent_topics = [b["title"] for b in _recent_blogs if b.get("title")][-20:]
+    _pub_blogs_v2  = [b for b in _recent_blogs if b.get("published")]
 
     try:
         loop = asyncio.get_event_loop()
         blog_object = await loop.run_in_executor(
-            None, run_auto_blog_pipeline, settings, gemini_key, _recent_topics
+            None, run_auto_blog_pipeline, settings, gemini_key, _recent_topics, _pub_blogs_v2
         )
 
         # SEO publish gate: surgical revision if pipeline didn't hit 90+.
@@ -1500,7 +1591,7 @@ async def generate_and_post_auto_blog_v2(settings: dict):
                 _rev = await loop.run_in_executor(
                     None, revise_blog_from_audit,
                     blog_object, _audit, rb, llm_cfg_v2,
-                    os.getenv("TAVILY_API_KEY", ""), 2,
+                    os.getenv("TAVILY_API_KEY", ""), 2, _pub_blogs_v2,
                 )
                 blog_object = _rev["revised_blog"]
                 if blog_object.get("content_html") and not blog_object.get("content"):
@@ -1540,6 +1631,19 @@ async def generate_and_post_auto_blog_v2(settings: dict):
         settings["run_count"] = settings.get("run_count", 0) + 1
         write_json_file(AUTO_BLOG_SETTINGS_FILE, settings)
 
+        if new_blog.get("published"):
+            _fire_publish_webhook(new_blog)
+            _send_email_alert(
+                f"Published: {new_blog['title']}",
+                f"SEO score: {new_blog.get('seoScore')}/100\nSlug: {new_blog.get('slug')}\nURL: /blog/{new_blog.get('slug')}"
+            )
+        else:
+            _send_email_alert(
+                f"Draft saved for review: {new_blog.get('title', 'Untitled')}",
+                f"Reason: {new_blog.get('draftReason', 'Unknown')}\nSEO score: {new_blog.get('seoScore')}/100\n"
+                f"Review queue: /api/blogs/review-queue"
+            )
+
         await manager.broadcast({
             "type": "blog_published",
             "blog": new_blog,
@@ -1548,10 +1652,12 @@ async def generate_and_post_auto_blog_v2(settings: dict):
         print(f"[auto_blogger] Published: {new_blog['title']} (SEO {new_blog.get('seoScore')}/100)")
     except Exception as e:
         import traceback
+        err_msg = str(e)[:200]
         print(f"[auto_blogger_v2] Pipeline failed: {e}\n{traceback.format_exc()}")
+        _send_email_alert("Pipeline failure", f"Auto-blog pipeline failed:\n{err_msg}")
         await manager.broadcast({
             "type": "blog_error",
-            "message": f"Auto-blog pipeline failed: {str(e)[:200]}"
+            "message": f"Auto-blog pipeline failed: {err_msg}"
         })
 
 
@@ -1578,6 +1684,21 @@ async def revise_saved_blog(blog_id: str):
     blog = next((b for b in blogs if b.get("id") == blog_id or b.get("slug") == blog_id), None)
     if not blog:
         raise HTTPException(status_code=404, detail="Blog not found")
+
+    # Rate-limit: one revision per blog per hour to prevent runaway LLM spend.
+    last_revised = blog.get("revised_at")
+    if last_revised:
+        try:
+            delta = (datetime.utcnow() - datetime.fromisoformat(last_revised)).total_seconds()
+            if delta < 3600:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Blog was revised {int(delta // 60)}m ago — wait 1 hour before revising again."
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # malformed date — allow revision
 
     gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
     settings = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
@@ -1609,12 +1730,14 @@ async def revise_saved_blog(blog_id: str):
         "faqs":              [],
     } if stored_rb else {}
 
+    _pub_blogs_rev = [b for b in blogs if b.get("published") and b.get("id") != blog_id]
+
     try:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None, revise_blog_from_audit,
             blog, initial_audit, research_brief, llm_cfg,
-            os.getenv("TAVILY_API_KEY", ""), 2,
+            os.getenv("TAVILY_API_KEY", ""), 2, _pub_blogs_rev,
         )
     except Exception as e:
         import traceback

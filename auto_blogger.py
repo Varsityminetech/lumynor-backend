@@ -1982,6 +1982,39 @@ def _fetch_supporting_sources(topic: str, tavily_key: str) -> list:
     return unique[:6]
 
 
+def _find_related_blog_links(current_blog: dict, published_blogs: list, n: int = 2) -> list:
+    """Return up to n published blogs most related to current_blog by keyword overlap.
+    Returns list of dicts: {title, slug, url, anchor}"""
+    kw = (current_blog.get("primaryKeyword") or current_blog.get("primary_keyword") or "").lower()
+    title_words = set(re.sub(r'[^a-z0-9 ]', '', (current_blog.get("title") or "").lower()).split()) - {
+        "a", "an", "the", "and", "or", "in", "on", "at", "to", "for", "of", "with", "by",
+        "how", "what", "why", "is", "are", "was", "will", "can", "do", "does", "this", "that",
+    }
+    current_id = current_blog.get("id", "")
+    scored = []
+    for b in published_blogs:
+        if not b.get("published") or b.get("id") == current_id:
+            continue
+        slug = b.get("slug", "")
+        if not slug:
+            continue
+        b_kw  = (b.get("primaryKeyword") or "").lower()
+        b_title_words = set(re.sub(r'[^a-z0-9 ]', '', (b.get("title") or "").lower()).split())
+        overlap = len(title_words & b_title_words)
+        kw_match = int(bool(kw and b_kw and (kw in b_kw or b_kw in kw)))
+        score = overlap * 2 + kw_match * 3
+        if score > 0:
+            scored.append((score, b))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    result = []
+    for _, b in scored[:n]:
+        slug = b.get("slug", "")
+        title = b.get("title", slug)
+        result.append({"title": title, "slug": slug,
+                        "url": f"/blog/{slug}", "anchor": title[:50]})
+    return result
+
+
 def revise_blog_from_audit(
     blog: dict,
     audit: dict,
@@ -1989,6 +2022,7 @@ def revise_blog_from_audit(
     llm_cfg,
     tavily_key: str = "",
     max_loops: int = 2,
+    published_blogs: list = None,
 ) -> dict:
     """
     Targeted content revision — classifies issues, applies minimum surgical fix
@@ -2368,17 +2402,31 @@ Return ONLY this JSON:
             int_count = len(re.findall(
                 r'href=["\'](?:https?://(?:www\.)?lumynor\.com|/)[^"\']*["\']', raw, re.I))
             if int_count < 3 and "</p>" in raw:
-                block = (
-                    '<p>Looking to put these ideas into practice? Explore how '
-                    '<a href="/products/agent-forge">Agent Forge</a> helps SaaS teams '
-                    'ship agentic products faster, or <a href="/contact">talk to our team</a>. '
-                    'More on the <a href="/blog">Lumynor AI &amp; SaaS blog</a>.</p>'
-                )
+                # Build dynamic links: prefer topically related published blogs,
+                # fall back to the three hardcoded evergreen pages.
+                related = _find_related_blog_links(current, published_blogs or [], n=2) if published_blogs else []
+                if related:
+                    rel_links = " | ".join(
+                        f'<a href="{r["url"]}">{r["anchor"]}</a>' for r in related
+                    )
+                    block = (
+                        f'<p>Want to go deeper? {rel_links} — '
+                        f'or <a href="/contact">talk to the Lumynor team</a> about '
+                        f'building your own agentic product.</p>'
+                    )
+                else:
+                    block = (
+                        '<p>Looking to put these ideas into practice? Explore how '
+                        '<a href="/products/agent-forge">Agent Forge</a> helps SaaS teams '
+                        'ship agentic products faster, or <a href="/contact">talk to our team</a>. '
+                        'More on the <a href="/blog">Lumynor AI &amp; SaaS blog</a>.</p>'
+                    )
                 lp = raw.rfind("</p>")
                 if lp > 0:
                     current[_ck] = raw[:lp + 4] + "\n" + block + raw[lp + 4:]
                     links_added = True
-                    notes.append(f"  ✓ Internal links injected ({int_count} → 3+)")
+                    rel_note = f" (linked to: {', '.join(r['anchor'][:30] for r in related)})" if related else ""
+                    notes.append(f"  ✓ Internal links injected ({int_count} → 3+){rel_note}")
                     actions_taken.append("Internal links injected")
             else:
                 notes.append(f"  ℹ Internal links: already {int_count} present, skipping")
@@ -2571,7 +2619,8 @@ Return ONLY this JSON:
 
 # ── MASTER PIPELINE ───────────────────────────────────────────────────────────
 
-def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list = None) -> dict:
+def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list = None,
+                           published_blogs: list = None) -> dict:
     """
     Full auto-blog pipeline (guide-aligned):
     1. Crawl Tier 1/2 trusted sources, cluster + score topics → pick best
@@ -2605,17 +2654,62 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
         log.append("🧠 LLM: gemini (gemini-2.5-flash)")
     log.append(f"🔎 Research: {'Tavily (advanced)' if tavily_key else 'DuckDuckGo (fallback)'}")
 
-    # Stage 1: Crawl trusted sources, cluster stories, score + pick best topic
-    log.append("🔍 Crawling trusted AI sources and scoring topics...")
-    topic_data = research_trending_topics(
-        niche, keywords_hint, llm_cfg,
-        recent_topics=recent_topics, tavily_key=tavily_key,
-    )
-    topic = topic_data.get("topic", f"AI Trends in {niche}")
-    angle = topic_data.get("angle", "Comprehensive guide")
-    target_audience = topic_data.get("target_audience", "SaaS developers and digital product teams")
+    # Stage 1: Cluster queue → pick pending topic, or crawl for a new pillar topic.
+    # If settings has pending_cluster_topics, consume the first one instead of
+    # running full trending-topic research. This implements a pillar+cluster strategy:
+    # each pillar run generates subtopics that are queued for the next N runs.
+    pending_clusters = settings.get("pending_cluster_topics", [])
+    if pending_clusters:
+        queued = pending_clusters[0]
+        topic          = queued.get("topic", "")
+        angle          = queued.get("angle", "Deep-dive supporting post")
+        target_audience = queued.get("target_audience", "SaaS developers and digital product teams")
+        topic_data     = {"topic": topic, "angle": angle, "target_audience": target_audience,
+                          "total_score": "queued", "cluster_sources": []}
+        settings["pending_cluster_topics"] = pending_clusters[1:]
+        log.append(f"📌 Using queued cluster topic: {topic}")
+    else:
+        log.append("🔍 Crawling trusted AI sources and scoring topics...")
+        topic_data = research_trending_topics(
+            niche, keywords_hint, llm_cfg,
+            recent_topics=recent_topics, tavily_key=tavily_key,
+        )
+        topic          = topic_data.get("topic", f"AI Trends in {niche}")
+        angle          = topic_data.get("angle", "Comprehensive guide")
+        target_audience = topic_data.get("target_audience", "SaaS developers and digital product teams")
+        log.append(f"📌 Pillar topic selected: {topic} (score: {topic_data.get('total_score','?')})")
+
+        # Generate 3 cluster subtopics for the next 3 runs (stored in settings).
+        try:
+            cluster_prompt = (
+                f"You just chose '{topic}' as a pillar blog topic for a SaaS/AI blog.\n"
+                "Generate 3 specific supporting (cluster) subtopic ideas that:\n"
+                "- Each covers ONE narrow aspect of the pillar\n"
+                "- Together form a content cluster that internally links to the pillar\n"
+                "- Would rank for long-tail keywords\n\n"
+                'Return ONLY JSON: {"cluster_topics": ['
+                '{"topic": "...", "angle": "...", "target_audience": "..."}]}'
+            )
+            _ct = _parse_json_lenient(_llm(cluster_prompt, llm_cfg, json_mode=True,
+                                           timeout=60, max_tokens=512))
+            new_clusters = _ct.get("cluster_topics", [])[:3]
+            if new_clusters:
+                settings["pending_cluster_topics"] = (
+                    settings.get("pending_cluster_topics", []) + new_clusters
+                )
+                log.append(f"🗂 Queued {len(new_clusters)} cluster subtopics for future runs")
+        except Exception as _ce:
+            log.append(f"⚠ Cluster topic generation failed: {_ce}")
+
     cluster_sources = topic_data.get("cluster_sources", [])
-    log.append(f"📌 Topic selected: {topic} (score: {topic_data.get('total_score','?')})")
+
+    # Near-duplicate guard: warn if chosen topic strongly overlaps with recent titles.
+    _topic_words = {w for w in re.sub(r'[^a-z0-9 ]', ' ', topic.lower()).split() if len(w) > 4}
+    _dup_titles = [t for t in (recent_topics or []) if isinstance(t, str)
+                   and len(_topic_words & {w for w in re.sub(r'[^a-z0-9 ]', ' ', t.lower()).split()
+                                           if len(w) > 4}) >= 3]
+    if _dup_titles:
+        log.append(f"⚠ Near-duplicate: topic shares 3+ keywords with '{_dup_titles[0][:60]}'")
 
     # Stage 2: SEO keyword research
     log.append("🔑 Running SEO keyword research...")
@@ -2735,6 +2829,19 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
         if research_brief and not draft.get("research_brief"):
             draft["research_brief"] = {"_present": True}
 
+        # Inject dynamic internal links to published sibling posts (pillar ↔ cluster).
+        if published_blogs:
+            _related = _find_related_blog_links(draft, published_blogs, n=2)
+            _ch3 = draft.get("content_html", "")
+            if _related and not any(r["url"] in _ch3 for r in _related):
+                rel_links = " | ".join(f'<a href="{r["url"]}">{r["anchor"]}</a>' for r in _related)
+                il_block = (
+                    f'<p>Want to go deeper? {rel_links} — '
+                    f'or <a href="/contact">talk to the Lumynor team</a> about '
+                    f'building your own agentic product.</p>'
+                )
+                draft["content_html"] = _ch3 + "\n" + il_block
+
         # Inject schema.org Article + FAQPage JSON-LD for structured data / rich results.
         ch_ld = draft.get("content_html", "")
         if "<script type=\"application/ld+json\">" not in ch_ld:
@@ -2840,7 +2947,15 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
 
     # Build final blog object
     now = datetime.utcnow()
-    slug = re.sub(r'[^a-z0-9]+', '-', blog_content.get("title", topic).lower()).strip('-')[:80]
+    _SLUG_STOP = {
+        "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of",
+        "with", "by", "from", "how", "what", "why", "when", "where", "is", "are",
+        "was", "were", "will", "can", "do", "does", "this", "that", "s",
+    }
+    _slug_words = [w for w in re.sub(r'[^a-z0-9]+', '-',
+                   blog_content.get("title", topic).lower()).split('-')
+                   if w and w not in _SLUG_STOP]
+    slug = '-'.join(_slug_words)[:70].strip('-')
 
     blog_object = {
         "title": blog_content.get("title", topic),
