@@ -2010,8 +2010,7 @@ def revise_blog_from_audit(
             f"\n── Revision Loop {loop}/{max_loops} "
             f"(score before: {score_before}/100) ──────────────"
         )
-        buckets       = _classify_audit_issues(audit)
-        content_tasks = []
+        buckets = _classify_audit_issues(audit)
 
         # Log multi-bucket issues for visibility
         for c in buckets.get("_classified", []):
@@ -2106,118 +2105,185 @@ def revise_blog_from_audit(
             else:
                 notes.append("  ⚠ No additional trusted sources found — flagged as remaining risk")
 
-        # ── 3. Build LLM content revision tasks ──────────────────────────────
+        # ── 3. Surgical content fixes ─────────────────────────────────────────
+        # Each issue type extracts only the specific element(s) that need fixing,
+        # sends just those to the LLM, and splices the result back. This prevents
+        # content truncation (the previous full-article approach caused word count
+        # loss when the model only saw [:7000] chars of a long article).
+        #
+        # Exception: expand_content still needs full-article context — it uses a
+        # larger window ([:30000]) plus a word-count guard that rejects the revision
+        # if the model returns fewer words than the original.
+
+        primary_kw = current.get("primary_keyword") or current.get("primaryKeyword", "")
+        brief_summary = ""
+        if research_brief:
+            facts = research_brief.get("main_facts", research_brief.get("key_facts", []))[:5]
+            stats = research_brief.get("key_statistics", [])[:3]
+            avoid = research_brief.get("claims_to_avoid", [])[:3]
+            brief_summary = (
+                "Verified facts: " + "; ".join(str(f) for f in facts) + "\n"
+                "Key statistics: " + "; ".join(str(s) for s in stats) + "\n"
+                "Do NOT include: " + "; ".join(str(a) for a in avoid)
+            )[:1500]
+
+        # ── 3a. Expand content (full-article, word-count guarded) ─────────────
         if buckets.get("expand_content"):
             wc = audit.get("word_count", 0)
-            content_tasks.append(
-                f"EXPAND: The article is only {wc} words — expand every existing H2 section "
-                "to 200-350 words. Add specific examples, developer insights, and business context. "
-                "Use ONLY facts from the research brief — do not invent statistics or company claims."
-            )
-        if buckets.get("rewrite_intro"):
-            content_tasks.append(
-                "INTRO: Rewrite only the first <p> paragraph. Do NOT open with 'In today's', "
-                "'The world of', 'With the rise of', 'Artificial intelligence is transforming', "
-                "or any similar phrase. Open with a specific data point, a contrarian claim, "
-                "or a concrete scenario a SaaS builder would immediately recognise. Under 100 words."
-            )
-        if buckets.get("humanize_writing"):
-            content_tasks.append(
-                "HUMANIZE: Find every sentence that starts with 'Furthermore,', 'Moreover,', "
-                "'Additionally,', 'It is important to note', 'It should be noted', or "
-                "'Consequently,'. Rewrite just those sentences: cut the transition word, "
-                "start with the subject, use a shorter sentence. Sound like a developer "
-                "explaining something to a peer — not a professor writing a thesis."
-            )
-        if buckets.get("fix_keywords") and not buckets.get("expand_content"):
-            kw_issues = "; ".join(buckets["fix_keywords"][:3])
-            content_tasks.append(
-                f"KEYWORDS: {kw_issues}. Add the primary keyword where it fits naturally "
-                "(title, first paragraph, one H2 heading). Never force it."
-            )
-
-        # ── 4. Single LLM call for all content tasks ─────────────────────────
-        if content_tasks:
-            primary_kw  = current.get("primary_keyword") or current.get("primaryKeyword", "")
             raw_content = current.get(_ck, "")
-            brief_summary = ""
-            if research_brief:
-                facts = research_brief.get("main_facts", research_brief.get("key_facts", []))[:5]
-                stats = research_brief.get("key_statistics", [])[:3]
-                avoid = research_brief.get("claims_to_avoid", [])[:3]
-                brief_summary = (
-                    "Verified facts: " + "; ".join(str(f) for f in facts) + "\n"
-                    "Key statistics: " + "; ".join(str(s) for s in stats) + "\n"
-                    "Do NOT include: " + "; ".join(str(a) for a in avoid)
-                )[:1500]
-            _skip = {"hard_fail", "needs_research", "_classified",
-                     "_fixable_hard_fails", "_unfixable_hard_fails"}
-            top_issues = " | ".join(
-                v[0] for bk, v in buckets.items()
-                if v and bk not in _skip and isinstance(v, list) and v
-            )[:400]
-            tasks_block = "\n".join(f"{i+1}. {t}" for i, t in enumerate(content_tasks))
-            revision_prompt = f"""You are revising an SEO blog for Lumynor Systems.
+            orig_wc = len(re.sub(r'<[^>]+>', ' ', raw_content).split())
+            expand_prompt = f"""You are expanding a short SEO blog for Lumynor Systems.
 
-Do not rewrite the entire article unless required.
-Fix only the listed issues.
-Do not invent facts, statistics, sources, or company claims.
-Preserve all verified facts from the research brief.
-Keep the tone human, clear, business-focused, and non-generic.
+Add content to every existing H2 section until each is 200-350 words.
+Do NOT delete or shorten any existing content.
+Do NOT invent statistics or company claims.
+Use ONLY facts from the research brief below.
+Keep tone: human, business-focused, developer-friendly.
 
 BLOG TITLE: {current.get("title", "")}
 PRIMARY KEYWORD: {primary_kw}
-SEO AUDIT SCORE: {audit.get("score", 0)}/100
+CURRENT WORD COUNT: {wc} (target: 1500+)
 
 Research Brief:
-{brief_summary or "(No brief — preserve all existing facts exactly as written)"}
+{brief_summary or "(no brief — expand using only facts already in the article)"}
 
-Blog:
-{raw_content[:7000]}{"...[truncated]" if len(raw_content) > 7000 else ""}
-
-SEO Audit Issues:
-{top_issues}
-
-Revision Tasks:
-{tasks_block}
+Full Blog HTML:
+{raw_content[:30000]}{"...[truncated — preserve ALL sections including those not shown]" if len(raw_content) > 30000 else ""}
 
 Return ONLY this JSON:
 {{
-  "revised_title": "same as current unless KEYWORDS task changed it",
-  "revised_meta_description": "140-158 chars with primary keyword + CTA",
-  "revised_slug": "kebab-case",
-  "revised_content": "COMPLETE revised HTML — all unchanged sections preserved verbatim",
-  "changes_made": ["specific change 1", "specific change 2"],
-  "remaining_risks": ["anything still needing attention"]
+  "revised_content": "COMPLETE expanded HTML with all original sections + new content added",
+  "word_count_estimate": 0,
+  "sections_expanded": ["section name 1", "section name 2"]
 }}"""
             try:
-                result = _llm(revision_prompt, llm_cfg, json_mode=True,
-                              timeout=280, max_tokens=32768)
-                rev = _parse_json_lenient(result)
-                if rev.get("revised_content"):
-                    current[_ck]        = rev["revised_content"]
+                result  = _llm(expand_prompt, llm_cfg, json_mode=True, timeout=280, max_tokens=32768)
+                rev     = _parse_json_lenient(result)
+                new_html = (rev.get("revised_content") or "").strip()
+                new_wc   = len(re.sub(r'<[^>]+>', ' ', new_html).split())
+                if new_html and new_wc >= orig_wc * 0.85:
+                    current[_ck]        = new_html
                     content_was_changed  = True
-                new_title = (rev.get("revised_title") or "").strip()
-                if new_title and (not primary_kw or primary_kw.lower() in new_title.lower()):
-                    current["title"] = new_title
-                new_meta = (rev.get("revised_meta_description") or "").strip()
-                if new_meta:
-                    current["meta_description"] = (new_meta[:157].rstrip() + "..."
-                                                    if len(new_meta) > 160 else new_meta)
-                    current["summary"] = _clamp_summary(new_meta)
-                new_slug = (rev.get("revised_slug") or "").strip()
-                if new_slug:
-                    current["slug"] = re.sub(r'[^a-z0-9]+', '-',
-                                             new_slug.lower()).strip('-')[:80]
-                changes = rev.get("changes_made") or []
-                notes.append(f"  ✓ LLM revision: {len(content_tasks)} task(s), {len(changes)} change(s)")
-                for c in changes[:5]:
-                    notes.append(f"    • {c}")
-                for r in (rev.get("remaining_risks") or [])[:3]:
-                    notes.append(f"    ⚠ Risk: {r}")
-                actions_taken.extend([f"LLM: {t[:50]}" for t in content_tasks])
+                    notes.append(f"  ✓ Expanded: {orig_wc} → {new_wc} words "
+                                 f"(sections: {rev.get('sections_expanded', [])})")
+                    actions_taken.append(f"Expanded {orig_wc}→{new_wc} words")
+                elif new_html:
+                    notes.append(
+                        f"  ⚠ Expand rejected — model returned fewer words "
+                        f"({new_wc} vs {orig_wc} original), keeping original"
+                    )
+                else:
+                    notes.append("  ✗ Expand returned empty content")
             except Exception as e:
-                notes.append(f"  ✗ LLM content revision failed: {str(e)[:100]}")
+                notes.append(f"  ✗ Expand failed: {str(e)[:100]}")
+
+        # ── 3b. Surgical intro rewrite ────────────────────────────────────────
+        if buckets.get("rewrite_intro"):
+            html = current.get(_ck, "")
+            m = re.search(r'(<p[^>]*>)(.*?)(</p>)', html, re.DOTALL | re.I)
+            if m:
+                orig_para = m.group(0)
+                intro_prompt = (
+                    "Rewrite this blog intro paragraph for a B2B SaaS/AI tech blog.\n\n"
+                    "Rules:\n"
+                    "- Do NOT open with: 'In today's', 'The world of', 'With the rise of', "
+                    "'Artificial intelligence is transforming', or any generic preamble.\n"
+                    "- Open with a specific data point, contrarian claim, or concrete scenario "
+                    "a SaaS founder or developer would immediately recognise.\n"
+                    "- Under 100 words. No fluff.\n\n"
+                    f"Primary keyword to include: {primary_kw}\n\n"
+                    f"Paragraph to rewrite:\n{orig_para}\n\n"
+                    'Return ONLY JSON: {"revised": "<p>revised paragraph</p>"}'
+                )
+                try:
+                    r        = _parse_json_lenient(_llm(intro_prompt, llm_cfg,
+                                                        json_mode=True, timeout=60, max_tokens=512))
+                    new_para = (r.get("revised") or "").strip()
+                    if new_para and "<p" in new_para:
+                        current[_ck]        = html.replace(orig_para, new_para, 1)
+                        content_was_changed  = True
+                        notes.append("  ✓ Intro rewritten (surgical)")
+                        actions_taken.append("Intro rewritten")
+                    else:
+                        notes.append("  ⚠ Intro fix returned malformed output, skipped")
+                except Exception as e:
+                    notes.append(f"  ✗ Intro fix failed: {str(e)[:60]}")
+
+        # ── 3c. Surgical humanize fix ─────────────────────────────────────────
+        if buckets.get("humanize_writing"):
+            _BANNED_TRANS = (
+                "Furthermore,", "Moreover,", "Additionally,",
+                "It is important to note", "It should be noted", "Consequently,",
+                "In conclusion,", "In summary,", "To summarize,",
+            )
+            html = current.get(_ck, "")
+            para_iter = re.finditer(r'<p[^>]*>.*?</p>', html, re.DOTALL | re.I)
+            bad_paras = [m.group(0) for m in para_iter
+                         if any(t in m.group(0) for t in _BANNED_TRANS)][:8]
+            if bad_paras:
+                humanize_prompt = (
+                    "Rewrite each paragraph below to remove robotic AI transitions.\n"
+                    "Rules: Remove 'Furthermore,', 'Moreover,', 'Additionally,', "
+                    "'It is important to note', 'Consequently,', 'In conclusion,', etc. "
+                    "Start sentences with the subject. Keep all facts unchanged. "
+                    "Sound like a developer explaining to a peer.\n\n"
+                    "Paragraphs:\n" +
+                    "\n---\n".join(f"PARA_{i}:\n{p}" for i, p in enumerate(bad_paras)) +
+                    '\n\nReturn ONLY JSON: {"revisions": '
+                    '[{"original": "exact original paragraph", "revised": "fixed paragraph"}]}'
+                )
+                try:
+                    r    = _parse_json_lenient(_llm(humanize_prompt, llm_cfg,
+                                                    json_mode=True, timeout=120, max_tokens=4096))
+                    html = current.get(_ck, "")
+                    fixed = 0
+                    for pair in r.get("revisions", []):
+                        orig = (pair.get("original") or "").strip()
+                        repl = (pair.get("revised") or "").strip()
+                        if orig and repl and orig in html:
+                            html   = html.replace(orig, repl, 1)
+                            fixed += 1
+                    if fixed:
+                        current[_ck]        = html
+                        content_was_changed  = True
+                        notes.append(f"  ✓ Humanized {fixed}/{len(bad_paras)} paragraph(s) (surgical)")
+                        actions_taken.append(f"Humanized {fixed} paragraph(s)")
+                    else:
+                        notes.append("  ⚠ Humanize: no original paragraphs matched in HTML, skipped")
+                except Exception as e:
+                    notes.append(f"  ✗ Humanize failed: {str(e)[:60]}")
+
+        # ── 3d. Surgical keyword fix ──────────────────────────────────────────
+        # Only runs when expand_content is NOT active (expansion already adds keyword naturally).
+        if buckets.get("fix_keywords") and not buckets.get("expand_content") and primary_kw:
+            html      = current.get(_ck, "")
+            html_head = html[:600]  # first ~100 words
+            if primary_kw.lower() not in html_head.lower():
+                # Find the first <p> or <h1>/<h2> to inject keyword into
+                m = re.search(r'(?:<h[12][^>]*>.*?</h[12]>|<p[^>]*>.*?</p>)',
+                              html, re.DOTALL | re.I)
+                if m:
+                    target = m.group(0)
+                    kw_prompt = (
+                        f"Naturally add the keyword '{primary_kw}' to this HTML element. "
+                        "Only add it if it reads naturally — do NOT force it. "
+                        "Do NOT change any other content.\n\n"
+                        f"Element:\n{target}\n\n"
+                        'Return ONLY JSON: {"revised": "<element with keyword added>"}'
+                    )
+                    try:
+                        r       = _parse_json_lenient(_llm(kw_prompt, llm_cfg,
+                                                           json_mode=True, timeout=60, max_tokens=512))
+                        new_el  = (r.get("revised") or "").strip()
+                        if new_el and primary_kw.lower() in new_el.lower() and new_el != target:
+                            current[_ck]        = html.replace(target, new_el, 1)
+                            content_was_changed  = True
+                            notes.append(f"  ✓ Keyword '{primary_kw}' injected surgically")
+                            actions_taken.append(f"Keyword injected into first element")
+                        else:
+                            notes.append(f"  ⚠ Keyword injection: model didn't add '{primary_kw}', skipped")
+                    except Exception as e:
+                        notes.append(f"  ✗ Keyword fix failed: {str(e)[:60]}")
 
         # ── 5. Programmatic internal link injection ───────────────────────────
         if buckets.get("add_internal_links"):
