@@ -1179,6 +1179,38 @@ async def auto_blogger_daemon():
 
 from auto_blogger import run_auto_blog_pipeline, research_trending_topics, _tavily_search
 
+@app.get("/api/system/test-images")
+async def test_images():
+    """Test Pexels and Unsplash API keys from env — returns status, sample URL, or error for each."""
+    import os as _os
+    from auto_blogger import _search_pexels, _search_unsplash
+    pexels_key   = _os.getenv("PEXELS_API_KEY", "")
+    unsplash_key = _os.getenv("UNSPLASH_ACCESS_KEY", "")
+    result = {}
+
+    # Pexels
+    if pexels_key:
+        try:
+            url = _search_pexels("artificial intelligence technology", pexels_key)
+            result["pexels"] = {"status": "ok", "url": url} if url else {"status": "failed", "error": "returned no photos"}
+        except Exception as e:
+            result["pexels"] = {"status": "error", "error": str(e)}
+    else:
+        result["pexels"] = {"status": "no_key", "error": "PEXELS_API_KEY not set in Railway env"}
+
+    # Unsplash
+    if unsplash_key:
+        try:
+            photo = _search_unsplash("artificial intelligence technology", unsplash_key)
+            result["unsplash"] = {"status": "ok", "url": photo["url"]} if photo else {"status": "failed", "error": "returned no photos"}
+        except Exception as e:
+            result["unsplash"] = {"status": "error", "error": str(e)}
+    else:
+        result["unsplash"] = {"status": "no_key", "error": "UNSPLASH_ACCESS_KEY not set in Railway env"}
+
+    return result
+
+
 @app.get("/api/system/test-tavily")
 async def test_tavily(key: str = ""):
     """Test whether a Tavily API key works. Pass ?key=tvly-xxx or leave blank to check env."""
