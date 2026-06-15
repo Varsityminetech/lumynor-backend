@@ -925,17 +925,18 @@ AUTO_BLOG_SETTINGS_FILE = _seed_data_file("auto_blog_settings.json", {})
 
 class AutoBlogSettingsUpdateRequest(BaseModel):
     enabled: bool = False
-    niche: str = "Agentic AI & Software Development"
+    niche: str = "Latest AI News, Agentic AI, and SaaS Development"
+    keywords: str = "AI agents, agentic AI, SaaS development, AI automation, LLMs, Claude, GPT, Gemini, AI tools for developers, AI startups"
     topics: str = ""
     frequency_hours: int = 24
     author: str = "Danish"
-    category: str = "Agentic AI"
+    category: str = "AI"
     auto_publish: bool = True
     tone: str = "Technical Expert"
     # LLM passthrough (optional, uses system env if omitted)
-    llmProvider: str = "local"
-    llmApiName: str = "gemini"   # gemini | openai | anthropic | openrouter | deepseek
-    llmModelName: str = "qwen2.5:latest"
+    llmProvider: str = "api"
+    llmApiName: str = "gemini"
+    llmModelName: str = "gemini-2.5-flash"
     llmApiKey: str = ""
     llmBaseUrl: str = ""
 
