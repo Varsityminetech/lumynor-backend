@@ -1420,8 +1420,13 @@ def validate_seo(blog: dict) -> dict:
         "aws.amazon.com", "cloud.google.com", "azure.microsoft.com",
         "kubernetes.io", "docker.com", "postgresql.org",
     )
-    trusted_ext = [l for l in ext_links if any(d in l for d in TRUSTED)]
-    src_count = len(references) if references else len(ext_links)
+    # Combine inline links + reference URLs for trusted-source check
+    ref_urls = {r.get("url", "") for r in (references or []) if r.get("url")}
+    all_ext_urls = set(ext_links) | ref_urls
+    trusted_ext = [l for l in all_ext_urls if any(d in l for d in TRUSTED)]
+    # Adding references to the metadata must never hurt the src_count — use max()
+    ref_count = len(references) if references else 0
+    src_count = max(ref_count, len(ext_links))
 
     if src_count >= 3:
         ok(f"Source count: {src_count} references/links")
@@ -1444,7 +1449,7 @@ def validate_seo(blog: dict) -> dict:
 
     # Unsupported stats heuristic: numbers with % or $ but no external sources
     stat_hits = re.findall(r'\b\d+(?:\.\d+)?%|\$[\d\.]+[BMKbmk]?\b', clean)
-    if stat_hits and not ext_links:
+    if stat_hits and not all_ext_urls:
         lose("research_quality", 5,
              f"{len(stat_hits)} statistic(s) used but no external sources linked — potential unsupported claims",
              "Back all statistics with a linked source or remove them")
