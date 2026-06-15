@@ -1769,9 +1769,12 @@ def refine_blog_seo(blog: dict, seo_report: dict, gemini_key: str) -> dict:
     """
     Programmatic + lightweight-LLM fixes for the most impactful SEO issues.
     Does NOT rewrite the longform body — protects word count and content quality.
+    Works with both 'content_html' (pipeline drafts) and 'content' (stored blogs).
     """
-    primary_kw = blog.get("primary_keyword", "")
-    content = blog.get("content_html", "")
+    # Accept both key conventions used across the codebase
+    primary_kw = (blog.get("primary_keyword") or blog.get("primaryKeyword") or "").strip()
+    _ck = "content_html" if "content_html" in blog else "content"
+    content = blog.get(_ck, "")
     issues_text = " | ".join(seo_report.get("issues", []))
 
     # 1) Fix title + meta description via a short LLM call
@@ -1779,7 +1782,7 @@ def refine_blog_seo(blog: dict, seo_report: dict, gemini_key: str) -> dict:
 
 PRIMARY KEYWORD: {primary_kw}
 CURRENT TITLE: {blog.get('title', '')}
-CURRENT META DESCRIPTION: {blog.get('meta_description', '')}
+CURRENT META DESCRIPTION: {blog.get('meta_description') or blog.get('summary', '')}
 ARTICLE OPENING (first 300 chars): {re.sub('<[^>]+>', '', content)[:300]}
 SEO ISSUES TO FIX: {issues_text[:300]}
 
@@ -1795,8 +1798,10 @@ Respond ONLY with JSON: {{"title": "...", "meta_description": "..."}}"""
         fixed = _parse_json_lenient(result)
         kw_words = [w for w in primary_kw.lower().split() if len(w) > 2]
         new_title = (fixed.get("title") or "").strip()
-        title_has_kw = (primary_kw.lower() in new_title.lower() or
-                        (kw_words and all(w in new_title.lower() for w in kw_words)))
+        title_has_kw = (
+            (primary_kw and primary_kw.lower() in new_title.lower()) or
+            (kw_words and all(w in new_title.lower() for w in kw_words))
+        )
         if new_title and title_has_kw and 30 <= len(new_title) <= 70:
             blog["title"] = new_title
         if fixed.get("meta_description"):
@@ -1804,42 +1809,44 @@ Respond ONLY with JSON: {{"title": "...", "meta_description": "..."}}"""
             if len(md) > 160:
                 md = md[:157].rstrip() + "..."
             blog["meta_description"] = md
+            blog["summary"] = _clamp_summary(md)
     except Exception as e:
         print(f"[refine_seo] metadata fix error: {e}")
 
     # 2) Hard-enforce meta description length
-    md = blog.get("meta_description", "")
+    md = blog.get("meta_description") or blog.get("summary", "")
     if len(md) > 160:
         blog["meta_description"] = md[:157].rstrip() + "..."
 
     # 3) Ensure primary keyword appears in first paragraph
-    content = blog.get("content_html", "")
+    content = blog.get(_ck, "")
     first_chunk = re.sub('<[^>]+>', '', content)[:400].lower()
     if primary_kw and primary_kw.lower() not in first_chunk and "<p>" in content:
         lead = f'<p><strong>{primary_kw.capitalize()}</strong> is reshaping how modern teams build and ship digital products.</p>\n'
         content = content.replace("<p>", lead + "<p>", 1)
-        blog["content_html"] = content
+        blog[_ck] = content
 
     # 4) Remove stray H1 tags inside content body (title is the page H1)
-    content = blog.get("content_html", "")
+    content = blog.get(_ck, "")
     if len(re.findall(r'<h1[^>]*>', content, re.I)) > 1:
         content = re.sub(r'<h1([^>]*)>(.*?)</h1>', r'<h2\1>\2</h2>', content, count=10, flags=re.I | re.S)
-        blog["content_html"] = content
+        blog[_ck] = content
 
-    # 5) Inject default internal links if none present
-    content = blog.get("content_html", "")
-    has_internal = re.search(r'href=["\'](?:https?://(?:www\.)?lumynor\.com|/)[^"\']*["\']', content, re.I)
-    if not has_internal and "</p>" in content:
+    # 5) Inject internal links if fewer than 3 are present
+    content = blog.get(_ck, "")
+    int_link_count = len(re.findall(
+        r'href=["\'](?:https?://(?:www\.)?lumynor\.com|/)[^"\']*["\']', content, re.I))
+    if int_link_count < 3 and "</p>" in content:
         internal_block = (
             '<p>Looking to put these ideas into practice? Explore how '
             '<a href="/products">Lumynor\'s AI products</a> help startups automate faster, '
-            'or <a href="/contact">talk to our team</a> about building an agentic workflow for your business. '
-            'Read more on our <a href="/blog">AI &amp; SaaS insights blog</a>.</p>'
+            'or <a href="/contact">talk to our team</a> about building an agentic workflow '
+            'for your business. Read more on our <a href="/blog">AI &amp; SaaS insights blog</a>.</p>'
         )
         last_p = content.rfind("</p>")
         if last_p > 0:
             content = content[:last_p + 4] + "\n" + internal_block + content[last_p + 4:]
-            blog["content_html"] = content
+            blog[_ck] = content
 
     return blog
 
@@ -2213,12 +2220,52 @@ Return ONLY this JSON:
                     notes.append(f"  ✗ Intro fix failed: {str(e)[:60]}")
 
         # ── 3c. Surgical humanize fix ─────────────────────────────────────────
+        # Two layers:
+        #   Layer 1 — Programmatic: remove/replace known banned single words/phrases
+        #             directly in HTML without an LLM call (fast, zero hallucination).
+        #   Layer 2 — LLM: rewrite paragraphs containing robotic transition phrases
+        #             that need more context to fix naturally.
         if buckets.get("humanize_writing"):
+            _BANNED_REPLACEMENTS = {
+                "seamlessly":            "smoothly",
+                "game-changer":          "significant shift",
+                "game changer":          "significant shift",
+                "revolutionize":         "transform",
+                "unlock the power":      "take advantage",
+                "cutting-edge technology": "modern technology",
+                "leveraging ai":         "using AI",
+                "leveraging the power":  "using the power",
+                "delve into":            "explore",
+                "delve in":              "look into",
+                "it's worth noting":     "notably",
+                "it is worth noting":    "notably",
+                "this groundbreaking":   "this",
+                "this revolutionary":    "this",
+                "the future is here":    "this is already happening",
+                "needless to say":       "",
+            }
             _BANNED_TRANS = (
                 "Furthermore,", "Moreover,", "Additionally,",
                 "It is important to note", "It should be noted", "Consequently,",
                 "In conclusion,", "In summary,", "To summarize,",
             )
+            html = current.get(_ck, "")
+
+            # Layer 1: direct string replacement (case-insensitive)
+            swaps = 0
+            for bad, good in _BANNED_REPLACEMENTS.items():
+                pattern = re.compile(re.escape(bad), re.I)
+                new_html, n = pattern.subn(good, html)
+                if n:
+                    html   = new_html
+                    swaps += n
+            if swaps:
+                current[_ck]        = html
+                content_was_changed  = True
+                notes.append(f"  ✓ Banned words replaced inline ({swaps} substitution(s))")
+                actions_taken.append(f"Banned word replacements: {swaps}")
+
+            # Layer 2: LLM rewrite for robotic transition paragraphs
             html = current.get(_ck, "")
             para_iter = re.finditer(r'<p[^>]*>.*?</p>', html, re.DOTALL | re.I)
             bad_paras = [m.group(0) for m in para_iter
@@ -2252,9 +2299,9 @@ Return ONLY this JSON:
                         notes.append(f"  ✓ Humanized {fixed}/{len(bad_paras)} paragraph(s) (surgical)")
                         actions_taken.append(f"Humanized {fixed} paragraph(s)")
                     else:
-                        notes.append("  ⚠ Humanize: no original paragraphs matched in HTML, skipped")
+                        notes.append("  ⚠ Humanize LLM: no paragraphs matched for splice, skipped")
                 except Exception as e:
-                    notes.append(f"  ✗ Humanize failed: {str(e)[:60]}")
+                    notes.append(f"  ✗ Humanize LLM failed: {str(e)[:60]}")
 
         # ── 3d. Surgical keyword fix ──────────────────────────────────────────
         # Only runs when expand_content is NOT active (expansion already adds keyword naturally).
@@ -2290,10 +2337,10 @@ Return ONLY this JSON:
 
         # ── 5. Programmatic internal link injection ───────────────────────────
         if buckets.get("add_internal_links"):
-            raw    = current.get(_ck, "")
-            has_int = re.search(
-                r'href=["\'](?:https?://(?:www\.)?lumynor\.com|/)[^"\']*["\']', raw, re.I)
-            if not has_int and "</p>" in raw:
+            raw = current.get(_ck, "")
+            int_count = len(re.findall(
+                r'href=["\'](?:https?://(?:www\.)?lumynor\.com|/)[^"\']*["\']', raw, re.I))
+            if int_count < 3 and "</p>" in raw:
                 block = (
                     '<p>Looking to put these ideas into practice? Explore how '
                     '<a href="/products/agent-forge">Agent Forge</a> helps SaaS teams '
@@ -2303,9 +2350,11 @@ Return ONLY this JSON:
                 lp = raw.rfind("</p>")
                 if lp > 0:
                     current[_ck] = raw[:lp + 4] + "\n" + block + raw[lp + 4:]
-            links_added = True
-            notes.append("  ✓ Internal links injected")
-            actions_taken.append("Internal links injected")
+                    links_added = True
+                    notes.append(f"  ✓ Internal links injected ({int_count} → 3+)")
+                    actions_taken.append("Internal links injected")
+            else:
+                notes.append(f"  ℹ Internal links: already {int_count} present, skipping")
 
         # ── 6. FAQ injection ──────────────────────────────────────────────────
         if buckets.get("add_faq"):
