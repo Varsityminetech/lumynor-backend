@@ -1449,7 +1449,9 @@ def validate_seo(blog: dict) -> dict:
         ok("Statistics appear source-backed")
 
     # ── 3. Keyword Usage (10 pts) ─────────────────────────────────────────────
-    occ = len(re.findall(re.escape(p), content, re.I))
+    # Use clean text (HTML stripped) so keyword hits inside href/alt/class attrs
+    # don't inflate the count — only visible readable text is graded.
+    occ = len(re.findall(re.escape(p), clean, re.I))
     density = (occ * 100 / word_count) if word_count else 0
 
     if p in title_lower:
