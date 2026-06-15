@@ -1477,9 +1477,41 @@ async def generate_and_post_auto_blog_v2(settings: dict):
             None, run_auto_blog_pipeline, settings, gemini_key, _recent_topics
         )
 
-        # SEO publish gate: only auto-publish posts that clear a minimum score.
+        # SEO publish gate: surgical revision if pipeline didn't hit 90+.
         min_score = int(os.getenv("BLOG_MIN_PUBLISH_SCORE", "90"))
         score = blog_object.get("seoScore") or 0
+        llm_cfg_v2 = _build_llm_cfg(settings, gemini_key)
+        if score < min_score:
+            try:
+                _audit = validate_seo({
+                    "title":              blog_object.get("title", ""),
+                    "meta_description":   blog_object.get("metaDescription") or blog_object.get("summary", ""),
+                    "content_html":       blog_object.get("content", ""),
+                    "primary_keyword":    blog_object.get("primaryKeyword", ""),
+                    "secondary_keywords": blog_object.get("secondaryKeywords", ""),
+                    "coverImage":         blog_object.get("coverImage", ""),
+                    "references":         blog_object.get("references", []),
+                    "research_brief":     {"_present": True} if blog_object.get("researchBrief") else {},
+                })
+                stored_rb = blog_object.get("researchBrief") or {}
+                rb = {"core_angle": stored_rb.get("core_angle", ""),
+                      "lumynor_perspective": stored_rb.get("lumynor_perspective", ""),
+                      "main_facts": [], "key_statistics": [], "claims_to_avoid": [], "faqs": []} if stored_rb else {}
+                _rev = await loop.run_in_executor(
+                    None, revise_blog_from_audit,
+                    blog_object, _audit, rb, llm_cfg_v2,
+                    os.getenv("TAVILY_API_KEY", ""), 2,
+                )
+                blog_object = _rev["revised_blog"]
+                if blog_object.get("content_html") and not blog_object.get("content"):
+                    blog_object["content"] = blog_object["content_html"]
+                blog_object["seoScore"] = _rev["new_seo_score"]
+                blog_object["seoGrade"] = _rev["new_seo_grade"]
+                score = _rev["new_seo_score"]
+                print(f"[auto_blogger] Post-pipeline revision: {_rev['score_progression']} — final {score}")
+            except Exception as _re:
+                print(f"[auto_blogger] Post-pipeline revision failed: {_re}")
+
         seo_ok = score >= min_score
 
         # Image gate: a placehold.co URL means every real image source failed.
@@ -1490,7 +1522,7 @@ async def generate_and_post_auto_blog_v2(settings: dict):
         new_blog = {
             "id": str(uuid.uuid4()),
             **blog_object,
-            "published": bool(blog_object.get("published")) and seo_ok and has_real_image,
+            "published": seo_ok and has_real_image,
             "created_at": datetime.utcnow().isoformat(),
             "is_auto_posted": True,
         }
@@ -1521,6 +1553,17 @@ async def generate_and_post_auto_blog_v2(settings: dict):
             "type": "blog_error",
             "message": f"Auto-blog pipeline failed: {str(e)[:200]}"
         })
+
+
+@app.post("/api/system/trigger-blog")
+async def trigger_blog_now():
+    """Force the auto-blogger daemon to run on its next tick (within 10 seconds).
+    Returns immediately — generation runs in the background and is broadcast via WebSocket."""
+    settings = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
+    settings["enabled"] = True
+    settings["last_run"] = "1970-01-01T00:00:00"
+    write_json_file(AUTO_BLOG_SETTINGS_FILE, settings)
+    return {"status": "triggered", "message": "Blog generation will start within 10 seconds. Watch /api/blogs for the new post."}
 
 
 @app.post("/api/blogs/{blog_id}/revise")
