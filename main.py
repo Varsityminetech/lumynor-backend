@@ -1177,7 +1177,10 @@ async def auto_blogger_daemon():
 
 # ── ENHANCED AUTO-BLOG PIPELINE ENDPOINTS ──────────────────────────────────────
 
-from auto_blogger import run_auto_blog_pipeline, research_trending_topics, _tavily_search
+from auto_blogger import (
+    run_auto_blog_pipeline, research_trending_topics, _tavily_search,
+    revise_blog_from_audit, validate_seo, _build_llm_cfg,
+)
 
 @app.get("/api/system/test-images")
 async def test_images():
@@ -1310,7 +1313,6 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
 @app.get("/api/trending-topics")
 async def get_trending_topics(niche: str = "Technology", keywords: str = ""):
     """Get trending topic suggestions for a niche without generating a full blog."""
-    from auto_blogger import _build_llm_cfg
     gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
     settings = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
     llm_cfg = _build_llm_cfg(settings, gemini_key)
@@ -1467,6 +1469,102 @@ async def generate_and_post_auto_blog_v2(settings: dict):
             "type": "blog_error",
             "message": f"Auto-blog pipeline failed: {str(e)[:200]}"
         })
+
+
+@app.post("/api/blogs/{blog_id}/revise")
+async def revise_saved_blog(blog_id: str):
+    """Run targeted content revision automation on a saved blog post.
+    Classifies SEO issues into buckets → applies minimum surgical fix per bucket
+    → re-audits → loops up to 2 times.
+    Source issues trigger Tavily re-research only (no LLM fabrication).
+    Returns revision notes, score progression, and publish recommendation.
+    """
+    blogs = read_json_file(BLOGS_FILE, [])
+    blog = next((b for b in blogs if b.get("id") == blog_id or b.get("slug") == blog_id), None)
+    if not blog:
+        raise HTTPException(status_code=404, detail="Blog not found")
+
+    gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
+    settings = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
+    llm_cfg = _build_llm_cfg(settings, gemini_key)
+    if llm_cfg.get("provider") not in ("ollama_cloud", "ollama") and not gemini_key:
+        raise HTTPException(status_code=400,
+                            detail="No LLM key configured. Set GEMINI_API_KEY or OLLAMA_API_KEY.")
+
+    # Run initial audit on the stored blog
+    initial_audit = validate_seo({
+        "title":              blog.get("title", ""),
+        "meta_description":   blog.get("metaDescription") or blog.get("summary", ""),
+        "content_html":       blog.get("content", ""),
+        "primary_keyword":    blog.get("primaryKeyword", ""),
+        "secondary_keywords": blog.get("secondaryKeywords", ""),
+        "coverImage":         blog.get("coverImage", ""),
+        "references":         blog.get("references", []),
+        "research_brief":     {"_present": True} if blog.get("researchBrief") else {},
+    })
+
+    # Reconstruct a compact research brief from what was stored with the blog
+    stored_rb = blog.get("researchBrief") or {}
+    research_brief = {
+        "core_angle":        stored_rb.get("core_angle", ""),
+        "lumynor_perspective": stored_rb.get("lumynor_perspective", ""),
+        "main_facts":        [],
+        "key_statistics":    [],
+        "claims_to_avoid":   [],
+        "faqs":              [],
+    } if stored_rb else {}
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, revise_blog_from_audit,
+            blog, initial_audit, research_brief, llm_cfg,
+            os.getenv("TAVILY_API_KEY", ""), 2,
+        )
+    except Exception as e:
+        import traceback
+        print(f"[revise] {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Revision failed: {str(e)[:200]}")
+
+    revised = result["revised_blog"]
+
+    # Persist the revised blog back to storage
+    for idx, b in enumerate(blogs):
+        if b.get("id") == blog_id or b.get("slug") == blog_id:
+            blogs[idx] = {
+                **b,
+                "title":          revised.get("title", b["title"]),
+                "slug":           revised.get("slug", b.get("slug", "")),
+                "content":        revised.get("content", b.get("content", "")),
+                "summary":        revised.get("summary", b.get("summary", "")),
+                "metaDescription": revised.get("meta_description", b.get("metaDescription", "")),
+                "references":     revised.get("references", b.get("references", [])),
+                "seoScore":       result["new_seo_score"],
+                "seoGrade":       result["new_seo_grade"],
+                "published": (
+                    result["publish_recommendation"] == "publish"
+                    and bool(b.get("coverImage") and "placehold.co" not in b.get("coverImage", ""))
+                ),
+                "revised_at":     datetime.utcnow().isoformat(),
+                "revision_log":   result["revision_notes"],
+            }
+            write_json_file(BLOGS_FILE, blogs)
+            break
+
+    return {
+        "status":                 "success",
+        "blog_id":                blog_id,
+        "initial_seo_score":      initial_audit["score"],
+        "initial_seo_grade":      initial_audit["grade"],
+        "new_seo_score":          result["new_seo_score"],
+        "new_seo_grade":          result["new_seo_grade"],
+        "score_progression":      result["score_progression"],
+        "publish_recommendation": result["publish_recommendation"],
+        "verdict":                result["verdict"],
+        "revision_notes":         result["revision_notes"],
+        "remaining_issues":       result["remaining_issues"],
+        "hard_fail_reasons":      result["hard_fail_reasons"],
+    }
 
 
 @app.on_event("startup")
