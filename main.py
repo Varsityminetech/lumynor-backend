@@ -1261,9 +1261,11 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
         "pexels_key": req.pexels_key or settings.get("pexels_key", ""),
     }
 
-    gemini_key = req.gemini_api_key or settings.get("llmApiKey") or os.getenv("GEMINI_API_KEY")
-    if not gemini_key:
-        raise HTTPException(status_code=400, detail="Gemini API key is required. Set it in Settings or provide in request.")
+    gemini_key = (req.gemini_api_key or settings.get("llmApiKey") or
+                  os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "")
+    ollama_key = os.getenv("OLLAMA_API_KEY", "")
+    if not gemini_key and not ollama_key:
+        raise HTTPException(status_code=400, detail="No LLM key configured. Set GEMINI_API_KEY or OLLAMA_API_KEY in Railway environment.")
 
     try:
         loop = asyncio.get_event_loop()
@@ -1308,12 +1310,15 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
 @app.get("/api/trending-topics")
 async def get_trending_topics(niche: str = "Technology", keywords: str = ""):
     """Get trending topic suggestions for a niche without generating a full blog."""
-    gemini_key = os.getenv("GEMINI_API_KEY")
-    if not gemini_key:
-        raise HTTPException(status_code=400, detail="GEMINI_API_KEY not set")
+    from auto_blogger import _build_llm_cfg
+    gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
+    settings = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
+    llm_cfg = _build_llm_cfg(settings, gemini_key)
+    if llm_cfg.get("provider") not in ("ollama_cloud", "ollama") and not gemini_key:
+        raise HTTPException(status_code=400, detail="No LLM key configured. Set GEMINI_API_KEY or OLLAMA_API_KEY in Railway env.")
     try:
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, research_trending_topics, niche, keywords, gemini_key)
+        result = await loop.run_in_executor(None, research_trending_topics, niche, keywords, llm_cfg)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
