@@ -1387,7 +1387,7 @@ async def generate_and_post_auto_blog_v2(settings: dict):
         )
 
         # SEO publish gate: only auto-publish posts that clear a minimum score.
-        min_score = int(os.getenv("BLOG_MIN_PUBLISH_SCORE", "60"))
+        min_score = int(os.getenv("BLOG_MIN_PUBLISH_SCORE", "90"))
         score = blog_object.get("seoScore") or 0
         seo_ok = score >= min_score
 

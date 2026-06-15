@@ -1996,7 +1996,7 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
     # Quality rewrite: if SEO is still weak after refinement, rewrite the full article
     # body once — passing the specific issues back into the LLM so it can address them.
     # Images are already sourced above and are reused in _finalize_draft.
-    _min_quality = int(os.getenv("BLOG_MIN_QUALITY_SCORE", "80"))
+    _min_quality = int(os.getenv("BLOG_MIN_QUALITY_SCORE", "90"))
     if seo_report.get("hard_fail_reasons"):
         log.append(f"🚫 Hard Fail: {' | '.join(seo_report['hard_fail_reasons'])}")
     if seo_report["score"] < _min_quality and seo_report.get("issues"):
