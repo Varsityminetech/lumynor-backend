@@ -1176,7 +1176,25 @@ async def auto_blogger_daemon():
 
 # ── ENHANCED AUTO-BLOG PIPELINE ENDPOINTS ──────────────────────────────────────
 
-from auto_blogger import run_auto_blog_pipeline, research_trending_topics
+from auto_blogger import run_auto_blog_pipeline, research_trending_topics, _tavily_search
+
+@app.get("/api/system/test-tavily")
+async def test_tavily(key: str = ""):
+    """Test whether a Tavily API key works. Pass ?key=tvly-xxx or leave blank to check env."""
+    import os as _os
+    resolved_key = key or _os.getenv("TAVILY_API_KEY", "")
+    if not resolved_key:
+        return {"status": "no_key", "message": "No TAVILY_API_KEY found in env or request param"}
+    results = _tavily_search("latest AI news today", resolved_key, num=2, depth="basic")
+    if results:
+        return {
+            "status": "ok",
+            "key_source": "param" if key else "env",
+            "results_count": len(results),
+            "sample_title": results[0].get("title", ""),
+            "sample_url": results[0].get("url", ""),
+        }
+    return {"status": "failed", "message": "Tavily returned empty results — check key validity"}
 
 class AutoBlogRunRequest(BaseModel):
     niche: str = ""
