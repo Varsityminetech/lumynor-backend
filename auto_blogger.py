@@ -1310,84 +1310,433 @@ def generate_blog_images(
 # ── STAGE 6: SEO VALIDATION ────────────────────────────────────────────────────
 
 def validate_seo(blog: dict) -> dict:
-    """Score the blog with the SAME rubric as the on-page SEO checker in the
-    admin (Settings.jsx getSeoReport), so the stored score matches what the user
-    sees. Starts at 100 and deducts per failed check (exact-phrase keyword,
-    strict title/summary lengths, FAQ/References headings in the HTML)."""
-    title = blog.get("title", "") or ""
-    summary = blog.get("summary", "") or blog.get("meta_description", "") or ""
-    content = blog.get("content_html", "") or ""
-    primary = (blog.get("primary_keyword", "") or "").strip()
+    """
+    100-point SEO audit across 10 weighted categories (matches the guide checklist).
+
+    Category weights:
+      Topic & Intent        10   Research Quality      15   Keyword Usage     10
+      Title/Meta/Slug       10   Content Structure     10   Helpful Content   15
+      Human-Like Writing    10   Internal/Ext Links    10   FAQ/Schema/Image   5
+      Readability            5
+    """
+    title   = (blog.get("title")          or "").strip()
+    summary = (blog.get("meta_description") or blog.get("summary") or "").strip()
+    content = (blog.get("content_html")    or "").strip()
+    primary = (blog.get("primary_keyword") or "").strip()
+    cover   = (blog.get("coverImage")      or blog.get("cover_image") or "").strip()
+    references = blog.get("references") or []
+    research_brief = blog.get("research_brief") or {}
 
     sec_raw = blog.get("secondary_keywords", "")
-    if isinstance(sec_raw, str):
-        secondary = [k.strip() for k in sec_raw.split(",") if k.strip()]
-    else:
-        secondary = [str(k).strip() for k in (sec_raw or []) if str(k).strip()]
+    secondary = ([k.strip() for k in sec_raw.split(",") if k.strip()]
+                 if isinstance(sec_raw, str)
+                 else [str(k).strip() for k in (sec_raw or []) if str(k).strip()])
 
-    clean = re.sub(r'<[^>]*>', ' ', content)
-    clean = re.sub(r'\s+', ' ', clean).strip()
-    words = [w for w in clean.split(' ') if w]
+    clean = re.sub(r'\s+', ' ', re.sub(r'<[^>]*>', ' ', content)).strip()
+    words = clean.split()
     word_count = len(words)
+    clean_lower = clean.lower()
 
     if not primary:
-        return {"score": 0, "grade": "F", "word_count": word_count,
-                "issues": ["No primary keyword set"], "fixes": []}
+        return {"score": 0, "grade": "F", "status": "Hard Fail — No primary keyword",
+                "word_count": word_count, "issues": ["No primary keyword set"],
+                "passed": [], "fixes": [], "hard_fail_reasons": ["No primary keyword set"],
+                "category_scores": {}}
 
-    score = 100
-    issues = []
     p = primary.lower()
 
-    def deduct(pts, msg):
-        nonlocal score
-        score -= pts
-        issues.append(f"-{pts}: {msg}")
+    # Per-category point buckets (start at max, deduct inside each)
+    cat = {
+        "topic_intent":     10,
+        "research_quality": 15,
+        "keyword_usage":    10,
+        "title_meta":       10,
+        "structure":        10,
+        "helpful_content":  15,
+        "human_writing":    10,
+        "links":            10,
+        "faq_schema_image":  5,
+        "readability":       5,
+    }
+    issues, passed, fixes, hard_fails = [], [], [], []
 
-    if p not in title.lower():
-        deduct(15, "primary keyword missing from title")
-    if not (30 <= len(title) <= 60):
-        deduct(10, f"title length {len(title)} (need 30-60)")
-    if p not in summary.lower():
-        deduct(10, "primary keyword missing from summary")
-    if not (120 <= len(summary) <= 160):
-        deduct(10, f"summary length {len(summary)} (need 120-160)")
-    if word_count < 600:
-        deduct(10, f"word count {word_count} (<600)")
+    def lose(category, pts, issue, fix=""):
+        cat[category] = max(0, cat[category] - pts)
+        issues.append(issue)
+        if fix:
+            fixes.append(fix)
 
-    occ = len(re.findall(re.escape(primary), content, re.I))
+    def ok(msg):
+        passed.append(msg)
+
+    # ── 1. Topic & Intent (10 pts) ────────────────────────────────────────────
+    NICHE_KW = {"ai", "saas", "automation", "startup", "agent", "llm", "software",
+                "business", "digital", "tech", "product", "developer", "model"}
+    title_lower = title.lower()
+    if NICHE_KW & (set(title_lower.split()) | set(p.split())):
+        ok("Topic relevant to Lumynor's niche (AI / SaaS / automation)")
+    else:
+        lose("topic_intent", 4,
+             "Topic may not connect to Lumynor's audience (AI/SaaS/startups/digital products)",
+             "Ensure topic covers AI, SaaS, automation, business, or digital product themes")
+
+    if word_count >= 1200:
+        ok(f"Word count {word_count} — sufficient for a complete answer")
+    else:
+        lose("topic_intent", 4,
+             f"Word count {word_count} is too low for a complete, helpful article (target 1200+)",
+             "Expand article to at least 1200 words to properly cover the topic")
+
+    if research_brief:
+        ok("Research brief present — unique Lumynor angle baked in")
+    else:
+        lose("topic_intent", 2, "No research brief found — unique angle may be missing")
+
+    # ── 2. Research Quality (15 pts) ─────────────────────────────────────────
+    ext_links = re.findall(r'href=["\']https?://[^"\']+["\']', content, re.I)
+    TRUSTED = ("openai.com", "anthropic.com", "google.com", "microsoft.com", "meta.com",
+               "techcrunch.com", "venturebeat.com", "theverge.com", "wired.com",
+               "technologyreview.mit.edu", "arxiv.org", "reuters.com", "bloomberg.com",
+               "forbes.com", "mit.edu", "stanford.edu", "deepmind.google", "nvidia.com",
+               "huggingface.co", "the-decoder.com", "arstechnica.com")
+    trusted_ext = [l for l in ext_links if any(d in l for d in TRUSTED)]
+    src_count = len(references) if references else len(ext_links)
+
+    if src_count >= 3:
+        ok(f"Source count: {src_count} references/links")
+    elif src_count >= 1:
+        lose("research_quality", 5,
+             f"Only {src_count} source(s) — minimum 3 required",
+             "Add at least 3 reliable external sources (official announcements, trusted publications)")
+    else:
+        lose("research_quality", 10,
+             "No sources found — all claims are unsupported",
+             "Add references from official sources and trusted tech publications")
+        hard_fails.append("Sources missing")
+
+    if trusted_ext:
+        ok(f"Trusted external source(s) linked: {len(trusted_ext)}")
+    else:
+        lose("research_quality", 5,
+             "No links to trusted/primary sources (official sites, major publications)",
+             "Add at least 1 link to an official or reputed source (e.g. OpenAI blog, TechCrunch)")
+
+    # Unsupported stats heuristic: numbers with % or $ but no external sources
+    stat_hits = re.findall(r'\b\d+(?:\.\d+)?%|\$[\d\.]+[BMKbmk]?\b', clean)
+    if stat_hits and not ext_links:
+        lose("research_quality", 5,
+             f"{len(stat_hits)} statistic(s) used but no external sources linked — potential unsupported claims",
+             "Back all statistics with a linked source or remove them")
+    else:
+        ok("Statistics appear source-backed")
+
+    # ── 3. Keyword Usage (10 pts) ─────────────────────────────────────────────
+    occ = len(re.findall(re.escape(p), content, re.I))
     density = (occ * 100 / word_count) if word_count else 0
-    if not (0.6 <= density <= 2.2):
-        deduct(15, f"keyword density {density:.1f}% ({occ}x, need 0.6-2.2%)")
 
-    intro = ' '.join(words[:200]).lower()
-    if p not in intro:
-        deduct(10, "primary keyword not in first paragraph")
+    if p in title_lower:
+        ok("Primary keyword in title")
+    else:
+        lose("keyword_usage", 3,
+             "Primary keyword missing from title",
+             f"Add '{primary}' to the title naturally")
+
+    intro_text = " ".join(words[:150]).lower()
+    if p in intro_text:
+        ok("Primary keyword in intro (first 150 words)")
+    else:
+        lose("keyword_usage", 3,
+             "Primary keyword not in first 150 words",
+             f"Mention '{primary}' naturally within the opening paragraph")
+
+    h_texts = " ".join(re.sub(r'<[^>]+>', '', h)
+                       for h in re.findall(r'<h[23][^>]*>.*?</h[23]>', content, re.I | re.S)).lower()
+    if p in h_texts:
+        ok("Primary keyword in at least one H2/H3 heading")
+    else:
+        lose("keyword_usage", 2,
+             "Primary keyword not found in any H2/H3 heading",
+             "Include the primary keyword in at least one section heading")
+
+    if 0.5 <= density <= 2.5:
+        ok(f"Keyword density {density:.1f}% — natural ({occ}x)")
+    elif density > 2.5:
+        lose("keyword_usage", 2,
+             f"Keyword density {density:.1f}% ({occ}x) — possible keyword stuffing",
+             "Reduce repetition; use synonyms and related terms instead")
+        hard_fails.append("Keyword stuffing detected")
+    else:
+        lose("keyword_usage", 2,
+             f"Keyword density {density:.1f}% ({occ}x) — keyword underused",
+             "Increase natural usage of the primary keyword throughout the article")
+
+    # ── 4. Title / Meta / Slug (10 pts) ──────────────────────────────────────
+    tlen = len(title)
+    if 45 <= tlen <= 65:
+        ok(f"Title length {tlen} chars — good")
+    elif 30 <= tlen < 45:
+        lose("title_meta", 2,
+             f"Title length {tlen} — slightly short (target 50-60 chars)",
+             "Expand the title to be more descriptive (50-60 characters)")
+    elif tlen > 65:
+        lose("title_meta", 3,
+             f"Title length {tlen} — too long, will be truncated in search results (target 50-60)",
+             "Shorten title to under 60 characters")
+    else:
+        lose("title_meta", 5, "Title too short or missing", "Write a descriptive 50-60 character title")
+
+    mlen = len(summary)
+    if 130 <= mlen <= 162:
+        ok(f"Meta description length {mlen} chars — good")
+    else:
+        lose("title_meta", 3,
+             f"Meta description length {mlen} (target 140-160 chars)",
+             "Write a meta description of exactly 140-160 characters with a call-to-action")
+
+    if p in summary.lower():
+        ok("Primary keyword in meta description")
+    else:
+        lose("title_meta", 2,
+             "Primary keyword missing from meta description",
+             f"Add '{primary}' to the meta description")
+
+    # No clickbait heuristic: title matches topic
+    CLICKBAIT = ["will change everything", "you won't believe", "shocking", "secret revealed",
+                 "this one trick", "the truth about", "forever changed"]
+    if any(c in title_lower for c in CLICKBAIT):
+        lose("title_meta", 2,
+             "Title appears clickbait — may not match actual content",
+             "Rewrite title to accurately reflect the article's content")
+    else:
+        ok("Title appears accurate and non-clickbait")
+
+    # ── 5. Content Structure (10 pts) ─────────────────────────────────────────
+    h1s = re.findall(r'<h1[^>]*>.*?</h1>', content, re.I | re.S)
+    h2s = re.findall(r'<h2[^>]*>.*?</h2>', content, re.I | re.S)
+    h3s = re.findall(r'<h3[^>]*>.*?</h3>', content, re.I | re.S)
+
+    if len(h1s) <= 1:
+        ok(f"H1 count: {len(h1s)} — correct (title is the H1)")
+    else:
+        lose("structure", 2,
+             f"Multiple H1 tags ({len(h1s)}) — only one H1 allowed per page",
+             "Remove extra H1 tags; the blog post title serves as the H1")
+
+    if len(h2s) >= 5:
+        ok(f"H2 structure: {len(h2s)} sections — strong logical flow")
+    elif len(h2s) >= 3:
+        ok(f"H2 structure: {len(h2s)} sections")
+    elif len(h2s) >= 2:
+        lose("structure", 2,
+             f"Only {len(h2s)} H2 sections — needs more structure",
+             "Add H2 headings for: What/Why/Business Impact/Use Cases/Risks/Conclusion")
+    else:
+        lose("structure", 4,
+             f"Only {len(h2s)} H2 section(s) — article lacks structure",
+             "Structure with at least 5 H2 sections following the recommended outline")
+
+    if h3s:
+        ok(f"H3 sub-sections present: {len(h3s)}")
+    else:
+        lose("structure", 2,
+             "No H3 sub-sections — missing depth in structure",
+             "Add H3 sub-headings under major H2 sections for detail")
+
+    if re.search(r'<h[23][^>]*>[^<]*(conclusion|summary|takeaway|key points|what this means|wrap)',
+                 content, re.I):
+        ok("Conclusion / key takeaways section present")
+    else:
+        lose("structure", 2,
+             "No conclusion or key takeaways section found",
+             "Add a 'Conclusion' or 'Key Takeaways' H2 section at the end")
+
+    # ── 6. Helpful Content (15 pts) ───────────────────────────────────────────
+    BANNED = [
+        "in today's fast-paced", "in today's fast paced", "game-changer", "game changer",
+        "revolutionize", "unlock the power", "seamlessly", "cutting-edge technology",
+        "leveraging ai", "leverage ai", "leveraging the power", "delve into", "delve in",
+        "at the end of the day", "it's worth noting", "it is worth noting",
+        "as an ai language model", "as an ai,", "this groundbreaking", "this revolutionary",
+        "the future is here", "the landscape is evolving", "the world is changing",
+        "in conclusion,", "in summary,", "needless to say",
+    ]
+    found_banned = [b for b in BANNED if b in clean_lower]
+    if not found_banned:
+        ok("No banned/generic phrases detected")
+    elif len(found_banned) <= 2:
+        lose("helpful_content", 5,
+             f"Banned phrases found: {found_banned}",
+             f"Remove or rewrite these generic phrases: {', '.join(found_banned)}")
+    else:
+        lose("helpful_content", 10,
+             f"Multiple banned phrases ({len(found_banned)}): {found_banned[:5]}",
+             "Rewrite sections with specific, concrete language — avoid marketing fluff")
+        hard_fails.append("Article contains multiple banned generic phrases")
+
+    if word_count >= 1500:
+        ok(f"Content comprehensive — {word_count} words")
+    elif word_count >= 1000:
+        lose("helpful_content", 3,
+             f"Article at {word_count} words — target 1500+ for comprehensive long-form",
+             "Expand each section with detail, examples, and business context")
+    else:
+        lose("helpful_content", 8,
+             f"Article at {word_count} words — far too short for long-form SEO value",
+             "Rewrite with full sections: intro/what/why/impact/use cases/risks/FAQ/conclusion")
+        hard_fails.append("Article too short")
+
+    example_count = len(re.findall(
+        r'\b(for example|for instance|such as|consider |case study|in practice|'
+        r'real-world|imagine |like when|take [\w]+ as)',
+        clean_lower))
+    if example_count >= 3:
+        ok(f"Practical examples present ({example_count} instances)")
+    elif example_count >= 1:
+        lose("helpful_content", 3,
+             f"Only {example_count} example(s) — needs 3+ concrete examples",
+             "Add real-world business examples and use cases in each major section")
+    else:
+        lose("helpful_content", 5,
+             "No practical examples found — article is too abstract",
+             "Add specific business examples, product names, or use-case scenarios")
+        hard_fails.append("No original analysis or practical examples")
+
+    # ── 7. Human-Like Writing (10 pts) ────────────────────────────────────────
+    ROBOTIC = ["furthermore,", "moreover,", "additionally,", "nevertheless,",
+               "consequently,", "notwithstanding,", "it is important to note",
+               "it should be noted", "one must consider", "it is worth mentioning",
+               "on the other hand,", "in other words,"]
+    robotic_hits = sum(1 for t in ROBOTIC if t in clean_lower)
+    if robotic_hits == 0:
+        ok("No robotic transitions detected")
+    elif robotic_hits <= 2:
+        lose("human_writing", 3,
+             f"Robotic transitions detected ({robotic_hits}x) — reads like a template",
+             "Replace 'Furthermore/Moreover/Additionally' with natural connectors or new sentences")
+    else:
+        lose("human_writing", 6,
+             f"Heavy use of robotic transitions ({robotic_hits}x) — clearly AI-generated tone",
+             "Rewrite transitions; use short punchy sentences instead of academic connectors")
+
+    GENERIC_OPENER = ["in today", "the world of", "in the ever-", "in recent years,",
+                      "with the rise of", "technology is changing", "we live in a world",
+                      "artificial intelligence is transform", "the rapid advancement",
+                      "in the age of"]
+    intro_lower = " ".join(words[:200]).lower()
+    generic_hits = [g for g in GENERIC_OPENER if g in intro_lower]
+    if not generic_hits:
+        ok("Intro starts with a specific insight or event — not generic")
+    else:
+        lose("human_writing", 4,
+             f"Generic intro opener detected: '{generic_hits[0]}'",
+             "Rewrite intro to start with a specific fact, event, question, or contrarian insight")
+
+    # ── 8. Internal & External Links (10 pts) ────────────────────────────────
+    int_links = re.findall(
+        r'href=["\'](?:https?://(?:www\.)?lumynor\.com|/)[^"\']*["\']', content, re.I)
+    if len(int_links) >= 3:
+        ok(f"Internal links: {len(int_links)} — good")
+    elif len(int_links) >= 1:
+        lose("links", 5,
+             f"Only {len(int_links)} internal link(s) — target 3-5",
+             "Add links to relevant Lumynor pages (services, products, related blog posts)")
+    else:
+        lose("links", 7,
+             "No internal links — missing key on-page SEO and engagement signal",
+             "Add 3-5 internal links to Lumynor service/product pages and related blog posts")
+
+    bad_anchors = re.findall(r'<a\s[^>]*>\s*(?:click here|read more|here|this link)\s*</a>',
+                             content, re.I)
+    if bad_anchors:
+        lose("links", 3,
+             f"Bad anchor text: '{bad_anchors[0]}' — use descriptive text",
+             "Replace generic anchors ('click here', 'here') with descriptive link text")
+    elif ext_links:
+        ok(f"External links: {len(ext_links)} with descriptive anchors")
+
+    # ── 9. FAQ / Schema / Image SEO (5 pts) ──────────────────────────────────
+    if re.search(r'<h[23][^>]*>[^<]*(FAQ|Frequently Asked|Common Questions)', content, re.I):
+        ok("FAQ section present — eligible for rich results")
+    else:
+        lose("faq_schema_image", 2,
+             "No FAQ section — missing schema opportunity and search snippet eligibility",
+             "Add a 'Frequently Asked Questions' H2 with 4-6 relevant questions and concise answers")
+
+    if re.search(r'<h[23][^>]*>[^<]*(References|Sources|Citations)', content, re.I):
+        ok("References / Sources section present")
+    else:
+        lose("faq_schema_image", 1,
+             "No References section",
+             "Add a 'References & Sources' H2 section at the bottom of the article")
+
+    has_real_image = bool(cover and "placehold.co" not in cover)
+    if has_real_image:
+        ok("Cover image present")
+        imgs_no_alt = [img for img in re.findall(r'<img[^>]+>', content, re.I)
+                       if not re.search(r'alt=["\'][^"\']{10,}["\']', img, re.I)]
+        if not imgs_no_alt:
+            ok("Image alt text is descriptive")
+        else:
+            lose("faq_schema_image", 1,
+                 f"{len(imgs_no_alt)} image(s) missing descriptive alt text",
+                 "Add descriptive alt text (10+ chars) to all images — describe what the image shows")
+    else:
+        lose("faq_schema_image", 2,
+             "No cover image — missing visual SEO signal",
+             "Add a relevant cover image from Pexels/Unsplash")
+
+    # ── 10. Readability (5 pts) ───────────────────────────────────────────────
+    paras = re.findall(r'<p[^>]*>(.*?)</p>', content, re.I | re.S)
+    if paras:
+        para_lens = [len(re.sub(r'<[^>]+>', '', p).split()) for p in paras]
+        long_paras = [l for l in para_lens if l > 100]
+        if not long_paras:
+            ok(f"Paragraph length good (avg {sum(para_lens)//len(para_lens)} words)")
+        else:
+            lose("readability", 2,
+                 f"{len(long_paras)} paragraph(s) over 100 words — hurts readability",
+                 "Break long paragraphs into 2-4 sentence chunks")
 
     if secondary:
-        found = [s for s in secondary if s.lower() in content.lower()]
-        if not found:
-            deduct(15, "no secondary keywords present")
-        elif len(found) < len(secondary):
-            deduct(5 * (len(secondary) - len(found)), f"secondary keywords {len(found)}/{len(secondary)}")
+        found_sec = [s for s in secondary if s.lower() in clean_lower]
+        ratio = len(found_sec) / len(secondary)
+        if ratio >= 0.6:
+            ok(f"Secondary keywords: {len(found_sec)}/{len(secondary)} present")
+        else:
+            lose("readability", 3,
+                 f"Secondary keywords sparse: {len(found_sec)}/{len(secondary)} used",
+                 f"Naturally include more of: {', '.join(secondary[:4])}")
+    else:
+        ok("Secondary keywords not set — skipped")
 
-    headings = re.findall(r'<h[23][^>]*>(.*?)</h[23]>', content, re.I | re.S)
-    if not any(p in h.lower() for h in headings):
-        deduct(10, "primary keyword not in any H2/H3 subheading")
+    # ── Hard fail overrides ────────────────────────────────────────────────────
+    total = max(0, min(100, sum(cat.values())))
 
-    if not re.search(r'<h[23][^>]*>[^<]*(FAQ|Frequently Asked Questions)', content, re.I):
-        deduct(10, "no FAQ section heading in content")
-    if not re.search(r'<h[23][^>]*>[^<]*(References|Sources|Citations)', content, re.I):
-        deduct(10, "no References section heading in content")
-    if not re.search(r'<a\s+[^>]*href=["\']https?://', content, re.I):
-        deduct(5, "no external/citation links")
+    if hard_fails:
+        status = "Hard Fail — Do Not Publish"
+    elif total >= 90:
+        status = "Publish"
+    elif total >= 80:
+        status = "Publish after minor edits"
+    elif total >= 70:
+        status = "Needs revision"
+    else:
+        status = "Reject / Regenerate"
 
-    score = max(0, min(100, score))
+    grade = ("A" if total >= 90 else "B" if total >= 80 else
+             "C" if total >= 70 else "D" if total >= 60 else "F")
+
     return {
-        "score": score,
-        "grade": "A" if score >= 90 else "B" if score >= 75 else "C" if score >= 60 else "D",
+        "score": total,
+        "grade": grade,
+        "status": status,
         "word_count": word_count,
+        "category_scores": cat,
+        "passed": passed,
         "issues": issues,
-        "fixes": issues,
+        "fixes": fixes,
+        "recommended_fixes": fixes,
+        "hard_fail_reasons": hard_fails,
     }
 
 
@@ -1395,56 +1744,79 @@ def validate_seo(blog: dict) -> dict:
 
 def refine_blog_seo(blog: dict, seo_report: dict, gemini_key: str) -> dict:
     """
-    Fix the cheap, high-impact SEO issues (title + meta description) WITHOUT
-    rewriting the longform body — protects word count and content quality.
-    Heavier content issues are nudged via lightweight insertion, not full rewrite.
+    Programmatic + lightweight-LLM fixes for the most impactful SEO issues.
+    Does NOT rewrite the longform body — protects word count and content quality.
     """
     primary_kw = blog.get("primary_keyword", "")
     content = blog.get("content_html", "")
+    issues_text = " | ".join(seo_report.get("issues", []))
 
-    # 1) Fix title + meta description via a short, low-risk Gemini call
-    prompt = f"""You are an SEO metadata specialist. Improve ONLY the title and meta description for this blog.
+    # 1) Fix title + meta description via a short LLM call
+    prompt = f"""You are an SEO metadata specialist. Fix ONLY the title and meta description.
 
 PRIMARY KEYWORD: {primary_kw}
 CURRENT TITLE: {blog.get('title', '')}
 CURRENT META DESCRIPTION: {blog.get('meta_description', '')}
-FIRST 300 CHARS OF ARTICLE: {re.sub('<[^>]+>', '', content)[:300]}
+ARTICLE OPENING (first 300 chars): {re.sub('<[^>]+>', '', content)[:300]}
+SEO ISSUES TO FIX: {issues_text[:300]}
 
 RULES:
-- Title: 45-60 characters, MUST start with or contain "{primary_kw}", compelling and click-worthy
-- Meta description: EXACTLY 140-158 characters, MUST contain "{primary_kw}", end with a call-to-action
+- Title: 50-60 characters, must contain "{primary_kw}", specific and click-worthy (no clickbait)
+- Meta: exactly 140-158 characters, must contain "{primary_kw}", end with a call-to-action
+- Title must accurately match article content
 
-Respond ONLY with JSON:
-{{"title": "...", "meta_description": "..."}}"""
+Respond ONLY with JSON: {{"title": "...", "meta_description": "..."}}"""
 
     try:
-        result = _llm(prompt, gemini_key, json_mode=True, timeout=40, max_tokens=1024)
+        result = _llm(prompt, gemini_key, json_mode=True, timeout=40, max_tokens=512)
         fixed = _parse_json_lenient(result)
         kw_words = [w for w in primary_kw.lower().split() if len(w) > 2]
-        new_title = fixed.get("title", "")
-        title_has_kw = primary_kw.lower() in new_title.lower() or (kw_words and all(w in new_title.lower() for w in kw_words))
-        if new_title and title_has_kw and len(new_title) <= 70:
+        new_title = (fixed.get("title") or "").strip()
+        title_has_kw = (primary_kw.lower() in new_title.lower() or
+                        (kw_words and all(w in new_title.lower() for w in kw_words)))
+        if new_title and title_has_kw and 30 <= len(new_title) <= 70:
             blog["title"] = new_title
         if fixed.get("meta_description"):
             md = fixed["meta_description"].strip()
-            # Hard-enforce length cap
             if len(md) > 160:
                 md = md[:157].rstrip() + "..."
             blog["meta_description"] = md
     except Exception as e:
         print(f"[refine_seo] metadata fix error: {e}")
 
-    # 2) Programmatic safety net: trim meta description if still too long
+    # 2) Hard-enforce meta description length
     md = blog.get("meta_description", "")
     if len(md) > 160:
         blog["meta_description"] = md[:157].rstrip() + "..."
 
-    # 3) Ensure primary keyword appears in first paragraph (length-safe)
+    # 3) Ensure primary keyword appears in first paragraph
+    content = blog.get("content_html", "")
     first_chunk = re.sub('<[^>]+>', '', content)[:400].lower()
     if primary_kw and primary_kw.lower() not in first_chunk and "<p>" in content:
-        lead = f'<p><strong>{primary_kw.capitalize()}</strong> is changing the way modern teams build and ship.</p>\n'
+        lead = f'<p><strong>{primary_kw.capitalize()}</strong> is reshaping how modern teams build and ship digital products.</p>\n'
         content = content.replace("<p>", lead + "<p>", 1)
         blog["content_html"] = content
+
+    # 4) Remove stray H1 tags inside content body (title is the page H1)
+    content = blog.get("content_html", "")
+    if len(re.findall(r'<h1[^>]*>', content, re.I)) > 1:
+        content = re.sub(r'<h1([^>]*)>(.*?)</h1>', r'<h2\1>\2</h2>', content, count=10, flags=re.I | re.S)
+        blog["content_html"] = content
+
+    # 5) Inject default internal links if none present
+    content = blog.get("content_html", "")
+    has_internal = re.search(r'href=["\'](?:https?://(?:www\.)?lumynor\.com|/)[^"\']*["\']', content, re.I)
+    if not has_internal and "</p>" in content:
+        internal_block = (
+            '<p>Looking to put these ideas into practice? Explore how '
+            '<a href="/products">Lumynor\'s AI products</a> help startups automate faster, '
+            'or <a href="/contact">talk to our team</a> about building an agentic workflow for your business. '
+            'Read more on our <a href="/blog">AI &amp; SaaS insights blog</a>.</p>'
+        )
+        last_p = content.rfind("</p>")
+        if last_p > 0:
+            content = content[:last_p + 4] + "\n" + internal_block + content[last_p + 4:]
+            blog["content_html"] = content
 
     return blog
 
@@ -1620,15 +1992,16 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
 
     # First finalization pass
     blog_content, seo_report = _finalize_draft(blog_content)
-    log.append(f"📊 SEO Score: {seo_report['score']}/100 (Grade {seo_report['grade']})")
 
     # Quality rewrite: if SEO is still weak after refinement, rewrite the full article
     # body once — passing the specific issues back into the LLM so it can address them.
     # Images are already sourced above and are reused in _finalize_draft.
-    _min_quality = int(os.getenv("BLOG_MIN_QUALITY_SCORE", "75"))
+    _min_quality = int(os.getenv("BLOG_MIN_QUALITY_SCORE", "80"))
+    if seo_report.get("hard_fail_reasons"):
+        log.append(f"🚫 Hard Fail: {' | '.join(seo_report['hard_fail_reasons'])}")
     if seo_report["score"] < _min_quality and seo_report.get("issues"):
-        hints = " | ".join(i.lstrip("-0123456789: ") for i in seo_report["issues"])
-        log.append(f"🔄 Quality below {_min_quality} — rewriting with {len(seo_report['issues'])} SEO fixes targeted...")
+        hints = " | ".join(i for i in seo_report["issues"])
+        log.append(f"🔄 SEO {seo_report['score']}/100 below threshold {_min_quality} — rewriting with {len(seo_report['issues'])} targeted fixes...")
         try:
             _rewrite = write_longform_blog(
                 topic, angle, keywords, research, target_audience, gemini_key,
@@ -1638,13 +2011,36 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
             _rewrite, _seo_rewrite = _finalize_draft(_rewrite)
             if _seo_rewrite["score"] >= seo_report["score"]:
                 blog_content, seo_report = _rewrite, _seo_rewrite
-                log.append(f"✅ Rewrite improved SEO: {seo_report['score']}/100 (Grade {seo_report['grade']})")
             else:
-                log.append(f"⚠️ Rewrite SEO {_seo_rewrite['score']} not better — keeping original {seo_report['score']}")
+                log.append(f"⚠️ Rewrite scored {_seo_rewrite['score']} — keeping original {seo_report['score']}")
         except Exception as e:
             log.append(f"⚠️ Quality rewrite failed ({str(e)[:60]}), keeping original")
-    else:
-        log.append(f"✅ SEO Score: {seo_report['score']}/100 (Grade {seo_report['grade']})")
+
+    # Full audit report (matches the guide's output format)
+    _cat = seo_report.get("category_scores", {})
+    _cat_max = {
+        "topic_intent": 10, "research_quality": 15, "keyword_usage": 10,
+        "title_meta": 10, "structure": 10, "helpful_content": 15,
+        "human_writing": 10, "links": 10, "faq_schema_image": 5, "readability": 5,
+    }
+    _cat_lines = "".join(
+        "  " + k.replace("_", " ").title().ljust(25) + str(v) + "/" + str(_cat_max.get(k, 10)) + "\n"
+        for k, v in _cat.items()
+    )
+    _passed_lines  = "".join("  ✓ " + p + "\n" for p in seo_report.get("passed", []))
+    _issue_lines   = "".join("  ✗ " + i + "\n" for i in seo_report.get("issues", []))
+    _fix_lines     = "".join("  → " + f + "\n" for f in seo_report.get("fixes", []))
+    log.append(
+        "\n═══ SEO AUDIT REPORT ═════════════════════════════════\n"
+        "SEO Score: " + str(seo_report["score"]) + "/100  Grade: " + seo_report["grade"] + "\n"
+        "Status: " + seo_report.get("status", "") + "\n"
+        "Words: " + str(seo_report.get("word_count", 0)) + "\n\n"
+        "Category Breakdown:\n" + _cat_lines +
+        "\nPassed:\n" + _passed_lines +
+        "\nIssues:\n" + _issue_lines +
+        "\nRecommended Fixes:\n" + _fix_lines +
+        "═════════════════════════════════════════════════════"
+    )
 
     # Build final blog object
     now = datetime.utcnow()
