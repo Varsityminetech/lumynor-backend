@@ -1854,20 +1854,23 @@ Respond ONLY with JSON: {{"title": "...", "meta_description": "..."}}"""
 
 # Issue text fragments → revision bucket (ALL matches collected per issue).
 _REVISION_PATTERNS = (
-    ("expand_content",     ("word count", "too short", "far too short", "words — target", "expand")),
-    ("rewrite_intro",      ("generic intro", "opener detected", "generic opening", "cliché",
-                            "intro starts with")),
-    ("fix_title_meta",     ("title length", "title too", "meta description", "clickbait",
-                            "primary keyword missing from title",
-                            "primary keyword missing from meta")),
-    ("add_internal_links", ("internal link",)),
-    ("add_faq",            ("faq", "frequently asked", "schema opportunity")),
-    ("humanize_writing",   ("robotic", "transition", "template", "clearly ai",
-                            "banned phrase", "banned/generic", "generic phrase")),
-    ("fix_keywords",       ("primary keyword not", "keyword not in", "keyword missing from",
-                            "keyword density", "keyword underused")),
-    ("needs_research",     ("source", "no links to trusted", "external sources",
-                            "unsupported claims", "statistics used but no")),
+    ("expand_content",      ("word count", "too short", "far too short", "words — target", "expand")),
+    ("rewrite_intro",       ("generic intro", "opener detected", "generic opening", "cliché",
+                             "intro starts with")),
+    ("fix_title_meta",      ("title length", "title too", "meta description", "clickbait",
+                             "primary keyword missing from title",
+                             "primary keyword missing from meta")),
+    ("add_internal_links",  ("internal link",)),
+    ("add_faq",             ("faq", "frequently asked", "schema opportunity")),
+    ("humanize_writing",    ("robotic", "transition", "template", "clearly ai",
+                             "banned phrase", "banned/generic", "generic phrase")),
+    ("fix_keywords",        ("primary keyword not", "keyword not in", "keyword missing from",
+                             "keyword density", "keyword underused")),
+    ("needs_research",      ("source", "no links to trusted", "external sources",
+                             "unsupported claims", "statistics used but no")),
+    ("add_conclusion",      ("no conclusion", "conclusion", "key takeaways", "takeaway")),
+    ("fix_secondary_kw",    ("secondary keyword", "secondary keywords sparse",
+                             "lsi keyword", "related keyword")),
 )
 
 # Hard fail strings the revision system CAN attempt to resolve.
@@ -2334,6 +2337,73 @@ Return ONLY this JSON:
                     faq_added = True
                     notes.append(f"  ✓ FAQ added ({len(faq_items)} Q&As)")
                     actions_taken.append(f"FAQ added ({len(faq_items)} Q&As)")
+
+        # ── 6b. Conclusion section injection ──────────────────────────────────
+        if buckets.get("add_conclusion"):
+            raw = current.get(_ck, "")
+            if not re.search(r'<h[23][^>]*>[^<]*(conclusion|key takeaway|summary|wrap)', raw, re.I):
+                concl_prompt = (
+                    f'Write a "Key Takeaways" conclusion section for a blog titled '
+                    f'"{current.get("title", "")}" about '
+                    f'"{primary_kw}".\n'
+                    "Include: 3-4 bullet takeaways and a 1-sentence CTA pointing to Lumynor Systems.\n"
+                    "No invented stats. Factual, human tone.\n"
+                    'JSON only: {"conclusion_html": "<h2>Key Takeaways</h2><ul><li>...</li></ul><p>CTA</p>"}'
+                )
+                try:
+                    r = _parse_json_lenient(_llm(concl_prompt, llm_cfg, json_mode=True,
+                                                 timeout=60, max_tokens=1024))
+                    concl_html = (r.get("conclusion_html") or "").strip()
+                    if concl_html and "<h2" in concl_html:
+                        # Insert before FAQ if present, otherwise append
+                        faq_pos = raw.find("<h2>Frequently Asked")
+                        if faq_pos > 0:
+                            current[_ck] = raw[:faq_pos] + concl_html + "\n" + raw[faq_pos:]
+                        else:
+                            current[_ck] = raw.rstrip() + "\n" + concl_html
+                        content_was_changed = True
+                        notes.append("  ✓ Conclusion / Key Takeaways section added")
+                        actions_taken.append("Conclusion section added")
+                except Exception as e:
+                    notes.append(f"  ✗ Conclusion injection failed: {str(e)[:60]}")
+
+        # ── 6c. Secondary keyword injection ───────────────────────────────────
+        if buckets.get("fix_secondary_kw"):
+            sec_raw = current.get("secondary_keywords") or current.get("secondaryKeywords", "")
+            sec_kws = [s.strip() for s in re.split(r"[,;|]", sec_raw) if s.strip()][:3]
+            if sec_kws:
+                html = current.get(_ck, "")
+                # Find H2 headings that don't yet contain any secondary keyword
+                h2_matches = list(re.finditer(r'<h2[^>]*>.*?</h2>', html, re.DOTALL | re.I))
+                inject_targets = [m for m in h2_matches
+                                  if not any(kw.lower() in m.group(0).lower() for kw in sec_kws)][:3]
+                if inject_targets and len(inject_targets) >= len(sec_kws):
+                    kw_prompt = (
+                        "Naturally add one secondary keyword to each H2 heading listed below. "
+                        "Only add if it reads naturally — do NOT force it.\n\n" +
+                        "\n".join(f"H2_{i} + keyword '{kw}':\n{m.group(0)}"
+                                  for i, (m, kw) in enumerate(zip(inject_targets, sec_kws))) +
+                        '\n\nReturn ONLY JSON: {"revisions": '
+                        '[{"original": "exact h2", "revised": "h2 with keyword"}]}'
+                    )
+                    try:
+                        r    = _parse_json_lenient(_llm(kw_prompt, llm_cfg,
+                                                        json_mode=True, timeout=60, max_tokens=1024))
+                        html = current.get(_ck, "")
+                        fixed = 0
+                        for pair in r.get("revisions", []):
+                            orig = (pair.get("original") or "").strip()
+                            repl = (pair.get("revised") or "").strip()
+                            if orig and repl and orig in html and orig != repl:
+                                html   = html.replace(orig, repl, 1)
+                                fixed += 1
+                        if fixed:
+                            current[_ck]        = html
+                            content_was_changed  = True
+                            notes.append(f"  ✓ {fixed} secondary keyword(s) injected into H2s")
+                            actions_taken.append(f"Secondary keywords: {fixed} H2s updated")
+                    except Exception as e:
+                        notes.append(f"  ✗ Secondary keyword injection failed: {str(e)[:60]}")
 
         # ── 7. Title/meta — always after content changes OR when issues found ─
         # Running after a content expansion ensures meta reflects the new angle.
