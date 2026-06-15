@@ -1690,6 +1690,13 @@ def validate_seo(blog: dict) -> dict:
              "No FAQ section — missing schema opportunity and search snippet eligibility",
              "Add a 'Frequently Asked Questions' H2 with 4-6 relevant questions and concise answers")
 
+    if re.search(r'application/ld\+json', content, re.I):
+        ok("Structured data (JSON-LD) present — eligible for rich results")
+    else:
+        lose("faq_schema_image", 1,
+             "No structured data (JSON-LD) found — missing schema.org markup",
+             "Add Article and FAQPage JSON-LD schema for Google rich results eligibility")
+
     if re.search(r'<h[23][^>]*>[^<]*(References|Sources|Citations)', content, re.I):
         ok("References / Sources section present")
     else:
@@ -2057,11 +2064,17 @@ def revise_blog_from_audit(
         if fixable:
             notes.append(f"  ⚠ Fixable hard fail(s) — will attempt: {fixable}")
 
-        # ── 2. Source issues → Tavily + paragraph attribution ─────────────────
+        # ── 2. Source issues → Tavily (with primary-keyword fallback) ────────────
         if buckets.get("needs_research"):
             notes.append("  🔍 Source issue — fetching trusted sources (Tavily, no LLM fabrication)")
             topic    = ((current.get("topicData") or {}).get("topic") or current.get("title", ""))
             new_refs = _fetch_supporting_sources(topic, tavily_key)
+            # Fallback: retry with primary keyword if title query found nothing
+            if not new_refs and tavily_key:
+                kw = primary_kw or current.get("primary_keyword") or current.get("primaryKeyword", "")
+                if kw and kw.lower() not in topic.lower():
+                    notes.append(f"  🔄 Retrying Tavily with primary keyword: '{kw}'")
+                    new_refs = _fetch_supporting_sources(kw, tavily_key)
             existing = current.get("references", [])
             existing_urls = {r.get("url", "") for r in existing}
             added = [r for r in new_refs if r["url"] not in existing_urls]
@@ -2080,35 +2093,41 @@ def revise_blog_from_audit(
                 actions_taken.append(f"Added {len(added)} sources via Tavily")
 
                 # Attribute floating statistics to the newly added sources.
-                # Pattern: numbers/percentages with no inline "According to..." attribution.
+                # Send actual HTML <p> paragraphs (not stripped text) so orig can be
+                # matched and spliced back into raw_html without re-escaping issues.
                 _stat_pats = (r'\b\d+(?:\.\d+)?%', r'\$[\d\.]+[BMKbmk]?\b',
                               r'\b\d+x\b', r'\b\d{1,3}(?:,\d{3})+\b')
-                raw_clean = re.sub(r'<[^>]+>', ' ', current.get(_ck, ""))
-                if any(re.search(p, raw_clean) for p in _stat_pats):
+                raw_html = current.get(_ck, "")
+                stat_paras = [
+                    m.group(0) for m in re.finditer(r'<p[^>]*>.*?</p>', raw_html, re.DOTALL | re.I)
+                    if any(re.search(p, re.sub(r'<[^>]+>', ' ', m.group(0))) for p in _stat_pats)
+                ][:5]
+                if stat_paras:
                     src_ctx = "; ".join(f"{r['title']} ({r['url']})" for r in added[:3])
                     cite_prompt = (
                         "You are editing a blog to improve source attribution.\n\n"
                         f"Newly added trusted sources:\n{src_ctx}\n\n"
-                        f"Blog (first 3000 chars):\n{raw_clean[:3000]}\n\n"
-                        "TASK: Find paragraphs containing floating statistics or specific numbers "
-                        "with no attribution. For each, revise only that paragraph to naturally "
-                        "credit the relevant source — e.g. 'According to [source name],...' or "
-                        "'[Domain] reports that...'. Do NOT invent new facts or change the statistic. "
-                        "Only attribute what is already written.\n\n"
+                        "TASK: For each paragraph below that contains floating statistics with no "
+                        "attribution, revise it to naturally credit the relevant source — e.g. "
+                        "'According to [source name],...' or '[Domain] reports that...'. "
+                        "Do NOT invent new facts. Preserve all HTML tags exactly.\n\n"
+                        "Paragraphs:\n" + "\n---\n".join(stat_paras) + "\n\n"
                         'Return ONLY JSON: {"revised_paragraphs": '
-                        '[{"original": "full original <p> tag", "revised": "revised <p> with credit"}]}'
+                        '[{"original": "exact <p>...</p> as given", "revised": "revised <p>...</p>"}]}'
                     )
                     try:
                         cite_data = _parse_json_lenient(
                             _llm(cite_prompt, llm_cfg, json_mode=True,
-                                 timeout=120, max_tokens=4096)
+                                 timeout=90, max_tokens=2048)
                         )
-                        raw_html = current.get(_ck, "")
-                        changed  = 0
+                        changed = 0
                         for pair in cite_data.get("revised_paragraphs", []):
                             orig = (pair.get("original") or "").strip()
                             repl = (pair.get("revised") or "").strip()
-                            if orig and repl and orig in raw_html:
+                            # Word-count guard: reject if rewrite shrinks paragraph >25%
+                            orig_wc = len(re.sub(r'<[^>]+>', ' ', orig).split())
+                            repl_wc = len(re.sub(r'<[^>]+>', ' ', repl).split())
+                            if orig and repl and orig in raw_html and repl_wc >= orig_wc * 0.75:
                                 raw_html = raw_html.replace(orig, repl, 1)
                                 changed += 1
                         if changed:
@@ -2295,7 +2314,10 @@ Return ONLY this JSON:
                     for pair in r.get("revisions", []):
                         orig = (pair.get("original") or "").strip()
                         repl = (pair.get("revised") or "").strip()
-                        if orig and repl and orig in html:
+                        # Word-count guard: reject if rewrite shrinks paragraph >25%
+                        orig_wc = len(re.sub(r'<[^>]+>', ' ', orig).split())
+                        repl_wc = len(re.sub(r'<[^>]+>', ' ', repl).split())
+                        if orig and repl and orig in html and repl_wc >= orig_wc * 0.75:
                             html   = html.replace(orig, repl, 1)
                             fixed += 1
                     if fixed:
@@ -2617,7 +2639,7 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
 
     # Stage 4: Write blog from brief — quality retry loop, best model only
     log.append("✍️ Writing longform blog from research brief...")
-    _min_words = int(os.getenv("BLOG_MIN_WORD_COUNT", "1200"))
+    _min_words = int(os.getenv("BLOG_MIN_WORD_COUNT", "1800"))
     blog_content = None
     _wc_hint = None
     for _attempt in range(1, 4):
@@ -2712,6 +2734,43 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
         # The full brief is too large for the blog object — pass a lightweight sentinel.
         if research_brief and not draft.get("research_brief"):
             draft["research_brief"] = {"_present": True}
+
+        # Inject schema.org Article + FAQPage JSON-LD for structured data / rich results.
+        ch_ld = draft.get("content_html", "")
+        if "<script type=\"application/ld+json\">" not in ch_ld:
+            title_ld  = (draft.get("title") or "").replace('"', '\\"')
+            desc_ld   = (draft.get("summary") or draft.get("meta_description") or "")[:160].replace('"', '\\"')
+            faq_items_ld = draft.get("faq", []) or []
+            # Also pull FAQ items already embedded in the HTML
+            if not faq_items_ld:
+                faq_items_ld = [
+                    {"question": re.sub(r'<[^>]+>', '', q), "answer": re.sub(r'<[^>]+>', '', a)}
+                    for q, a in re.findall(r'<h3[^>]*>(.*?)</h3>\s*<p[^>]*>(.*?)</p>',
+                                           ch_ld, re.DOTALL | re.I)
+                ]
+            faq_ld_items = "".join(
+                f'{{"@type":"Question","name":"{it.get("question","").replace(chr(34), chr(39))}",'
+                f'"acceptedAnswer":{{"@type":"Answer","text":"{it.get("answer","").replace(chr(34), chr(39))[:300]}"}}}}'
+                + ("," if i < len(faq_items_ld) - 1 else "")
+                for i, it in enumerate(faq_items_ld[:8])
+            )
+            schema_blocks = (
+                f'<script type="application/ld+json">'
+                f'{{"@context":"https://schema.org","@type":"Article",'
+                f'"headline":"{title_ld}","description":"{desc_ld}",'
+                f'"author":{{"@type":"Organization","name":"Lumynor Systems"}},'
+                f'"publisher":{{"@type":"Organization","name":"Lumynor Systems",'
+                f'"url":"https://lumynor.com"}}}}'
+                f'</script>'
+            )
+            if faq_ld_items:
+                schema_blocks += (
+                    f'\n<script type="application/ld+json">'
+                    f'{{"@context":"https://schema.org","@type":"FAQPage",'
+                    f'"mainEntity":[{faq_ld_items}]}}'
+                    f'</script>'
+                )
+            draft["content_html"] = schema_blocks + "\n" + ch_ld
 
         # SEO validate + refine (target 90+)
         seo = validate_seo(draft)
