@@ -29,7 +29,7 @@ def _build_llm_cfg(settings: dict, gemini_key: str) -> dict:
         # Best-quality model chain — all tasks use this, no fast/small model.
         # Override via OLLAMA_WRITING_MODELS env (comma-separated, best first).
         writing_models = [m.strip() for m in (os.getenv("OLLAMA_WRITING_MODELS", "") or "").split(",") if m.strip()] \
-            or ["kimi-k2", "deepseek-v3.1:671b", "glm-4.6", "gpt-oss:120b"]
+            or ["glm-4.7", "nemotron-3-super", "gpt-oss:120b", "devstral-2:123b"]
         return {
             "provider": "ollama_cloud",
             "model": writing_models[0],
@@ -1016,7 +1016,7 @@ OUTPUT — Respond ONLY with this exact JSON:
     if quality_hints:
         prompt += f"\n\nPREVIOUS DRAFT ISSUES — FIX ALL OF THESE IN THIS REWRITE:\n{quality_hints}\n"
 
-    result = _llm(prompt, gemini_key, json_mode=True, timeout=300, max_tokens=32768)
+    result = _llm(prompt, gemini_key, json_mode=True, timeout=280, max_tokens=32768)
     try:
         blog = _parse_json_lenient(result)
         # Inject references into the HTML content
