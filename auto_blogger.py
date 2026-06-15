@@ -1849,10 +1849,10 @@ Respond ONLY with JSON: {{"title": "...", "meta_description": "..."}}"""
 # Targeted revision — the system classifies audit issues into buckets and applies
 # the minimum surgical fix for each bucket. It never blindly rewrites the whole
 # article. Source issues are fixed by Tavily re-research only; the LLM is never
-# asked to fabricate citations. The loop runs at most MAX_REVISION_LOOPS times
-# and exits early once score ≥ 90.
+# asked to fabricate citations. The loop runs at most max_loops times and exits
+# early once score ≥ 90.
 
-# Issue text fragments → revision bucket (first match wins).
+# Issue text fragments → revision bucket (ALL matches collected per issue).
 _REVISION_PATTERNS = (
     ("expand_content",     ("word count", "too short", "far too short", "words — target", "expand")),
     ("rewrite_intro",      ("generic intro", "opener detected", "generic opening", "cliché",
@@ -1870,20 +1870,56 @@ _REVISION_PATTERNS = (
                             "unsupported claims", "statistics used but no")),
 )
 
+# Hard fail strings the revision system CAN attempt to resolve.
+# Anything not matching these → unfixable → reject immediately.
+_FIXABLE_HARD_FAIL_PATTERNS = (
+    "too short", "sources missing", "banned", "generic phrase",
+    "no original analysis", "practical examples", "keyword stuffing",
+)
+
 
 def _classify_audit_issues(seo_report: dict) -> dict:
-    """Map SEO audit issues into targeted revision buckets.
-    First-match wins per issue. Always returns all bucket keys."""
-    issues = seo_report.get("issues", [])
+    """
+    Map SEO audit issues into targeted revision buckets.
+
+    Every issue is matched against ALL patterns. primary_bucket = first match;
+    secondary_buckets = any further matches. Both are logged so mixed-issue cases
+    are visible in the loop diff, even though only the primary drives the action.
+
+    Hard fails are split into:
+      _fixable_hard_fails   — revision will attempt these
+      _unfixable_hard_fails — reject immediately; don't waste loop budget
+
+    Returns a flat dict for backward-compat bucket access (buckets[name]),
+    plus _classified, _fixable_hard_fails, _unfixable_hard_fails keys.
+    """
+    issues    = seo_report.get("issues", [])
     hard_fails = seo_report.get("hard_fail_reasons", [])
-    buckets = {k: [] for k, _ in _REVISION_PATTERNS}
+    buckets   = {k: [] for k, _ in _REVISION_PATTERNS}
     buckets["hard_fail"] = list(hard_fails)
+    classified = []
     for issue in issues:
-        il = issue.lower()
-        for bucket, pats in _REVISION_PATTERNS:
-            if any(p in il for p in pats):
-                buckets[bucket].append(issue)
-                break  # first match only
+        il      = issue.lower()
+        matched = [bk for bk, pats in _REVISION_PATTERNS if any(p in il for p in pats)]
+        primary    = matched[0] if matched else "unclassified"
+        secondary  = matched[1:] if len(matched) > 1 else []
+        confidence = "high" if len(matched) == 1 else ("medium" if matched else "low")
+        if primary != "unclassified":
+            buckets[primary].append(issue)
+        classified.append({
+            "issue":            issue,
+            "primary_bucket":   primary,
+            "secondary_buckets": secondary,
+            "confidence":       confidence,
+        })
+    buckets["_classified"]           = classified
+    buckets["_fixable_hard_fails"]   = [
+        h for h in hard_fails
+        if any(p in h.lower() for p in _FIXABLE_HARD_FAIL_PATTERNS)
+    ]
+    buckets["_unfixable_hard_fails"] = [
+        h for h in hard_fails if h not in buckets["_fixable_hard_fails"]
+    ]
     return buckets
 
 
@@ -1936,62 +1972,88 @@ def revise_blog_from_audit(
     Targeted content revision — classifies issues, applies minimum surgical fix
     per bucket, re-audits, and loops up to max_loops.
 
-    V1 fixes (in order per loop):
-      1. Source issues       → Tavily re-research only (NEVER LLM fabrication)
-      2. expand_content      → LLM prompt: expand short sections
-      3. rewrite_intro       → LLM prompt: rewrite opening <p> only
-      4. humanize_writing    → LLM prompt: strip robotic transitions
-      5. fix_keywords        → folded into LLM content call
-      6. add_internal_links  → programmatic injection (no LLM)
-      7. add_faq             → short LLM call OR from research brief
-      8. fix_title_meta      → refine_blog_seo() if no content call ran
+    Per loop:
+      1. Classify issues (primary + secondary buckets; fixable vs unfixable hard fails)
+      2. Unfixable hard fail → reject immediately, break
+      3. Source issues → Tavily re-research + floating-claim paragraph attribution (LLM)
+      4. Content tasks (expand/intro/humanize/keywords) → single LLM revision call
+      5. Internal links → programmatic injection
+      6. FAQ → from research brief or short LLM call
+      7. Title/meta → runs after ANY content change OR when fix_title_meta issues exist
+      8. Re-audit → build structured loop diff; exit early at 90+
 
     Score thresholds after all loops:
-      ≥ 90          → publish
-      80 – 89       → human review
-      < 80          → manual revision
-      hard fail     → reject
+      ≥ 90       → publish
+      80-89      → human_review
+      < 80       → manual_revision
+      hard fail  → reject
     """
     tavily_key = tavily_key or os.getenv("TAVILY_API_KEY", "")
-    notes = []
-    # Normalise content key: stored blogs use "content", drafts use "content_html"
-    _ck = "content_html" if "content_html" in blog else "content"
-    current = dict(blog)
-    # Sentinel so validate_seo awards the research-brief check every loop
+    notes      = []
+    loop_diffs = []
+    _ck        = "content_html" if "content_html" in blog else "content"
+    current    = dict(blog)
     if research_brief and not current.get("research_brief"):
         current["research_brief"] = {"_present": True}
 
     score_progression = [audit.get("score", 0)]
 
     for loop in range(1, max_loops + 1):
+        score_before        = audit.get("score", 0)
+        content_was_changed = False
+        sources_added_count = 0
+        links_added         = False
+        faq_added           = False
+        actions_taken       = []
+
         notes.append(
             f"\n── Revision Loop {loop}/{max_loops} "
-            f"(score before: {audit.get('score', 0)}/100) ──────────────"
+            f"(score before: {score_before}/100) ──────────────"
         )
-        buckets = _classify_audit_issues(audit)
+        buckets       = _classify_audit_issues(audit)
         content_tasks = []
 
-        # ── 1. Hard-fail triage ───────────────────────────────────────────────
-        hf = buckets.get("hard_fail", [])
-        if hf:
-            # Some hard fails can be addressed by other buckets (short → expand,
-            # banned phrases → humanize). Flag purely-unfixable ones.
-            unfixable = [h for h in hf if not any(x in h.lower() for x in
-                         ("short", "banned", "phrase", "example", "stuffing"))]
-            if unfixable:
-                notes.append(f"  ⚠ Hard fail — needs manual intervention: {unfixable}")
+        # Log multi-bucket issues for visibility
+        for c in buckets.get("_classified", []):
+            if c["secondary_buckets"]:
+                notes.append(
+                    f"  ℹ Multi-bucket: '{c['issue'][:60]}' "
+                    f"→ primary={c['primary_bucket']}, "
+                    f"also={c['secondary_buckets']} [{c['confidence']}]"
+                )
 
-        # ── 2. Source issues → Tavily only, never LLM ────────────────────────
+        # ── 1. Hard-fail triage ───────────────────────────────────────────────
+        unfixable = buckets.get("_unfixable_hard_fails", [])
+        fixable   = buckets.get("_fixable_hard_fails", [])
+        if unfixable:
+            notes.append(f"  ✗ UNFIXABLE hard fail — rejecting immediately: {unfixable}")
+            loop_diffs.append({
+                "loop_number":          loop,
+                "issues_before":        [c["issue"] for c in buckets.get("_classified", [])],
+                "actions_taken":        ["REJECTED — unfixable hard fail"],
+                "sections_changed":     [],
+                "sources_added":        0,
+                "internal_links_added": False,
+                "faq_added":            False,
+                "score_before":         score_before,
+                "score_after":          score_before,
+                "remaining_hard_fails": buckets.get("hard_fail", []),
+            })
+            break
+        if fixable:
+            notes.append(f"  ⚠ Fixable hard fail(s) — will attempt: {fixable}")
+
+        # ── 2. Source issues → Tavily + paragraph attribution ─────────────────
         if buckets.get("needs_research"):
             notes.append("  🔍 Source issue — fetching trusted sources (Tavily, no LLM fabrication)")
-            topic = ((current.get("topicData") or {}).get("topic")
-                     or current.get("title", ""))
+            topic    = ((current.get("topicData") or {}).get("topic") or current.get("title", ""))
             new_refs = _fetch_supporting_sources(topic, tavily_key)
             existing = current.get("references", [])
             existing_urls = {r.get("url", "") for r in existing}
             added = [r for r in new_refs if r["url"] not in existing_urls]
             if added:
                 current["references"] = existing + added
+                sources_added_count   = len(added)
                 raw = current.get(_ck, "")
                 if "References" not in raw:
                     ref_html = "<h2>References &amp; Sources</h2><ol>"
@@ -2000,7 +2062,47 @@ def revise_blog_from_audit(
                                      f' rel="noopener noreferrer">{r["title"]}</a></li>')
                     ref_html += "</ol>"
                     current[_ck] = raw.rstrip() + "\n" + ref_html
-                notes.append(f"  ✓ {len(added)} trusted source(s) added from Tavily")
+                notes.append(f"  ✓ {len(added)} trusted source(s) added")
+                actions_taken.append(f"Added {len(added)} sources via Tavily")
+
+                # Attribute floating statistics to the newly added sources.
+                # Pattern: numbers/percentages with no inline "According to..." attribution.
+                _stat_pats = (r'\b\d+(?:\.\d+)?%', r'\$[\d\.]+[BMKbmk]?\b',
+                              r'\b\d+x\b', r'\b\d{1,3}(?:,\d{3})+\b')
+                raw_clean = re.sub(r'<[^>]+>', ' ', current.get(_ck, ""))
+                if any(re.search(p, raw_clean) for p in _stat_pats):
+                    src_ctx = "; ".join(f"{r['title']} ({r['url']})" for r in added[:3])
+                    cite_prompt = (
+                        "You are editing a blog to improve source attribution.\n\n"
+                        f"Newly added trusted sources:\n{src_ctx}\n\n"
+                        f"Blog (first 3000 chars):\n{raw_clean[:3000]}\n\n"
+                        "TASK: Find paragraphs containing floating statistics or specific numbers "
+                        "with no attribution. For each, revise only that paragraph to naturally "
+                        "credit the relevant source — e.g. 'According to [source name],...' or "
+                        "'[Domain] reports that...'. Do NOT invent new facts or change the statistic. "
+                        "Only attribute what is already written.\n\n"
+                        'Return ONLY JSON: {"revised_paragraphs": '
+                        '[{"original": "full original <p> tag", "revised": "revised <p> with credit"}]}'
+                    )
+                    try:
+                        cite_data = _parse_json_lenient(
+                            _llm(cite_prompt, llm_cfg, json_mode=True,
+                                 timeout=120, max_tokens=4096)
+                        )
+                        raw_html = current.get(_ck, "")
+                        changed  = 0
+                        for pair in cite_data.get("revised_paragraphs", []):
+                            orig = (pair.get("original") or "").strip()
+                            repl = (pair.get("revised") or "").strip()
+                            if orig and repl and orig in raw_html:
+                                raw_html = raw_html.replace(orig, repl, 1)
+                                changed += 1
+                        if changed:
+                            current[_ck] = raw_html
+                            notes.append(f"  ✓ {changed} paragraph(s) attributed to sources")
+                            actions_taken.append(f"Source attribution: {changed} paragraph(s)")
+                    except Exception as e:
+                        notes.append(f"  ⚠ Source attribution call failed: {str(e)[:60]}")
             else:
                 notes.append("  ⚠ No additional trusted sources found — flagged as remaining risk")
 
@@ -2036,29 +2138,25 @@ def revise_blog_from_audit(
 
         # ── 4. Single LLM call for all content tasks ─────────────────────────
         if content_tasks:
-            primary_kw = (current.get("primary_keyword")
-                          or current.get("primaryKeyword", ""))
+            primary_kw  = current.get("primary_keyword") or current.get("primaryKeyword", "")
             raw_content = current.get(_ck, "")
-
             brief_summary = ""
             if research_brief:
-                facts  = research_brief.get("main_facts",
-                         research_brief.get("key_facts", []))[:5]
-                stats  = research_brief.get("key_statistics", [])[:3]
-                avoid  = research_brief.get("claims_to_avoid", [])[:3]
+                facts = research_brief.get("main_facts", research_brief.get("key_facts", []))[:5]
+                stats = research_brief.get("key_statistics", [])[:3]
+                avoid = research_brief.get("claims_to_avoid", [])[:3]
                 brief_summary = (
                     "Verified facts: " + "; ".join(str(f) for f in facts) + "\n"
                     "Key statistics: " + "; ".join(str(s) for s in stats) + "\n"
                     "Do NOT include: " + "; ".join(str(a) for a in avoid)
                 )[:1500]
-
+            _skip = {"hard_fail", "needs_research", "_classified",
+                     "_fixable_hard_fails", "_unfixable_hard_fails"}
             top_issues = " | ".join(
                 v[0] for bk, v in buckets.items()
-                if v and bk not in ("hard_fail", "needs_research") and isinstance(v, list)
+                if v and bk not in _skip and isinstance(v, list) and v
             )[:400]
-
             tasks_block = "\n".join(f"{i+1}. {t}" for i, t in enumerate(content_tasks))
-
             revision_prompt = f"""You are revising an SEO blog for Lumynor Systems.
 
 Do not rewrite the entire article unless required.
@@ -2092,14 +2190,13 @@ Return ONLY this JSON:
   "changes_made": ["specific change 1", "specific change 2"],
   "remaining_risks": ["anything still needing attention"]
 }}"""
-
             try:
                 result = _llm(revision_prompt, llm_cfg, json_mode=True,
                               timeout=280, max_tokens=32768)
                 rev = _parse_json_lenient(result)
-
                 if rev.get("revised_content"):
-                    current[_ck] = rev["revised_content"]
+                    current[_ck]        = rev["revised_content"]
+                    content_was_changed  = True
                 new_title = (rev.get("revised_title") or "").strip()
                 if new_title and (not primary_kw or primary_kw.lower() in new_title.lower()):
                     current["title"] = new_title
@@ -2112,23 +2209,21 @@ Return ONLY this JSON:
                 if new_slug:
                     current["slug"] = re.sub(r'[^a-z0-9]+', '-',
                                              new_slug.lower()).strip('-')[:80]
-                notes.append(
-                    f"  ✓ LLM revision applied "
-                    f"({len(content_tasks)} task(s), {len(rev.get('changes_made', []))} change(s))"
-                )
-                for c in (rev.get("changes_made") or [])[:5]:
+                changes = rev.get("changes_made") or []
+                notes.append(f"  ✓ LLM revision: {len(content_tasks)} task(s), {len(changes)} change(s)")
+                for c in changes[:5]:
                     notes.append(f"    • {c}")
                 for r in (rev.get("remaining_risks") or [])[:3]:
                     notes.append(f"    ⚠ Risk: {r}")
+                actions_taken.extend([f"LLM: {t[:50]}" for t in content_tasks])
             except Exception as e:
                 notes.append(f"  ✗ LLM content revision failed: {str(e)[:100]}")
 
         # ── 5. Programmatic internal link injection ───────────────────────────
         if buckets.get("add_internal_links"):
-            raw = current.get(_ck, "")
+            raw    = current.get(_ck, "")
             has_int = re.search(
-                r'href=["\'](?:https?://(?:www\.)?lumynor\.com|/)[^"\']*["\']',
-                raw, re.I)
+                r'href=["\'](?:https?://(?:www\.)?lumynor\.com|/)[^"\']*["\']', raw, re.I)
             if not has_int and "</p>" in raw:
                 block = (
                     '<p>Looking to put these ideas into practice? Explore how '
@@ -2139,9 +2234,11 @@ Return ONLY this JSON:
                 lp = raw.rfind("</p>")
                 if lp > 0:
                     current[_ck] = raw[:lp + 4] + "\n" + block + raw[lp + 4:]
+            links_added = True
             notes.append("  ✓ Internal links injected")
+            actions_taken.append("Internal links injected")
 
-        # ── 6. FAQ injection (from brief or short LLM call) ───────────────────
+        # ── 6. FAQ injection ──────────────────────────────────────────────────
         if buckets.get("add_faq"):
             raw = current.get(_ck, "")
             if not re.search(r'<h[23][^>]*>[^<]*(FAQ|Frequently Asked)', raw, re.I):
@@ -2151,61 +2248,81 @@ Return ONLY this JSON:
                         f'Generate 4 FAQ questions and concise answers for a blog titled '
                         f'"{current.get("title", "")}" about '
                         f'"{current.get("primary_keyword") or current.get("primaryKeyword", "")}".\n'
-                        'Answers must be 2-3 sentences, factual, no invented statistics.\n'
+                        'Answers: 2-3 sentences, factual, no invented statistics.\n'
                         'JSON only: {"faqs": [{"question":"...","answer":"..."}]}'
                     )
                     try:
-                        faq_raw = _llm(faq_prompt, llm_cfg, json_mode=True,
-                                       timeout=90, max_tokens=1024)
-                        faq_items = _parse_json_lenient(faq_raw).get("faqs", [])
+                        faq_items = _parse_json_lenient(
+                            _llm(faq_prompt, llm_cfg, json_mode=True,
+                                 timeout=90, max_tokens=1024)
+                        ).get("faqs", [])
                     except Exception:
                         faq_items = []
                 if faq_items:
                     faq_html = "<h2>Frequently Asked Questions</h2>"
                     for it in faq_items[:5]:
-                        q = (it.get("question") or "").strip()
-                        a = (it.get("answer") or "").strip()
+                        q, a = (it.get("question") or "").strip(), (it.get("answer") or "").strip()
                         if q and a:
                             faq_html += f"<h3>{q}</h3><p>{a}</p>"
                     current[_ck] = raw.rstrip() + "\n" + faq_html
-                    notes.append(f"  ✓ FAQ section added ({len(faq_items)} Q&As)")
+                    faq_added = True
+                    notes.append(f"  ✓ FAQ added ({len(faq_items)} Q&As)")
+                    actions_taken.append(f"FAQ added ({len(faq_items)} Q&As)")
 
-        # ── 7. Title/meta refinement (standalone, only if no LLM content call) ─
-        if buckets.get("fix_title_meta") and not content_tasks:
+        # ── 7. Title/meta — always after content changes OR when issues found ─
+        # Running after a content expansion ensures meta reflects the new angle.
+        if buckets.get("fix_title_meta") or content_was_changed:
             try:
                 current = refine_blog_seo(current, audit, llm_cfg)
-                notes.append("  ✓ Title/meta refined")
+                notes.append("  ✓ Title/meta refined (post-content pass)")
+                actions_taken.append("Title/meta refined")
             except Exception as e:
                 notes.append(f"  ✗ Title/meta fix failed: {str(e)[:60]}")
 
-        # ── 8. Re-audit ───────────────────────────────────────────────────────
+        # ── 8. Re-audit + structured diff ────────────────────────────────────
         audit_input = {
             "title":              current.get("title", ""),
-            "meta_description":   (current.get("meta_description")
-                                   or current.get("summary", "")),
+            "meta_description":   current.get("meta_description") or current.get("summary", ""),
             "content_html":       current.get(_ck, ""),
-            "primary_keyword":    (current.get("primary_keyword")
-                                   or current.get("primaryKeyword", "")),
-            "secondary_keywords": (current.get("secondary_keywords")
-                                   or current.get("secondaryKeywords", "")),
+            "primary_keyword":    current.get("primary_keyword") or current.get("primaryKeyword", ""),
+            "secondary_keywords": current.get("secondary_keywords") or current.get("secondaryKeywords", ""),
             "coverImage":         current.get("coverImage", ""),
             "references":         current.get("references", []),
             "research_brief":     {"_present": True} if research_brief else {},
         }
-        audit = validate_seo(audit_input)
-        score_progression.append(audit["score"])
+        audit       = validate_seo(audit_input)
+        score_after = audit["score"]
+        score_progression.append(score_after)
+
+        _non_meta_buckets = {"hard_fail", "_classified",
+                             "_fixable_hard_fails", "_unfixable_hard_fails"}
+        loop_diffs.append({
+            "loop_number":          loop,
+            "issues_before":        [c["issue"] for c in buckets.get("_classified", [])],
+            "actions_taken":        actions_taken,
+            "sections_changed":     [
+                bk for bk in buckets
+                if buckets.get(bk) and isinstance(buckets[bk], list)
+                and bk not in _non_meta_buckets
+            ],
+            "sources_added":        sources_added_count,
+            "internal_links_added": links_added,
+            "faq_added":            faq_added,
+            "score_before":         score_before,
+            "score_after":          score_after,
+            "remaining_hard_fails": audit.get("hard_fail_reasons", []),
+        })
         notes.append(
-            f"  📊 Score after loop {loop}: {audit['score']}/100 "
+            f"  📊 Score after loop {loop}: {score_after}/100 "
             f"Grade {audit['grade']} — {audit['status']}"
         )
-        if audit["score"] >= 90 and not audit.get("hard_fail_reasons"):
+        if score_after >= 90 and not audit.get("hard_fail_reasons"):
             notes.append("  ✅ Threshold 90+ reached — stopping early")
             break
 
     # ── Final verdict ─────────────────────────────────────────────────────────
-    final_score = audit.get("score", 0)
+    final_score  = audit.get("score", 0)
     remaining_hf = audit.get("hard_fail_reasons", [])
-
     if remaining_hf:
         recommendation = "reject"
         verdict = (f"Reject — hard fail remains after {max_loops} loop(s): "
@@ -2222,7 +2339,6 @@ Return ONLY this JSON:
 
     notes.append(f"\n📋 FINAL VERDICT: {verdict}")
 
-    # Normalise to storage key
     final_blog = dict(current)
     if _ck == "content_html":
         final_blog["content"] = final_blog.get("content_html", "")
@@ -2230,6 +2346,7 @@ Return ONLY this JSON:
     return {
         "revised_blog":           final_blog,
         "revision_notes":         notes,
+        "loop_diffs":             loop_diffs,
         "score_progression":      score_progression,
         "new_seo_score":          final_score,
         "new_seo_grade":          audit.get("grade", "F"),

@@ -1559,6 +1559,7 @@ async def revise_saved_blog(blog_id: str):
         "new_seo_score":          result["new_seo_score"],
         "new_seo_grade":          result["new_seo_grade"],
         "score_progression":      result["score_progression"],
+        "loop_diffs":             result.get("loop_diffs", []),
         "publish_recommendation": result["publish_recommendation"],
         "verdict":                result["verdict"],
         "revision_notes":         result["revision_notes"],
