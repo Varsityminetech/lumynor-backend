@@ -41,10 +41,10 @@ def _build_llm_cfg(settings: dict, gemini_key: str) -> dict:
             "ollama_key": ollama_key,
             "ollama_host": settings.get("llmBaseUrl") or os.getenv("OLLAMA_HOST") or "https://ollama.com",
         }
-    return {
-        "provider": "gemini",
-        "gemini_key": gemini_key or settings.get("llmApiKey", "") or os.getenv("GEMINI_API_KEY", ""),
-    }
+    # Check both GEMINI_API_KEY and GOOGLE_API_KEY — Railway may set either.
+    _gkey = (gemini_key or settings.get("llmApiKey", "") or
+             os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", ""))
+    return {"provider": "gemini", "gemini_key": _gkey}
 
 
 def _llm(prompt: str, llm_cfg, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192, task: str = "fast") -> str:
@@ -222,7 +222,7 @@ def _search_web(query: str, num: int = 8) -> list:
 
 # ── STAGE 1: TRENDING TOPIC RESEARCH ──────────────────────────────────────────
 
-def research_trending_topics(niche: str, keywords: str, gemini_key: str) -> dict:
+def research_trending_topics(niche: str, keywords: str, gemini_key: str, recent_topics: list = None) -> dict:
     """Find the best trending blog topic for this niche right now."""
 
     # Web search for trending topics
@@ -247,6 +247,11 @@ def research_trending_topics(niche: str, keywords: str, gemini_key: str) -> dict
     # Ask Gemini to pick the best topic
     snippets = "\n".join([f"- [{r['title']}]({r['url']}): {r['snippet'][:200]}" for r in unique[:15]])
 
+    _avoid_block = ""
+    if recent_topics:
+        _avoid_lines = "".join("- " + t + "\n" for t in recent_topics[:15])
+        _avoid_block = "ALREADY PUBLISHED — do NOT repeat or closely overlap these topics:\n" + _avoid_lines
+
     prompt = f"""You are a content strategist for a tech/digital product company.
 Niche: {niche}
 Additional keywords: {keywords}
@@ -260,7 +265,9 @@ Pick the SINGLE best blog topic that:
 2. Has high search demand
 3. Can rank with a well-written article
 4. Is relevant to the niche: {niche}
+5. Is NOT similar to any already-published topic listed below
 
+{_avoid_block}
 Respond ONLY with JSON:
 {{
   "topic": "exact blog topic title",
@@ -1052,7 +1059,7 @@ Respond ONLY with JSON:
 
 # ── MASTER PIPELINE ───────────────────────────────────────────────────────────
 
-def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
+def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list = None) -> dict:
     """
     Full auto-blog pipeline:
     1. Research trending topic
@@ -1085,9 +1092,12 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str) -> dict:
     else:
         log.append("🧠 LLM: gemini (gemini-2.5-flash)")
 
+    # Truncate keywords_hint to avoid 3000-char keyword dumps polluting prompts
+    keywords_hint = (keywords_hint or "")[:300]
+
     # Stage 1: Trending topic
     log.append("🔍 Researching trending topics...")
-    topic_data = research_trending_topics(niche, keywords_hint, gemini_key)
+    topic_data = research_trending_topics(niche, keywords_hint, gemini_key, recent_topics=recent_topics)
     topic = topic_data.get("topic", f"AI Trends in {niche}")
     angle = topic_data.get("angle", "Comprehensive guide")
     target_audience = topic_data.get("target_audience", "professionals")

@@ -1344,20 +1344,28 @@ def update_auto_blog_settings_v2(req: AutoBlogSettingsUpdateRequestV2):
 # ── ENHANCED GENERATE_AND_POST to use the new pipeline ─────────────────────────
 async def generate_and_post_auto_blog_v2(settings: dict):
     """Enhanced auto-blog posting using the full pipeline."""
-    gemini_key = settings.get("llmApiKey") or os.getenv("GEMINI_API_KEY")
-    # The pipeline can run on Ollama Cloud too; only fall back to the legacy
-    # generator if NO provider key is available at all.
+    # Check both GEMINI_API_KEY and GOOGLE_API_KEY — Railway may set either name.
+    gemini_key = (settings.get("llmApiKey") or
+                  os.getenv("GEMINI_API_KEY") or
+                  os.getenv("GOOGLE_API_KEY", ""))
     ollama_key = os.getenv("OLLAMA_API_KEY") or (
         settings.get("llmApiKey") if (settings.get("llmApiName") or "").lower() in ("ollama_cloud", "ollama") else ""
     )
     if not gemini_key and not ollama_key:
-        print("[auto_blogger] No LLM key (Gemini or Ollama) — falling back to legacy generator")
-        await generate_and_post_auto_blog(settings)
+        msg = "Auto-blog skipped: no LLM key found. Set GEMINI_API_KEY on Railway."
+        print(f"[auto_blogger] {msg}")
+        await manager.broadcast({"type": "blog_error", "message": msg})
         return
+
+    # Pass recently published titles so Stage 1 picks a fresh, unique topic.
+    _recent_blogs = read_json_file(BLOGS_FILE, [])
+    _recent_topics = [b["title"] for b in _recent_blogs if b.get("title")][-20:]
 
     try:
         loop = asyncio.get_event_loop()
-        blog_object = await loop.run_in_executor(None, run_auto_blog_pipeline, settings, gemini_key)
+        blog_object = await loop.run_in_executor(
+            None, run_auto_blog_pipeline, settings, gemini_key, _recent_topics
+        )
 
         # SEO publish gate: only auto-publish posts that clear a minimum score.
         min_score = int(os.getenv("BLOG_MIN_PUBLISH_SCORE", "60"))
@@ -1397,8 +1405,12 @@ async def generate_and_post_auto_blog_v2(settings: dict):
         })
         print(f"[auto_blogger] Published: {new_blog['title']} (SEO {new_blog.get('seoScore')}/100)")
     except Exception as e:
-        print(f"[auto_blogger_v2] Error: {e} — falling back to legacy")
-        await generate_and_post_auto_blog(settings)
+        import traceback
+        print(f"[auto_blogger_v2] Pipeline failed: {e}\n{traceback.format_exc()}")
+        await manager.broadcast({
+            "type": "blog_error",
+            "message": f"Auto-blog pipeline failed: {str(e)[:200]}"
+        })
 
 
 @app.on_event("startup")
