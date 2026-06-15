@@ -996,12 +996,13 @@ AUTO_BLOG_SETTINGS_FILE = _seed_data_file("auto_blog_settings.json", {})
 
 class AutoBlogSettingsUpdateRequest(BaseModel):
     enabled: bool = False
-    niche: str = "Latest AI News, Agentic AI, and SaaS Development"
-    keywords: str = "AI agents, agentic AI, SaaS development, AI automation, LLMs, Claude, GPT, Gemini, AI tools for developers, AI startups"
+    niche: str = "Latest AI News & Developments"
+    keywords: str = "AI agents, LLMs, model releases, agentic AI, SaaS tools"
     topics: str = ""
+    blog_format: str = "deep_dive"  # "deep_dive" | "roundup"
     frequency_hours: int = 24
     author: str = "Danish"
-    category: str = "AI"
+    category: str = "AI News"
     auto_publish: bool = True
     tone: str = "Technical Expert"
     # LLM passthrough (optional, uses system env if omitted)
@@ -1017,11 +1018,12 @@ def get_auto_blog_settings():
     # Provide defaults for any missing keys
     defaults = {
         "enabled": False,
-        "niche": "Agentic AI & Software Development",
-        "topics": "AI agents, TypeScript, system architecture, developer tools",
+        "niche": "Latest AI News & Developments",
+        "topics": "AI agents, LLMs, model releases, agentic AI, SaaS tools",
+        "blog_format": "deep_dive",
         "frequency_hours": 24,
         "author": "Danish",
-        "category": "Agentic AI",
+        "category": "AI News",
         "auto_publish": True,
         "tone": "Technical Expert",
         "llmProvider": "local",

@@ -1040,6 +1040,100 @@ OUTPUT — Respond ONLY with this exact JSON:
         raise
 
 
+def write_roundup_blog(niche: str, month_year: str, llm_cfg, tavily_key: str = "") -> dict:
+    """Write a 'Top 10 AI News Headlines with Analysis' roundup post.
+    Pulls real headlines from Tavily/DDG, then asks the LLM to write 200-250 words
+    of practitioner analysis per story. Returns the same dict shape as write_longform_blog."""
+    raw = []
+    if tavily_key:
+        for q in [
+            f"biggest AI news announcements {month_year}",
+            f"new AI model release product launch {month_year}",
+            f"AI research breakthrough startup funding {month_year}",
+            f"{niche} news highlights {month_year}",
+        ]:
+            for r in _tavily_search(q, tavily_key, num=5, depth="basic", days=7):
+                if r.get("title") and r.get("url"):
+                    raw.append(r)
+    else:
+        for q in [f"top AI news {month_year}", f"latest AI model release {month_year}",
+                  f"{niche} breakthroughs this week"]:
+            for r in _search_web(q, 5):
+                if r.get("title") and r.get("url"):
+                    raw.append(r)
+
+    seen, unique = set(), []
+    for h in raw:
+        u = h.get("url", "")
+        if u and u not in seen:
+            seen.add(u)
+            unique.append(h)
+    top = unique[:12]
+    if not top:
+        raise RuntimeError("No headlines found — check Tavily key or network access")
+
+    refs = [{"title": h.get("title", ""), "url": h.get("url", "")} for h in top if h.get("url")]
+    refs_json = json.dumps(refs[:10])
+    slug_date = month_year.lower().replace(" ", "-")
+    primary_kw = f"AI news {month_year}"
+
+    headlines_block = ""
+    for i, h in enumerate(top, 1):
+        snippet = (h.get("content") or h.get("snippet") or "")[:300]
+        headlines_block += (
+            f"{i}. TITLE: {h.get('title', '')}\n"
+            f"   URL:   {h.get('url', '')}\n"
+            f"   INFO:  {snippet}\n\n"
+        )
+
+    prompt = f"""You are a senior AI analyst at Lumynor Systems — a digital product studio building agentic AI and SaaS products.
+
+Write a comprehensive "Top 10 AI News Headlines" roundup blog post for {month_year}.
+Cover each story with real technical depth — what happened, technical implications for SaaS and AI product builders, and the Lumynor perspective.
+
+═══ NEWS STORIES TO COVER ══════════════════════════════════════════════════════
+{headlines_block}
+════════════════════════════════════════════════════════════════════════════════
+
+STRUCTURE:
+- Intro paragraph (100-150 words): frame why this batch matters
+- For each story: <h2>N. Story Headline</h2> → 200-250 words of analysis → inline <a href="URL" target="_blank" rel="noopener noreferrer">source</a> → end paragraph with "What this means for builders: [sentence]."
+- <h2>Key Takeaways for AI Builders</h2> → 200-word conclusion with Lumynor angle and a call to action linking to <a href="/contact">talk to the Lumynor team</a>
+- 3-5 FAQ pairs about the news
+
+RULES:
+- 2500-3500 total words — every section needs real analysis not bullet summaries
+- HTML only inside content_html — NO markdown
+- BANNED: "game-changer", "revolutionize", "leverage", "delve", "In today's world", "in conclusion", "it's worth noting"
+- Tone: opinionated, technical, practitioner — not generic journalism
+
+Return ONLY valid JSON (no markdown wrapper):
+{{
+  "title": "Top 10 AI News: {month_year} — What Builders Actually Need to Know",
+  "slug": "top-10-ai-news-{slug_date}",
+  "summary": "A practitioner breakdown of the 10 biggest AI news stories in {month_year} — what they mean for SaaS and agentic product builders.",
+  "meta_description": "Top AI news {month_year}: 10 biggest stories analyzed for SaaS and AI product builders by Lumynor Systems.",
+  "content_html": "<p>intro...</p><h2>1. First Headline</h2><p>analysis...</p>...",
+  "primary_keyword": "{primary_kw}",
+  "secondary_keywords": ["AI headlines {month_year}", "artificial intelligence news this week", "AI model releases {month_year}", "latest AI updates", "agentic AI news"],
+  "tags": ["AI News", "Weekly Roundup", "Machine Learning", "Agentic AI", "SaaS"],
+  "faq": [
+    {{"question": "What were the biggest AI news stories in {month_year}?", "answer": "..."}},
+    {{"question": "How will these AI developments affect SaaS products?", "answer": "..."}},
+    {{"question": "What should developers watch in AI right now?", "answer": "..."}}
+  ],
+  "image_prompts": [
+    {{"placement": "cover", "prompt": "futuristic AI news room with glowing holographic headlines and neural networks", "alt": "Top 10 AI news headlines {month_year}"}},
+    {{"placement": "section_1", "prompt": "abstract AI data streams and connected neural network nodes", "alt": "artificial intelligence developments {month_year}"}}
+  ],
+  "references": {refs_json}
+}}"""
+
+    raw_result = _llm(prompt, llm_cfg, json_mode=True, timeout=280, max_tokens=16384)
+    blog = _parse_json_lenient(raw_result)
+    return blog
+
+
 # ── STAGE 5: IMAGE SOURCING (web search + optional AI gen) ─────────────────────
 
 def _image_query(img: dict) -> str:
@@ -2711,53 +2805,80 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
     if _dup_titles:
         log.append(f"⚠ Near-duplicate: topic shares 3+ keywords with '{_dup_titles[0][:60]}'")
 
-    # Stage 2: SEO keyword research
-    log.append("🔑 Running SEO keyword research...")
-    keywords = do_keyword_research(topic, niche, llm_cfg)
-    log.append(f"🎯 Primary keyword: {keywords.get('primary_keyword')}")
+    blog_format = settings.get("blog_format", "deep_dive")
+    month_year  = datetime.now().strftime("%B %Y")
 
-    # Stage 3a: Deep research — multi-angle dive with Tavily or DDG
-    log.append("🔬 Running deep research on topic...")
-    research = deep_research_topic(topic, cluster_sources, llm_cfg, tavily_key=tavily_key)
-    log.append(
-        f"📊 Deep research: {len(research.get('key_facts', []))} facts, "
-        f"{len(research.get('key_statistics', []))} stats, "
-        f"{len(research.get('references', []))} references"
-    )
-
-    # Stage 3b: Generate research brief — source of truth before writing
-    log.append("📋 Generating research brief...")
-    research_brief = generate_research_brief(topic, angle, keywords, research, niche, llm_cfg)
-    log.append(f"📋 Brief ready: {len(research_brief.get('suggested_outline', []))} sections, "
-               f"{len(research_brief.get('faqs', []))} FAQs")
-
-    # Stage 4: Write blog from brief — quality retry loop, best model only
-    log.append("✍️ Writing longform blog from research brief...")
-    _min_words = int(os.getenv("BLOG_MIN_WORD_COUNT", "1800"))
-    blog_content = None
-    _wc_hint = None
-    for _attempt in range(1, 4):
+    if blog_format == "roundup":
+        # Roundup path: skip stages 2-4; gather real headlines and write a Top-10 post.
+        log.append(f"📰 Format: ROUNDUP — collecting top 10 AI headlines for {month_year}...")
         try:
-            _draft = write_longform_blog(
-                topic, angle, keywords, research, target_audience, llm_cfg,
-                quality_hints=_wc_hint,
-                research_brief=research_brief,
-            )
-            _wc = len(re.sub('<[^>]+>', '', _draft.get("content_html", "")).split())
-            blog_content = _draft
-            if _wc >= _min_words or _attempt == 3:
-                log.append(f"📝 Blog written: {_wc} words" + (f" (attempt {_attempt})" if _attempt > 1 else ""))
-                break
-            log.append(f"⚠️ Attempt {_attempt}: only {_wc} words (min {_min_words}) — rewriting with length hint...")
-            _wc_hint = (f"CRITICAL: Your previous draft was only {_wc} words. "
-                        f"You MUST write at least {_min_words} words. "
-                        "Every H2 section must be 250-350 words. Expand all sections with more detail, "
-                        "examples, statistics, and business context. Do not summarise — elaborate.")
-        except Exception as e:
-            if _attempt == 3:
-                raise
-            log.append(f"⚠️ Write attempt {_attempt} failed ({str(e)[:60]}), retrying...")
-    word_count = len(re.sub('<[^>]+>', '', blog_content.get("content_html", "")).split())
+            blog_content = write_roundup_blog(niche, month_year, gemini_key, tavily_key=tavily_key)
+            _sec = blog_content.get("secondary_keywords", [])
+            keywords = {
+                "primary_keyword": blog_content.get("primary_keyword", f"AI news {month_year}"),
+                "secondary_keywords": _sec if isinstance(_sec, list) else [_sec],
+                "lsi_keywords": [],
+                "people_also_ask": [],
+            }
+            research       = {"references": blog_content.get("references", []),
+                              "key_facts": [], "key_statistics": [], "expert_insights": [], "real_examples": []}
+            research_brief = {"core_angle": f"Top 10 AI headlines roundup for {month_year}",
+                              "lumynor_perspective": "What these AI developments mean for SaaS and agentic product builders",
+                              "suggested_outline": [], "faqs": [], "_present": True}
+            word_count = len(re.sub(r'<[^>]+>', ' ', blog_content.get("content_html", "")).split())
+            log.append(f"📝 Roundup written: {word_count} words")
+        except Exception as _re:
+            log.append(f"⚠️ Roundup failed ({str(_re)[:80]}) — falling back to deep-dive")
+            blog_format = "deep_dive"
+
+    if blog_format != "roundup":
+        # Stage 2: SEO keyword research
+        log.append("🔑 Running SEO keyword research...")
+        keywords = do_keyword_research(topic, niche, llm_cfg)
+        log.append(f"🎯 Primary keyword: {keywords.get('primary_keyword')}")
+
+        # Stage 3a: Deep research — multi-angle dive with Tavily or DDG
+        log.append("🔬 Running deep research on topic...")
+        research = deep_research_topic(topic, cluster_sources, llm_cfg, tavily_key=tavily_key)
+        log.append(
+            f"📊 Deep research: {len(research.get('key_facts', []))} facts, "
+            f"{len(research.get('key_statistics', []))} stats, "
+            f"{len(research.get('references', []))} references"
+        )
+
+        # Stage 3b: Generate research brief — source of truth before writing
+        log.append("📋 Generating research brief...")
+        research_brief = generate_research_brief(topic, angle, keywords, research, niche, llm_cfg)
+        log.append(f"📋 Brief ready: {len(research_brief.get('suggested_outline', []))} sections, "
+                   f"{len(research_brief.get('faqs', []))} FAQs")
+
+        # Stage 4: Write blog from brief — quality retry loop, best model only
+        log.append("✍️ Writing longform blog from research brief...")
+        _min_words = int(os.getenv("BLOG_MIN_WORD_COUNT", "1800"))
+        blog_content = None
+        _wc_hint = None
+        for _attempt in range(1, 4):
+            try:
+                _draft = write_longform_blog(
+                    topic, angle, keywords, research, target_audience, llm_cfg,
+                    quality_hints=_wc_hint,
+                    research_brief=research_brief,
+                )
+                _wc = len(re.sub('<[^>]+>', '', _draft.get("content_html", "")).split())
+                blog_content = _draft
+                if _wc >= _min_words or _attempt == 3:
+                    log.append(f"📝 Blog written: {_wc} words" + (f" (attempt {_attempt})" if _attempt > 1 else ""))
+                    break
+                log.append(f"⚠️ Attempt {_attempt}: only {_wc} words (min {_min_words}) — rewriting with length hint...")
+                _wc_hint = (f"CRITICAL: Your previous draft was only {_wc} words. "
+                            f"You MUST write at least {_min_words} words. "
+                            "Every H2 section must be 250-350 words. Expand all sections with more detail, "
+                            "examples, statistics, and business context. Do not summarise — elaborate.")
+            except Exception as e:
+                if _attempt == 3:
+                    raise
+                log.append(f"⚠️ Write attempt {_attempt} failed ({str(e)[:60]}), retrying...")
+        word_count = len(re.sub('<[^>]+>', '', blog_content.get("content_html", "")).split())
 
     # Stage 5: Source images — done ONCE and reused on any quality rewrite below.
     image_prompts = blog_content.get("image_prompts", [])
@@ -2902,7 +3023,7 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
     _min_quality = int(os.getenv("BLOG_MIN_QUALITY_SCORE", "90"))
     if seo_report.get("hard_fail_reasons"):
         log.append(f"🚫 Hard Fail: {' | '.join(seo_report['hard_fail_reasons'])}")
-    if seo_report["score"] < _min_quality and seo_report.get("issues"):
+    if blog_format != "roundup" and seo_report["score"] < _min_quality and seo_report.get("issues"):
         hints = " | ".join(i for i in seo_report["issues"])
         log.append(f"🔄 SEO {seo_report['score']}/100 below threshold {_min_quality} — rewriting with {len(seo_report['issues'])} targeted fixes...")
         try:
