@@ -29,7 +29,7 @@ def _build_llm_cfg(settings: dict, gemini_key: str) -> dict:
         # Best-quality model chain — all tasks use this, no fast/small model.
         # Override via OLLAMA_WRITING_MODELS env (comma-separated, best first).
         writing_models = [m.strip() for m in (os.getenv("OLLAMA_WRITING_MODELS", "") or "").split(",") if m.strip()] \
-            or ["glm-4.7", "nemotron-3-super", "gpt-oss:120b", "devstral-2:123b"]
+            or ["cogito-2.1:671b", "qwen3-coder:480b", "nemotron-3-super", "gpt-oss:120b", "devstral-2:123b"]
         return {
             "provider": "ollama_cloud",
             "model": writing_models[0],
@@ -134,7 +134,15 @@ def _ollama_generate(prompt: str, cfg: dict, json_mode: bool = False, timeout: i
             req = urllib.request.Request(f"{host}/api/chat", data=data, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 result = json.loads(resp.read().decode())
-                return (result.get("message", {}).get("content", "") or "").strip()
+                msg = result.get("message", {})
+                content = (msg.get("content") or "").strip()
+                # Some models (e.g. minimax-m2, glm-4.6) are "thinking" models that
+                # put their reasoning in 'thinking' and the final answer in 'content'.
+                # When content is empty (token budget consumed by thinking), fall back
+                # to the thinking text so the pipeline gets something usable.
+                if not content:
+                    content = (msg.get("thinking") or "").strip()
+                return content
         except urllib.error.HTTPError as e:
             last_err = e
             # 404 included: cloud models are occasionally "not found" transiently
