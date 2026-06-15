@@ -1394,11 +1394,29 @@ def validate_seo(blog: dict) -> dict:
 
     # ── 2. Research Quality (15 pts) ─────────────────────────────────────────
     ext_links = re.findall(r'href=["\']https?://[^"\']+["\']', content, re.I)
-    TRUSTED = ("openai.com", "anthropic.com", "google.com", "microsoft.com", "meta.com",
-               "techcrunch.com", "venturebeat.com", "theverge.com", "wired.com",
-               "technologyreview.mit.edu", "arxiv.org", "reuters.com", "bloomberg.com",
-               "forbes.com", "mit.edu", "stanford.edu", "deepmind.google", "nvidia.com",
-               "huggingface.co", "the-decoder.com", "arstechnica.com")
+    TRUSTED = (
+        # AI / model labs
+        "openai.com", "anthropic.com", "deepmind.google", "nvidia.com",
+        "huggingface.co", "mistral.ai", "cohere.com", "stability.ai",
+        # Big tech
+        "google.com", "microsoft.com", "meta.com", "amazon.com", "aws.amazon.com",
+        "research.microsoft.com", "blogs.microsoft.com", "ai.meta.com",
+        "blog.google", "cloud.google.com",
+        # Tech journalism
+        "techcrunch.com", "venturebeat.com", "theverge.com", "wired.com",
+        "arstechnica.com", "zdnet.com", "the-decoder.com", "semafor.com",
+        # Business / finance press
+        "reuters.com", "bloomberg.com", "forbes.com", "wsj.com",
+        "ft.com", "businessinsider.com", "cnbc.com",
+        # Academic / research
+        "technologyreview.mit.edu", "arxiv.org", "mit.edu", "stanford.edu",
+        "nature.com", "science.org", "acm.org", "ieee.org",
+        # Developer / SaaS docs
+        "stripe.com", "github.com", "docs.github.com", "cloudflare.com",
+        "vercel.com", "supabase.com", "planetscale.com", "neon.tech",
+        "aws.amazon.com", "cloud.google.com", "azure.microsoft.com",
+        "kubernetes.io", "docker.com", "postgresql.org",
+    )
     trusted_ext = [l for l in ext_links if any(d in l for d in TRUSTED)]
     src_count = len(references) if references else len(ext_links)
 
