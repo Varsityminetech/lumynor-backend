@@ -19,6 +19,7 @@ import activity as act
 import team as tm
 import authority as auth
 import strategy as strat
+import weekly_intel as wi
 
 app = FastAPI(title="Lumynor Systems Engine")
 
@@ -546,6 +547,26 @@ def get_brief(_admin: dict = Depends(_require_admin)):
     if not brief:
         raise HTTPException(status_code=404, detail="No brief generated yet")
     return brief
+
+
+# ── Weekly Intelligence ───────────────────────────────────────────────────────
+
+@app.get("/api/weekly/latest")
+def weekly_latest(_admin: dict = Depends(_require_admin)):
+    report = wi.get_latest_report()
+    if not report:
+        raise HTTPException(status_code=404, detail="No report generated yet")
+    return report
+
+
+@app.get("/api/weekly/history")
+def weekly_history(_admin: dict = Depends(_require_admin)):
+    return wi.get_all_reports()
+
+
+@app.post("/api/weekly/generate")
+def weekly_generate(_admin: dict = Depends(_require_admin)):
+    return wi.generate_weekly_report()
 
 
 @app.get("/api/projects/{slug}")
@@ -2324,6 +2345,22 @@ def migrate_json_to_supabase():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_blogger_daemon())
+    asyncio.create_task(weekly_intel_daemon())
+
+
+async def weekly_intel_daemon():
+    """Auto-generate weekly report every Monday if not yet produced for this week."""
+    import asyncio as _aio
+    await _aio.sleep(30)  # let app fully start
+    while True:
+        try:
+            if wi.should_auto_generate():
+                print("[weekly_intel] Monday detected — auto-generating weekly report")
+                wi.generate_weekly_report()
+                print("[weekly_intel] Weekly report generated")
+        except Exception as e:
+            print(f"[weekly_intel] auto-generate error: {e}")
+        await _aio.sleep(3600)  # check hourly
 
 if __name__ == "__main__":
     import uvicorn
