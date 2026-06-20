@@ -16,6 +16,7 @@ from exporter import markdown_to_docx, markdown_to_pptx
 import db
 import indexer
 import activity as act
+import team as tm
 
 app = FastAPI(title="Lumynor Systems Engine")
 
@@ -442,6 +443,53 @@ def update_project_status(project: str, body: dict, _admin: dict = Depends(_requ
     if status not in valid_statuses:
         raise HTTPException(status_code=400, detail=f"Invalid status. Use: {valid_statuses}")
     return act.update_project_status(project, status, body.get("note", ""))
+
+
+@app.get("/api/team/projects")
+def team_list_projects(_admin: dict = Depends(_require_admin)):
+    return tm.get_projects()
+
+
+@app.get("/api/team/projects/{slug}")
+def team_get_project(slug: str, _admin: dict = Depends(_require_admin)):
+    p = tm.get_project(slug)
+    if not p:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return p
+
+
+@app.patch("/api/team/projects/{slug}")
+def team_update_project(slug: str, body: dict, _admin: dict = Depends(_require_admin)):
+    return tm.update_project(slug, **{k: v for k, v in body.items() if k in ("owner_name", "status", "note", "name")})
+
+
+@app.post("/api/team/projects/{slug}/members")
+def team_add_member(slug: str, body: dict, _admin: dict = Depends(_require_admin)):
+    if body.get("user_name") not in tm.TEAM_MEMBERS:
+        raise HTTPException(status_code=400, detail=f"Unknown member. Use: {tm.TEAM_MEMBERS}")
+    return tm.add_member(slug, body["user_name"], body.get("role", "member"))
+
+
+@app.delete("/api/team/projects/{slug}/members/{user_name}")
+def team_remove_member(slug: str, user_name: str, _admin: dict = Depends(_require_admin)):
+    return tm.remove_member(slug, user_name)
+
+
+@app.get("/api/team/projects/{slug}/messages")
+def team_get_messages(slug: str, reader_name: str = None, _admin: dict = Depends(_require_admin)):
+    return tm.get_messages(slug, reader_name)
+
+
+@app.post("/api/team/projects/{slug}/messages")
+def team_send_message(slug: str, body: dict, _admin: dict = Depends(_require_admin)):
+    if not body.get("message", "").strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    return tm.send_message(slug, body.get("sender_name", "Unknown"), body["message"])
+
+
+@app.get("/api/team/unread")
+def team_unread(reader_name: str, _admin: dict = Depends(_require_admin)):
+    return tm.get_unread_counts(reader_name)
 
 
 @app.post("/api/webhooks/github", include_in_schema=False)
