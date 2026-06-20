@@ -10,10 +10,11 @@ from auth import (
     seed_users, seed_audit, authenticate_user, create_access_token,
     decode_token, append_audit_log, get_audit_logs, update_user_credentials
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from agent_graph import company_app, set_broadcast_callback, set_raw_broadcast_callback
 from exporter import markdown_to_docx, markdown_to_pptx
 import db
+import indexer
 
 app = FastAPI(title="Lumynor Systems Engine")
 
@@ -958,9 +959,14 @@ def update_blog(blog_id: str, req: BlogSaveRequest):
 @app.patch("/api/blogs/{blog_id}")
 def patch_blog(blog_id: str, req: dict):
     """Partial update — merges fields without losing AI metadata."""
-    updated = db.patch_blog(blog_id, req)
+    existing = db.get_blog(blog_id)
+    updated  = db.patch_blog(blog_id, req)
     if not updated:
         raise HTTPException(status_code=404, detail="Blog post not found")
+    # Auto-index when a post is published for the first time
+    just_published = req.get("published") is True and not (existing or {}).get("published")
+    if just_published:
+        indexer.index_blog_async(updated)
     return {"status": "success", "blog": updated}
 
 @app.delete("/api/blogs/{blog_id}")
@@ -970,6 +976,50 @@ def delete_blog(blog_id: str):
         raise HTTPException(status_code=404, detail="Blog post not found")
     db.delete_blog(blog_id)
     return {"status": "success", "message": "Blog deleted successfully."}
+
+
+# ── INDEXER ENDPOINTS ─────────────────────────────────────────────────────────
+
+@app.get("/sitemap.xml", include_in_schema=False)
+def sitemap():
+    blogs = db.get_published_blogs()
+    xml   = indexer.generate_sitemap(blogs)
+    return Response(content=xml, media_type="application/xml")
+
+
+@app.post("/api/indexer/blog/{blog_id}")
+def index_single_blog(blog_id: str, _admin: dict = Depends(_require_admin)):
+    blog = db.get_blog(blog_id)
+    if not blog:
+        raise HTTPException(status_code=404, detail="Blog not found")
+    if not blog.get("published"):
+        raise HTTPException(status_code=400, detail="Only published blogs can be indexed")
+    results = indexer.index_blog(blog)
+    db.patch_blog(blog_id, {"last_indexed_at": results["indexed_at"], "index_results": results})
+    return results
+
+
+@app.post("/api/indexer/all")
+def index_all(_admin: dict = Depends(_require_admin)):
+    blogs   = db.get_published_blogs()
+    results = indexer.index_all_blogs(blogs)
+    return results
+
+
+@app.get("/api/indexer/status")
+def indexer_status(_admin: dict = Depends(_require_admin)):
+    blogs = db.get_all_blogs()
+    return [
+        {
+            "id":               b.get("id"),
+            "slug":             b.get("slug"),
+            "title":            b.get("title"),
+            "published":        b.get("published"),
+            "last_indexed_at":  b.get("last_indexed_at"),
+            "index_results":    b.get("index_results"),
+        }
+        for b in blogs
+    ]
 
 @app.post("/api/blogs/{slug_or_id}/comments")
 def add_comment(slug_or_id: str, req: BlogCommentRequest):

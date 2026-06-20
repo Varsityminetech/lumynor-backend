@@ -16,3 +16,4 @@ python-docx
 python-pptx
 markdown
 beautifulsoup4
+cryptography
