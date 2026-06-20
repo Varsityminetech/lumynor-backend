@@ -80,11 +80,12 @@ def _get_used_event_ids() -> set:
     return ids
 
 
-def scan_opportunities() -> list:
-    """Use the LLM to identify story opportunities from recent activity events."""
+def scan_opportunities(days: int = 60) -> dict:
+    """Use the LLM to identify story opportunities from recent activity events.
+    Returns a dict: {created, count, debug}."""
     sb = _sb()
     if not sb:
-        return []
+        return {"created": [], "count": 0, "debug": "DB not configured"}
 
     try:
         from auto_blogger import _build_llm_cfg, _llm
@@ -96,17 +97,19 @@ def scan_opportunities() -> list:
     stored = get_settings("auto_blog")
     gemini_key = stored.get("llmApiKey", "")
 
-    # Events from last 14 days, exclude 'other' bucket
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+    # Events from last `days` days — include ALL projects for broader coverage
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     events = (
         sb.table("activity_events").select("*")
           .gte("created_at", cutoff)
-          .neq("project", "other")
           .order("created_at", desc=True)
           .limit(150).execute().data or []
     )
+    # Exclude the generic 'other' bucket but keep everything else
+    events = [e for e in events if e.get("project") and e["project"] != "other"]
+
     if not events:
-        return []
+        return {"created": [], "count": 0, "debug": f"No activity events found in last {days} days"}
 
     # Project context
     projects = (
@@ -119,7 +122,7 @@ def scan_opportunities() -> list:
     used_ids   = _get_used_event_ids()
     new_events = [e for e in events if e["id"] not in used_ids]
     if not new_events:
-        return []
+        return {"created": [], "count": 0, "debug": f"All {len(events)} events already captured in existing opportunities"}
 
     events_text = "\n".join(
         f"[{e['project']}] {e.get('event_type','')} | {e.get('title','')} | "
@@ -183,15 +186,16 @@ Return ONLY the JSON array."""
         llm_cfg  = _build_llm_cfg(stored, gemini_key)
         response = _llm(prompt, llm_cfg, json_mode=False, timeout=180, max_tokens=2500)
 
-        match = re.search(r'\[.*?\]', response, re.DOTALL)
+        print(f"[authority] LLM raw response (first 300): {response[:300]}")
+        match = re.search(r'\[.*\]', response, re.DOTALL)
         if not match:
             print(f"[authority] no JSON array in LLM response")
-            return []
+            return {"created": [], "count": 0, "debug": "LLM response had no JSON array"}
 
         opportunities_data = json.loads(match.group())
     except Exception as e:
         print(f"[authority] LLM error: {e}")
-        return []
+        return {"created": [], "count": 0, "debug": f"LLM error: {str(e)[:200]}"}
 
     created = []
     for opp in opportunities_data:
@@ -225,7 +229,9 @@ Return ONLY the JSON array."""
         except Exception as e:
             print(f"[authority] insert error: {e}")
 
-    return created
+    debug = f"LLM returned {len(opportunities_data)} candidates; {len(created)} saved (scored >= 25)"
+    print(f"[authority] scan complete: {debug}")
+    return {"created": created, "count": len(created), "debug": debug}
 
 
 # ── Weekly summary for ATLAS ──────────────────────────────────────────────────

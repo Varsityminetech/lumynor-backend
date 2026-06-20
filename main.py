@@ -478,8 +478,8 @@ def list_opportunities(
 
 @app.post("/api/authority/scan")
 def scan_opportunities(_admin: dict = Depends(_require_admin)):
-    created = auth.scan_opportunities()
-    return {"created": created, "count": len(created)}
+    result = auth.scan_opportunities()
+    return result
 
 
 @app.patch("/api/authority/opportunities/{opp_id}")
