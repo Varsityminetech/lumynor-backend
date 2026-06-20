@@ -263,7 +263,7 @@ Write a structured briefing with EXACTLY these 5 sections. Use bullet points. Be
 
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
-        llm    = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.2)
+        llm    = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.2)
         result = llm.invoke(prompt)
         briefing = result.content if hasattr(result, "content") else str(result)
     except Exception as e:
