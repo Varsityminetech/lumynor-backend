@@ -688,6 +688,30 @@ def chat_lead(req: dict):
 def get_leads():
     return db.get_all_leads()
 
+@app.post("/api/leads/contact")
+def contact_inquiry(req: dict):
+    """Store a full project inquiry from the Contact page."""
+    new_lead = {
+        "id":          str(uuid.uuid4()),
+        "source":      "contact_form",
+        "name":        req.get("name", ""),
+        "email":       req.get("email", ""),
+        "phone":       req.get("phone", ""),
+        "company":     req.get("company", ""),
+        "projectType": req.get("projectType", ""),
+        "budget":      req.get("budget", ""),
+        "timeline":    req.get("timeline", ""),
+        "description": req.get("description", ""),
+        "timestamp":   datetime.utcnow().isoformat(),
+    }
+    db.insert_lead(new_lead)
+    _send_email_alert(
+        f"New inquiry from {new_lead['name'] or new_lead['email']}",
+        f"Type: {new_lead['projectType']}\nBudget: {new_lead['budget']}\n"
+        f"Timeline: {new_lead['timeline']}\n\n{new_lead['description']}"
+    )
+    return {"status": "success", "lead": new_lead}
+
 
 # ── Alert helpers (fire-and-forget; env vars gate them) ───────────────────────
 
