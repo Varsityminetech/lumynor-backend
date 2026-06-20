@@ -159,6 +159,8 @@ def parse_github_event(gh_event: str, payload: dict) -> dict | None:
     actor    = (payload.get("sender") or {}).get("login", "github")
     repo_url = (payload.get("repository") or {}).get("html_url", "")
 
+    base_meta = {"repo": repo}
+
     if gh_event == "push":
         commits = payload.get("commits", [])
         if not commits:
@@ -171,7 +173,7 @@ def parse_github_event(gh_event: str, payload: dict) -> dict | None:
             "summary": " · ".join(msgs),
             "status": "completed", "priority": "normal", "actor": actor,
             "related_url": payload.get("compare", repo_url),
-            "metadata_json": {"ref": ref, "commit_count": len(commits)},
+            "metadata_json": {**base_meta, "ref": ref, "commit_count": len(commits)},
         }
 
     if gh_event == "pull_request":
@@ -188,7 +190,7 @@ def parse_github_event(gh_event: str, payload: dict) -> dict | None:
             "summary": pr.get("body", "")[:300] or f"PR #{pr.get('number')} by {actor}",
             "status": status, "priority": "important" if merged else "normal", "actor": actor,
             "related_url": pr.get("html_url", ""),
-            "metadata_json": {"pr_number": pr.get("number"), "merged": merged},
+            "metadata_json": {**base_meta, "pr_number": pr.get("number"), "merged": merged},
         }
 
     if gh_event == "release":
@@ -201,7 +203,7 @@ def parse_github_event(gh_event: str, payload: dict) -> dict | None:
             "summary": (rel.get("body") or "")[:300],
             "status": "completed", "priority": "important", "actor": actor,
             "related_url": rel.get("html_url", ""),
-            "metadata_json": {"tag": rel.get("tag_name")},
+            "metadata_json": {**base_meta, "tag": rel.get("tag_name")},
         }
 
     if gh_event == "deployment_status":
@@ -216,7 +218,22 @@ def parse_github_event(gh_event: str, payload: dict) -> dict | None:
             "status": status_map.get(state, "in_progress"),
             "priority": priority_map.get(state, "normal"), "actor": actor,
             "related_url": ds.get("target_url") or repo_url,
-            "metadata_json": {"state": state, "environment": (payload.get("deployment") or {}).get("environment")},
+            "metadata_json": {**base_meta, "state": state, "environment": (payload.get("deployment") or {}).get("environment")},
+        }
+
+    if gh_event == "issues":
+        action = payload.get("action", "")
+        if action not in ("opened", "closed"):
+            return None
+        issue = payload.get("issue", {})
+        return {
+            "source": "github", "project": project, "event_type": "task_update",
+            "title":  f"[{repo}] Issue {action}: {issue.get('title', '')}",
+            "summary": (issue.get("body") or "")[:300] or f"Issue #{issue.get('number')} by {actor}",
+            "status": "completed" if action == "closed" else "new",
+            "priority": "normal", "actor": actor,
+            "related_url": issue.get("html_url", ""),
+            "metadata_json": {**base_meta, "issue_number": issue.get("number"), "action": action},
         }
 
     return None
@@ -382,33 +399,36 @@ def generate_atlas_summary() -> dict:
 
     prompt = f"""You are ATLAS, executive intelligence system for Lumynor Systems.
 
-Analyze these {len(events)} activity events from the last 24 hours and write a concise executive briefing for the founder (Danish).
+GitHub is the primary source of truth. Prioritize GitHub-derived events when assessing work progress.
+Manual events are founder notes — treat them as high-signal context.
+
+Analyze these {len(events)} activity events from the last 24 hours for founder Danish.
 
 EVENTS:
 {context}
 
-PROJECT MOMENTUM (calculated):
+PROJECT MOMENTUM (calculated from recent activity):
 {mom_lines}
 
 Write a structured briefing with EXACTLY these 6 sections. Use bullet points. Be direct — executive tone, zero fluff.
 
-## Major Achievements
-(What was completed or shipped — only meaningful wins. Write "None today." if nothing significant.)
+## What Changed in Code
+(GitHub commits, PRs merged, deployments — which repos moved and what changed. Write "No code activity." if none.)
 
-## Key Decisions
-(Strategic or technical decisions made. Write "None recorded." if none.)
+## Completed
+(What was shipped, merged, or deployed. Only meaningful wins.)
 
-## Blockers
-(What is stuck and needs action — who owns it, what is needed. Write "Nothing blocked." if none.)
+## Blocked or Stalled
+(Projects with no recent GitHub activity, failed deployments, or explicitly blocked events. Write "Nothing blocked." if clear.)
 
-## Momentum Changes
-(Which projects accelerated, stalled, or shifted direction based on the data above.)
+## Decisions
+(Manually logged strategic decisions. Write "None recorded." if none.)
 
 ## Needs Your Review
-(Items requiring Danish's direct attention or approval. Write "None." if clear.)
+(Open PRs, failed deployments, review_needed events. Write "None." if clear.)
 
 ## Recommended Focus Tomorrow
-(1-3 prioritized actions for Danish — most impactful first.)"""
+(1-3 prioritized actions based on code activity and project momentum — most impactful first.)"""
 
     try:
         from auto_blogger import _build_llm_cfg, _llm
