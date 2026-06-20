@@ -176,6 +176,133 @@ def update_credentials(req: CredentialUpdateRequest, authorization: str = Header
     new_token = create_access_token({"sub": req.newEmail, "name": user["name"], "role": user["role"]})
     return {"status": "success", "access_token": new_token, "user": {"email": req.newEmail, "name": user["name"], "role": user["role"]}}
 
+# ── SUPABASE AUTH HELPERS ─────────────────────────────────────────────────────
+
+OWNER_EMAIL = "varsityminetech@gmail.com"
+
+def _get_supabase_user(authorization: str = Header(None)) -> dict:
+    """Validate Supabase JWT from Authorization header."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
+    token = authorization.split(" ", 1)[1]
+    try:
+        sb = db._sb()
+        if not sb:
+            raise HTTPException(status_code=500, detail="Database not configured")
+        resp = sb.auth.get_user(token)
+        if not resp.user:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return {"id": resp.user.id, "email": resp.user.email}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Auth error: {e}")
+
+
+def _require_admin(auth_user: dict = Depends(_get_supabase_user)) -> dict:
+    """Allow owner always; otherwise check role in user_profiles."""
+    if auth_user["email"] == OWNER_EMAIL:
+        return {**auth_user, "role": "admin"}
+    profile = db.get_user_profile(auth_user["id"])
+    if not profile or profile.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return {**auth_user, "role": "admin"}
+
+
+# ── USER / ROLE ENDPOINTS ─────────────────────────────────────────────────────
+
+@app.post("/api/auth/sync-profile")
+def sync_profile(auth_user: dict = Depends(_get_supabase_user)):
+    """Create or refresh the user_profiles row after login/signup."""
+    existing = db.get_user_profile(auth_user["id"])
+    if existing:
+        return existing
+    # Owner gets admin role immediately, everyone else starts as 'user'
+    role = "admin" if auth_user["email"] == OWNER_EMAIL else "user"
+    profile = {
+        "id":             auth_user["id"],
+        "email":          auth_user["email"],
+        "display_name":   auth_user["email"].split("@")[0],
+        "role":           role,
+        "saved_blogs":    [],
+        "favorite_blogs": [],
+        "bio":            "",
+    }
+    return db.upsert_user_profile(profile)
+
+
+@app.get("/api/users/me")
+def get_my_profile(auth_user: dict = Depends(_get_supabase_user)):
+    profile = db.get_user_profile(auth_user["id"])
+    if not profile:
+        # Auto-create on first access
+        role = "admin" if auth_user["email"] == OWNER_EMAIL else "user"
+        profile = {
+            "id":             auth_user["id"],
+            "email":          auth_user["email"],
+            "display_name":   auth_user["email"].split("@")[0],
+            "role":           role,
+            "saved_blogs":    [],
+            "favorite_blogs": [],
+            "bio":            "",
+        }
+        db.upsert_user_profile(profile)
+    elif profile.get("email") == OWNER_EMAIL and profile.get("role") != "admin":
+        db.set_user_role(profile["id"], "admin")
+        profile["role"] = "admin"
+    return profile
+
+
+@app.post("/api/users/request-admin")
+def request_admin(auth_user: dict = Depends(_get_supabase_user)):
+    profile = db.get_user_profile(auth_user["id"])
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found. Please reload.")
+    if profile.get("role") == "admin":
+        return {"status": "already_admin"}
+    db.set_user_role(auth_user["id"], "pending_admin")
+    return {"status": "requested"}
+
+
+@app.get("/api/users/pending-admins")
+def pending_admins(_admin: dict = Depends(_require_admin)):
+    return db.get_pending_admins()
+
+
+@app.patch("/api/users/{user_id}/role")
+def update_role(user_id: str, body: dict, _admin: dict = Depends(_require_admin)):
+    role = body.get("role")
+    if role not in ("user", "admin", "pending_admin"):
+        raise HTTPException(status_code=400, detail="Invalid role")
+    db.set_user_role(user_id, role)
+    return {"status": "updated", "role": role}
+
+
+@app.post("/api/users/saved-blogs/{slug}")
+def toggle_saved(slug: str, auth_user: dict = Depends(_get_supabase_user)):
+    return {"saved_blogs": db.toggle_saved_blog(auth_user["id"], slug)}
+
+
+@app.post("/api/users/favorite-blogs/{slug}")
+def toggle_favorite(slug: str, auth_user: dict = Depends(_get_supabase_user)):
+    return {"favorite_blogs": db.toggle_favorite_blog(auth_user["id"], slug)}
+
+
+@app.get("/api/users/community")
+def community_members(_auth_user: dict = Depends(_get_supabase_user)):
+    """Return public profiles of all users for the community tab."""
+    profiles = db.get_all_user_profiles()
+    return [
+        {
+            "id":           p["id"],
+            "display_name": p.get("display_name", ""),
+            "role":         p.get("role", "user"),
+            "bio":          p.get("bio", ""),
+        }
+        for p in profiles
+    ]
+
+
 # ── PIPELINE RUNNER ────────────────────────────────────────────────────────────
 
 async def run_pipeline(start_dept: str = "R&D"):

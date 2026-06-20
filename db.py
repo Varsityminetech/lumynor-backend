@@ -241,6 +241,77 @@ def delete_blog_comments(blog_id: str) -> None:
     sb.table("comments").delete().eq("blog_id", blog_id).execute()
 
 
+# ── User Profiles ─────────────────────────────────────────────────────────────
+
+def get_user_profile(user_id: str) -> dict | None:
+    sb = _sb()
+    if not sb:
+        return None
+    res = sb.table("user_profiles").select("*").eq("id", user_id).limit(1).execute()
+    return res.data[0] if res.data else None
+
+
+def upsert_user_profile(profile: dict) -> dict:
+    sb = _sb()
+    if not sb:
+        raise RuntimeError("Supabase not configured")
+    sb.table("user_profiles").upsert(profile).execute()
+    return profile
+
+
+def get_all_user_profiles() -> list:
+    sb = _sb()
+    if not sb:
+        return []
+    res = sb.table("user_profiles").select("*").order("created_at", desc=True).execute()
+    return res.data or []
+
+
+def get_pending_admins() -> list:
+    sb = _sb()
+    if not sb:
+        return []
+    res = (sb.table("user_profiles").select("*")
+             .eq("role", "pending_admin")
+             .order("created_at", desc=True)
+             .execute())
+    return res.data or []
+
+
+def set_user_role(user_id: str, role: str) -> None:
+    sb = _sb()
+    if not sb:
+        return
+    sb.table("user_profiles").update({"role": role}).eq("id", user_id).execute()
+
+
+def get_saved_blogs(user_id: str) -> list:
+    profile = get_user_profile(user_id)
+    return profile.get("saved_blogs") or [] if profile else []
+
+
+def toggle_saved_blog(user_id: str, blog_slug: str) -> list:
+    profile = get_user_profile(user_id) or {"id": user_id, "saved_blogs": [], "favorite_blogs": []}
+    saved = list(profile.get("saved_blogs") or [])
+    if blog_slug in saved:
+        saved.remove(blog_slug)
+    else:
+        saved.append(blog_slug)
+    upsert_user_profile({**profile, "saved_blogs": saved})
+    return saved
+
+
+def toggle_favorite_blog(user_id: str, blog_slug: str) -> list:
+    profile = get_user_profile(user_id) or {"id": user_id, "saved_blogs": [], "favorite_blogs": []}
+    favs = list(profile.get("favorite_blogs") or [])
+    if blog_slug in favs:
+        favs.remove(blog_slug)
+    else:
+        favs.append(blog_slug)
+    upsert_user_profile({**profile, "favorite_blogs": favs})
+    return favs
+
+
 # ── Settings ──────────────────────────────────────────────────────────────────
 
 def get_settings(key: str = "auto_blog") -> dict:
