@@ -108,6 +108,7 @@ def scan_opportunities(days: int = 60) -> dict:
     # Exclude the generic 'other' bucket but keep everything else
     events = [e for e in events if e.get("project") and e["project"] != "other"]
 
+    print(f"[authority] found {len(events)} events in last {days} days across projects: {list(set(e.get('project','?') for e in events))}")
     if not events:
         return {"created": [], "count": 0, "debug": f"No activity events found in last {days} days"}
 
@@ -178,8 +179,7 @@ IMPORTANCE SCORING GUIDE:
 - 70-85: product launch prep, milestone completed, significant release
 - 86-100: company-defining moment, launch, major public milestone
 
-Only include opportunities with importance_score >= 25.
-Skip routine commits, minor maintenance, and dependency updates.
+Include all opportunities with importance_score >= 15. Even routine commits can have story value for a founder building in public.
 Return ONLY the JSON array."""
 
     try:
@@ -202,7 +202,7 @@ Return ONLY the JSON array."""
         if not opp.get("title") or not opp.get("project_slug"):
             continue
         score = int(opp.get("importance_score") or 0)
-        if score < 25:
+        if score < 15:
             continue
 
         # Match source event IDs by title
