@@ -15,6 +15,7 @@ from agent_graph import company_app, set_broadcast_callback, set_raw_broadcast_c
 from exporter import markdown_to_docx, markdown_to_pptx
 import db
 import indexer
+import activity as act
 
 app = FastAPI(title="Lumynor Systems Engine")
 
@@ -154,7 +155,7 @@ def login(req: LoginRequest):
 def audit_logs():
     return get_audit_logs()
 
-from fastapi import Depends, Header, File, UploadFile
+from fastapi import Depends, Header, File, UploadFile, Request
 
 class CredentialUpdateRequest(BaseModel):
     newEmail: str
@@ -359,9 +360,76 @@ def community_members(_auth_user: dict = Depends(_get_supabase_user)):
             "display_name": p.get("display_name", ""),
             "role":         p.get("role", "user"),
             "bio":          p.get("bio", ""),
+            "avatar_color": p.get("avatar_color", "blue"),
+            "avatar_url":   p.get("avatar_url", ""),
         }
         for p in profiles
     ]
+
+
+# ── ACTIVITY OS ───────────────────────────────────────────────────────────────
+
+@app.post("/api/activity")
+def create_activity(body: dict, _admin: dict = Depends(_require_admin)):
+    try:
+        return act.create_event(body)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/activity")
+def get_activity(_admin: dict = Depends(_require_admin)):
+    return act.get_events()
+
+
+@app.get("/api/activity/today")
+def get_activity_today(_admin: dict = Depends(_require_admin)):
+    return act.get_today_events()
+
+
+@app.get("/api/activity/projects")
+def get_activity_projects(_admin: dict = Depends(_require_admin)):
+    return act.get_events_by_project()
+
+
+@app.get("/api/activity/critical")
+def get_activity_critical(_admin: dict = Depends(_require_admin)):
+    return act.get_critical_events()
+
+
+@app.get("/api/activity/summary/daily")
+def get_activity_summary(_admin: dict = Depends(_require_admin)):
+    return act.generate_atlas_summary()
+
+
+@app.patch("/api/activity/{event_id}/status")
+def update_activity_status(event_id: str, body: dict, _admin: dict = Depends(_require_admin)):
+    status = body.get("status")
+    if status not in act.STATUSES:
+        raise HTTPException(status_code=400, detail=f"Invalid status. Use: {act.STATUSES}")
+    result = act.update_event_status(event_id, status)
+    if not result:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return result
+
+
+@app.post("/api/webhooks/github", include_in_schema=False)
+async def github_webhook(request: Request):
+    body = await request.body()
+    sig  = request.headers.get("X-Hub-Signature-256", "")
+    if not act.verify_github_signature(body, sig):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    import json as _json
+    payload  = _json.loads(body)
+    gh_event = request.headers.get("X-GitHub-Event", "")
+    event    = act.parse_github_event(gh_event, payload)
+    if event:
+        try:
+            act.create_event(event)
+        except Exception as e:
+            print(f"[activity] GitHub webhook storage error: {e}")
+    return {"status": "ok"}
 
 
 # ── PIPELINE RUNNER ────────────────────────────────────────────────────────────
