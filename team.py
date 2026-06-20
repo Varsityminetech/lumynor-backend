@@ -78,30 +78,41 @@ def get_project(slug: str) -> dict | None:
 
 
 def _ensure_project(sb, slug: str, primary_repo: str = None):
-    if not sb.table("projects").select("id").eq("slug", slug).limit(1).execute().data:
-        name = slug.replace("_", " ").replace("-", " ").title()
-        sb.table("projects").insert({
-            "id":                  str(uuid.uuid4()),
-            "slug":                slug,
-            "name":                name,
-            "owner_name":          "",
-            "status":              "Development",
-            "note":                "",
-            "description":         "",
-            "strategic_notes":     "",
-            "priority":            "Medium",
-            "strategic_importance": "Internal Tool",
-            "current_blocker":     "",
-            "next_milestone":      "",
-            "target_launch_date":  None,
-            "notes":               "",
-            "human_locked_fields": [],
-            "primary_repo":        primary_repo or slug,
-            "auto_created":        True,
-            "recent_activity_count": 0,
-            "created_at":          _now(),
-            "updated_at":          _now(),
-        }).execute()
+    if sb.table("projects").select("id").eq("slug", slug).limit(1).execute().data:
+        return  # already exists
+    name = slug.replace("_", " ").replace("-", " ").title()
+    full_row = {
+        "id":                   str(uuid.uuid4()),
+        "slug":                 slug,
+        "name":                 name,
+        "owner_name":           "",
+        "status":               "Development",
+        "note":                 "",
+        "description":          "",
+        "strategic_notes":      "",
+        "priority":             "Medium",
+        "strategic_importance": "Internal Tool",
+        "current_blocker":      "",
+        "next_milestone":       "",
+        "target_launch_date":   None,
+        "notes":                "",
+        "human_locked_fields":  [],
+        "primary_repo":         primary_repo or slug,
+        "auto_created":         True,
+        "recent_activity_count": 0,
+        "created_at":           _now(),
+        "updated_at":           _now(),
+    }
+    try:
+        sb.table("projects").insert(full_row).execute()
+    except Exception:
+        # Phase 4 columns may not exist yet — fall back to the original schema
+        minimal = {k: full_row[k] for k in
+                   ("id", "slug", "name", "owner_name", "status", "note", "created_at", "updated_at")}
+        try:
+            sb.table("projects").insert(minimal).execute()
+        except Exception:
+            pass  # already exists or DB unavailable
 
 
 def update_project(slug: str, human_edit: bool = False, **kwargs) -> dict:
@@ -143,7 +154,28 @@ def update_github_fields(slug: str, **kwargs) -> None:
         updates['recent_activity_count'] = (project.get('recent_activity_count') or 0) + 1
     if updates:
         updates['updated_at'] = _now()
-        sb.table('projects').update(updates).eq('slug', slug).execute()
+        try:
+            sb.table('projects').update(updates).eq('slug', slug).execute()
+        except Exception:
+            # Phase 4 columns may not exist yet — only update base columns
+            safe = {k: v for k, v in updates.items() if k in ('updated_at',)}
+            if safe:
+                sb.table('projects').update(safe).eq('slug', slug).execute()
+
+
+def sync_projects_from_events() -> list[str]:
+    """Create project rows for any event slugs not yet in the projects table."""
+    sb = _sb()
+    if not sb:
+        return []
+    events = sb.table("activity_events").select("project").execute().data or []
+    slugs = {e["project"] for e in events if e.get("project") and e["project"] != "other"}
+    existing = {r["slug"] for r in (sb.table("projects").select("slug").execute().data or [])}
+    created = []
+    for slug in slugs - existing:
+        _ensure_project(sb, slug)
+        created.append(slug)
+    return created
 
 
 # ── Members ───────────────────────────────────────────────────────────────────

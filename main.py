@@ -457,6 +457,13 @@ def get_portfolio(_admin: dict = Depends(_require_admin)):
     return tm.get_portfolio()
 
 
+@app.post("/api/projects/sync")
+def sync_projects(_admin: dict = Depends(_require_admin)):
+    """Create project rows for any event slugs not yet in the projects table."""
+    created = tm.sync_projects_from_events()
+    return {"created": created, "count": len(created)}
+
+
 @app.get("/api/projects/{slug}")
 def get_project_detail(slug: str, _admin: dict = Depends(_require_admin)):
     p = tm.get_project(slug)
