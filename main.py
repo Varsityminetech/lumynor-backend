@@ -413,6 +413,37 @@ def update_activity_status(event_id: str, body: dict, _admin: dict = Depends(_re
     return result
 
 
+@app.get("/api/activity/snapshot")
+def get_activity_snapshot(_admin: dict = Depends(_require_admin)):
+    return act.get_executive_snapshot()
+
+
+@app.get("/api/activity/momentum")
+def get_activity_momentum(_admin: dict = Depends(_require_admin)):
+    return act.get_project_momentum()
+
+
+@app.get("/api/activity/decisions")
+def get_activity_decisions(_admin: dict = Depends(_require_admin)):
+    return act.get_decisions()
+
+
+@app.get("/api/activity/project-status")
+def get_project_status(_admin: dict = Depends(_require_admin)):
+    return act.get_project_statuses()
+
+
+@app.patch("/api/activity/project-status/{project}")
+def update_project_status(project: str, body: dict, _admin: dict = Depends(_require_admin)):
+    if project not in act.PROJECTS:
+        raise HTTPException(status_code=400, detail=f"Unknown project. Use: {act.PROJECTS}")
+    valid_statuses = ("Planning", "Development", "Testing", "Launch Ready", "Production", "Paused")
+    status = body.get("status", "")
+    if status not in valid_statuses:
+        raise HTTPException(status_code=400, detail=f"Invalid status. Use: {valid_statuses}")
+    return act.update_project_status(project, status, body.get("note", ""))
+
+
 @app.post("/api/webhooks/github", include_in_schema=False)
 async def github_webhook(request: Request):
     body = await request.body()

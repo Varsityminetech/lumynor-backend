@@ -2,11 +2,22 @@
 Lumynor Activity OS — event storage, retrieval, and ATLAS intelligence.
 """
 import os
+import json
 import uuid
 import hmac
 import hashlib
 from datetime import datetime, timezone, timedelta
 from db import _sb
+
+_PROJECT_STATUS_FILE = "/data/project_statuses.json"
+_DEFAULT_PROJECT_STATUSES = {
+    "agentforge":      {"status": "Launch Ready", "note": "Awaiting Payment Integration"},
+    "linkforge":       {"status": "Development",  "note": ""},
+    "district21":      {"status": "Development",  "note": ""},
+    "lumynor_website": {"status": "Production",   "note": ""},
+    "mission_control": {"status": "Planning",     "note": ""},
+    "other":           {"status": "Development",  "note": ""},
+}
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -211,6 +222,132 @@ def parse_github_event(gh_event: str, payload: dict) -> dict | None:
     return None
 
 
+# ── Decision Registry ─────────────────────────────────────────────────────────
+
+def get_decisions(limit: int = 100) -> list:
+    sb = _sb()
+    if not sb:
+        return []
+    return (
+        sb.table("activity_events").select("*")
+          .eq("event_type", "decision")
+          .order("created_at", desc=True)
+          .limit(limit).execute().data or []
+    )
+
+
+# ── Project Status Layer ───────────────────────────────────────────────────────
+
+def get_project_statuses() -> dict:
+    try:
+        with open(_PROJECT_STATUS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return _DEFAULT_PROJECT_STATUSES.copy()
+
+
+def update_project_status(project: str, status: str, note: str = "") -> dict:
+    statuses = get_project_statuses()
+    statuses[project] = {"status": status, "note": note}
+    try:
+        os.makedirs(os.path.dirname(_PROJECT_STATUS_FILE), exist_ok=True)
+        with open(_PROJECT_STATUS_FILE, "w") as f:
+            json.dump(statuses, f)
+    except Exception as e:
+        print(f"[activity] Could not persist project statuses: {e}")
+    return statuses
+
+
+# ── Project Momentum Engine ────────────────────────────────────────────────────
+
+def get_project_momentum() -> dict:
+    """Score each project High / Medium / Low / Blocked from the last 7 days of events."""
+    all_events = get_events(limit=500)
+    now = datetime.now(timezone.utc)
+    week_ago = (now - timedelta(days=7)).isoformat()
+
+    result = {}
+    for project in PROJECTS:
+        proj  = [e for e in all_events if e.get("project") == project]
+        if not proj:
+            continue
+        recent   = [e for e in proj if (e.get("created_at") or "") >= week_ago]
+        blockers = [e for e in recent if e.get("status") in ("blocked", "failed")]
+        completed = [e for e in recent if e.get("status") == "completed"]
+        milestones = [e for e in recent if e.get("event_type") in ("milestone", "feature_completed")]
+
+        last_iso = proj[0].get("created_at", "")
+        try:
+            last_dt = datetime.fromisoformat(last_iso.replace("Z", "+00:00"))
+            days_since = max(0, (now - last_dt).days)
+        except Exception:
+            days_since = 999
+
+        vol = len(recent)
+
+        if blockers and vol == 0:
+            score = "blocked"
+            reason = f"{len(blockers)} unresolved blocker(s), no new activity."
+        elif days_since > 7:
+            score = "low"
+            reason = f"No activity in {days_since} day(s)."
+        elif vol >= 5 and (completed or milestones):
+            score = "high"
+            reason = f"{vol} events this week, {len(completed)} completed, {len(milestones)} milestone(s)."
+        elif vol >= 2:
+            score = "medium"
+            reason = f"{vol} events this week."
+        elif blockers:
+            score = "blocked"
+            reason = f"{len(blockers)} active blocker(s)."
+        else:
+            score = "low"
+            reason = f"Light activity ({vol} event(s) this week)."
+
+        result[project] = {
+            "score":           score,
+            "reason":          reason,
+            "recent_count":    vol,
+            "completed":       len(completed),
+            "blockers":        len(blockers),
+            "days_since_update": days_since,
+        }
+    return result
+
+
+# ── Executive Snapshot ─────────────────────────────────────────────────────────
+
+def get_executive_snapshot() -> dict:
+    """One-glance company status: active projects, blockers, critical items, big win today."""
+    today_events = get_today_events()
+    all_events   = get_events(limit=200)
+    momentum     = get_project_momentum()
+
+    projects_active  = sum(1 for v in momentum.values() if v["score"] in ("high", "medium"))
+    projects_blocked = sum(1 for v in momentum.values() if v["score"] == "blocked")
+    critical_issues  = sum(1 for e in all_events[:100] if e.get("priority") == "critical")
+    review_items     = sum(1 for e in all_events[:100] if e.get("status") == "review_needed")
+
+    major_achievement = None
+    for e in today_events:
+        if e.get("event_type") in ("milestone", "feature_completed") or e.get("status") == "completed":
+            major_achievement = e.get("title", "")
+            break
+
+    decisions_today = [e for e in today_events if e.get("event_type") == "decision"]
+
+    return {
+        "projects_active":   projects_active,
+        "projects_blocked":  projects_blocked,
+        "critical_issues":   critical_issues,
+        "review_items":      review_items,
+        "events_today":      len(today_events),
+        "decisions_today":   len(decisions_today),
+        "major_achievement": major_achievement,
+        "momentum":          momentum,
+    }
+
+
 # ── ATLAS Daily Intelligence ──────────────────────────────────────────────────
 
 def generate_atlas_summary() -> dict:
@@ -237,6 +374,12 @@ def generate_atlas_summary() -> dict:
     ]
     context = "\n".join(lines)
 
+    momentum     = get_project_momentum()
+    mom_lines    = "\n".join(
+        f"  {p.replace('_',' ').title()}: {v['score'].upper()} — {v['reason']}"
+        for p, v in momentum.items()
+    )
+
     prompt = f"""You are ATLAS, executive intelligence system for Lumynor Systems.
 
 Analyze these {len(events)} activity events from the last 24 hours and write a concise executive briefing for the founder (Danish).
@@ -244,22 +387,28 @@ Analyze these {len(events)} activity events from the last 24 hours and write a c
 EVENTS:
 {context}
 
-Write a structured briefing with EXACTLY these 5 sections. Use bullet points. Be direct — executive tone, zero fluff.
+PROJECT MOMENTUM (calculated):
+{mom_lines}
 
-## What Happened Today
-(2-4 highest-signal points only)
+Write a structured briefing with EXACTLY these 6 sections. Use bullet points. Be direct — executive tone, zero fluff.
 
-## Completed
-(what was finished)
+## Major Achievements
+(What was completed or shipped — only meaningful wins. Write "None today." if nothing significant.)
 
-## Blocked
-(what is stuck; write "Nothing blocked." if none)
+## Key Decisions
+(Strategic or technical decisions made. Write "None recorded." if none.)
+
+## Blockers
+(What is stuck and needs action — who owns it, what is needed. Write "Nothing blocked." if none.)
+
+## Momentum Changes
+(Which projects accelerated, stalled, or shifted direction based on the data above.)
 
 ## Needs Your Review
-(decisions or items requiring Danish's direct attention; write "None." if clear)
+(Items requiring Danish's direct attention or approval. Write "None." if clear.)
 
 ## Recommended Focus Tomorrow
-(1-3 prioritized actions for Danish)"""
+(1-3 prioritized actions for Danish — most impactful first.)"""
 
     try:
         from auto_blogger import _build_llm_cfg, _llm
