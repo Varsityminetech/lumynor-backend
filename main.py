@@ -1744,6 +1744,54 @@ async def revise_saved_blog(blog_id: str):
     }
 
 
+@app.post("/api/system/migrate-json-to-supabase")
+def migrate_json_to_supabase():
+    """One-time migration: copy blogs.json and leads.json into Supabase.
+    Safe to run multiple times — skips rows that already exist by slug/email."""
+    if not db.is_connected():
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+
+    results = {"blogs_inserted": 0, "blogs_skipped": 0, "leads_inserted": 0, "leads_skipped": 0, "errors": []}
+
+    # ── Blogs ──────────────────────────────────────────────────────────────────
+    old_blogs = read_json_file(BLOGS_FILE, [])
+    for b in old_blogs:
+        if not b.get("id") or not b.get("title"):
+            continue
+        try:
+            # Ensure slug
+            slug = b.get("slug") or re.sub(r'[^a-z0-9\s-]', '', b["title"].lower())
+            slug = re.sub(r'[\s-]+', '-', slug).strip('-') or b["id"]
+            b["slug"] = slug
+
+            # Check duplicate by slug
+            existing = db.get_blog(slug)
+            if existing:
+                results["blogs_skipped"] += 1
+                continue
+
+            db.insert_blog(b)
+            results["blogs_inserted"] += 1
+        except Exception as e:
+            results["errors"].append(f"blog {b.get('id','?')}: {str(e)[:100]}")
+
+    # ── Leads ──────────────────────────────────────────────────────────────────
+    old_leads = read_json_file(LEADS_FILE, [])
+    for lead in old_leads:
+        if not lead.get("email"):
+            continue
+        try:
+            if db.lead_exists(lead["email"]):
+                results["leads_skipped"] += 1
+                continue
+            db.insert_lead(lead)
+            results["leads_inserted"] += 1
+        except Exception as e:
+            results["errors"].append(f"lead {lead.get('email','?')}: {str(e)[:100]}")
+
+    return {"status": "done", **results}
+
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_blogger_daemon())
