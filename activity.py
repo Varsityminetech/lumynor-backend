@@ -136,19 +136,19 @@ def verify_github_signature(body: bytes, signature: str) -> bool:
 
 
 def _detect_project(repo_name: str) -> str:
-    name = (repo_name or "").lower()
-    if "backend" in name:
-        return "other"        # lumynor-backend → maps as infra/other
-    if "website" in name or "lumynor" in name:
-        return "lumynor_website"
+    name = (repo_name or "").lower().replace("-", "").replace("_", "")
     if "agentforge" in name:
         return "agentforge"
     if "linkforge" in name:
         return "linkforge"
-    if "district" in name:
+    if "district21" in name or "district" in name:
         return "district21"
-    if "mission" in name:
+    if "missioncontrol" in name or "mission" in name:
         return "mission_control"
+    if "backend" in name:
+        return "other"
+    if "website" in name or "lumynor" in name:
+        return "lumynor_website"
     return "other"
 
 
