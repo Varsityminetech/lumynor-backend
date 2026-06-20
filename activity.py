@@ -323,7 +323,7 @@ def get_executive_snapshot() -> dict:
     all_events   = get_events(limit=200)
     momentum     = get_project_momentum()
 
-    projects_active  = sum(1 for v in momentum.values() if v["score"] in ("high", "medium"))
+    projects_active  = sum(1 for v in momentum.values() if v["score"] != "blocked")
     projects_blocked = sum(1 for v in momentum.values() if v["score"] == "blocked")
     critical_issues  = sum(1 for e in all_events[:100] if e.get("priority") == "critical")
     review_items     = sum(1 for e in all_events[:100] if e.get("status") == "review_needed")
