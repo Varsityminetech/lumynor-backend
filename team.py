@@ -163,6 +163,15 @@ def update_github_fields(slug: str, **kwargs) -> None:
                 sb.table('projects').update(safe).eq('slug', slug).execute()
 
 
+def delete_project(slug: str) -> None:
+    sb = _sb()
+    if not sb:
+        raise RuntimeError("DB not configured")
+    sb.table("project_members").delete().eq("project_slug", slug).execute()
+    sb.table("project_messages").delete().eq("project_slug", slug).execute()
+    sb.table("projects").delete().eq("slug", slug).execute()
+
+
 def sync_projects_from_events() -> list[str]:
     """Create project rows for any event slugs not yet in the projects table."""
     sb = _sb()

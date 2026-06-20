@@ -472,6 +472,15 @@ def get_project_detail(slug: str, _admin: dict = Depends(_require_admin)):
     return p
 
 
+@app.delete("/api/projects/{slug}")
+def delete_project(slug: str, _admin: dict = Depends(_require_admin)):
+    p = tm.get_project(slug)
+    if not p:
+        raise HTTPException(status_code=404, detail="Project not found")
+    tm.delete_project(slug)
+    return {"deleted": slug}
+
+
 @app.patch("/api/projects/{slug}")
 def update_project_detail(slug: str, body: dict, _admin: dict = Depends(_require_admin)):
     allowed = {
