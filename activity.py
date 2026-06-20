@@ -126,6 +126,8 @@ def verify_github_signature(body: bytes, signature: str) -> bool:
 
 def _detect_project(repo_name: str) -> str:
     name = (repo_name or "").lower()
+    if "backend" in name:
+        return "other"        # lumynor-backend → maps as infra/other
     if "website" in name or "lumynor" in name:
         return "lumynor_website"
     if "agentforge" in name:
