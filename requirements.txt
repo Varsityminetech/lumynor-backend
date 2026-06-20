@@ -1,3 +1,4 @@
+supabase
 fastapi
 uvicorn[standard]
 websockets

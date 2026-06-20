@@ -13,6 +13,7 @@ from auth import (
 from fastapi.responses import FileResponse
 from agent_graph import company_app, set_broadcast_callback, set_raw_broadcast_callback
 from exporter import markdown_to_docx, markdown_to_pptx
+import db
 
 app = FastAPI(title="Lumynor Systems Engine")
 
@@ -657,9 +658,7 @@ class BlogGenerateRequest(BaseModel):
 
 @app.post("/api/leads/subscribe")
 def subscribe_lead(req: LeadSubscribeRequest):
-    leads = read_json_file(LEADS_FILE, [])
-    # Check if duplicate
-    if any(lead.get("email") == req.email for lead in leads):
+    if db.lead_exists(req.email):
         return {"status": "success", "message": "Already subscribed."}
     new_lead = {
         "id": str(uuid.uuid4()),
@@ -668,13 +667,11 @@ def subscribe_lead(req: LeadSubscribeRequest):
         "source": req.source,
         "timestamp": datetime.utcnow().isoformat()
     }
-    leads.append(new_lead)
-    write_json_file(LEADS_FILE, leads)
+    db.insert_lead(new_lead)
     return {"status": "success", "lead": new_lead}
 
 @app.post("/api/leads/chat")
 def chat_lead(req: dict):
-    leads = read_json_file(LEADS_FILE, [])
     new_lead = {
         "id": str(uuid.uuid4()),
         "source": req.get("source", "chatbot"),
@@ -684,13 +681,12 @@ def chat_lead(req: dict):
         "contact": req.get("contact", ""),
         "timestamp": datetime.utcnow().isoformat()
     }
-    leads.append(new_lead)
-    write_json_file(LEADS_FILE, leads)
+    db.insert_lead(new_lead)
     return {"status": "success", "lead": new_lead}
 
 @app.get("/api/leads/all")
 def get_leads():
-    return read_json_file(LEADS_FILE, [])
+    return db.get_all_leads()
 
 
 # ── Alert helpers (fire-and-forget; env vars gate them) ───────────────────────
@@ -749,129 +745,77 @@ def _fire_publish_webhook(blog: dict):
 
 @app.get("/api/blogs")
 def get_published_blogs():
-    blogs = read_json_file(BLOGS_FILE, [])
-    return [b for b in blogs if b.get("published", True)]
+    return db.get_published_blogs()
 
 @app.get("/api/blogs/admin")
 def get_all_blogs():
-    return read_json_file(BLOGS_FILE, [])
+    return db.get_all_blogs()
 
 
 @app.get("/api/blogs/review-queue")
 def get_review_queue():
-    """Return auto-posted draft blogs that need human review before publishing.
-    Sorted by SEO score descending — highest-quality drafts first."""
-    blogs = read_json_file(BLOGS_FILE, [])
-    queue = [
-        b for b in blogs
-        if not b.get("published")
-        and b.get("is_auto_posted")
-        and b.get("seoScore", 0) >= 50
-    ]
-    queue.sort(key=lambda b: b.get("seoScore", 0), reverse=True)
+    """Return auto-posted draft blogs that need human review before publishing."""
+    queue = db.get_review_queue()
     return {"count": len(queue), "blogs": queue}
 
 
 @app.get("/api/blogs/{slug_or_id}")
 def get_single_blog(slug_or_id: str):
-    blogs = read_json_file(BLOGS_FILE, [])
-    # Look by slug first, then ID
-    for idx, blog in enumerate(blogs):
-        if blog.get("slug") == slug_or_id or blog.get("id") == slug_or_id:
-            # Increment view count (powers "Most Read" on the blog landing).
-            blog["views"] = int(blog.get("views", 0)) + 1
-            blogs[idx] = blog
-            write_json_file(BLOGS_FILE, blogs)
-            comments = read_json_file(COMMENTS_FILE, {}).get(blog.get("id"), [])
-            blog_copy = dict(blog)
-            blog_copy["comments"] = comments
-            return blog_copy
-    raise HTTPException(status_code=404, detail="Blog post not found")
+    blog = db.get_blog(slug_or_id)
+    if not blog:
+        raise HTTPException(status_code=404, detail="Blog post not found")
+    db.increment_blog_views(slug_or_id)
+    comments = db.get_comments(blog.get("slug", slug_or_id))
+    return {**blog, "comments": comments}
 
 @app.post("/api/blogs")
 def create_blog(req: BlogSaveRequest):
-    blogs = read_json_file(BLOGS_FILE, [])
     new_blog = req.dict()
     new_blog["content"] = ensure_html_content(new_blog.get("content", ""))
     new_blog["id"] = str(uuid.uuid4())
     new_blog["created_at"] = datetime.utcnow().isoformat()
-    blogs.append(new_blog)
-    write_json_file(BLOGS_FILE, blogs)
+    db.insert_blog(new_blog)
     return {"status": "success", "blog": new_blog}
 
 @app.put("/api/blogs/{blog_id}")
 def update_blog(blog_id: str, req: BlogSaveRequest):
-    blogs = read_json_file(BLOGS_FILE, [])
-    for idx, blog in enumerate(blogs):
-        if blog.get("id") == blog_id:
-            updated = req.dict()
-            updated["content"] = ensure_html_content(updated.get("content", ""))
-            updated["id"] = blog_id
-            updated["created_at"] = blog.get("created_at", datetime.utcnow().isoformat())
-            updated["updated_at"] = datetime.utcnow().isoformat()
-            blogs[idx] = updated
-            write_json_file(BLOGS_FILE, blogs)
-            return {"status": "success", "blog": updated}
-    raise HTTPException(status_code=404, detail="Blog post not found")
+    existing = db.get_blog(blog_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Blog post not found")
+    updated = req.dict()
+    updated["content"] = ensure_html_content(updated.get("content", ""))
+    updated["id"] = blog_id
+    updated["created_at"] = existing.get("created_at", datetime.utcnow().isoformat())
+    updated["updated_at"] = datetime.utcnow().isoformat()
+    db.update_blog(blog_id, updated)
+    return {"status": "success", "blog": updated}
 
 @app.patch("/api/blogs/{blog_id}")
 def patch_blog(blog_id: str, req: dict):
-    """
-    Partial update — merges provided fields into the existing blog without
-    losing AI-generated metadata (faq, references, images, seoScore, tags).
-    Use this to manually insert backlinks / affiliate links into content,
-    toggle published status, or tweak any single field — even after publishing.
-    """
-    blogs = read_json_file(BLOGS_FILE, [])
-    for idx, blog in enumerate(blogs):
-        if blog.get("id") == blog_id:
-            # Only update provided keys; preserve everything else
-            for key, value in req.items():
-                if key not in ("id", "created_at"):
-                    blog[key] = value
-            blog["updated_at"] = datetime.utcnow().isoformat()
-            blogs[idx] = blog
-            write_json_file(BLOGS_FILE, blogs)
-            return {"status": "success", "blog": blog}
-    raise HTTPException(status_code=404, detail="Blog post not found")
+    """Partial update — merges fields without losing AI metadata."""
+    updated = db.patch_blog(blog_id, req)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Blog post not found")
+    return {"status": "success", "blog": updated}
 
 @app.delete("/api/blogs/{blog_id}")
 def delete_blog(blog_id: str):
-    blogs = read_json_file(BLOGS_FILE, [])
-    initial_len = len(blogs)
-    blogs = [b for b in blogs if b.get("id") != blog_id]
-    if len(blogs) == initial_len:
+    existing = db.get_blog(blog_id)
+    if not existing:
         raise HTTPException(status_code=404, detail="Blog post not found")
-    write_json_file(BLOGS_FILE, blogs)
-    # Also clean up comments
-    comments_db = read_json_file(COMMENTS_FILE, {})
-    comments_db.pop(blog_id, None)
-    write_json_file(COMMENTS_FILE, comments_db)
+    db.delete_blog(blog_id)
     return {"status": "success", "message": "Blog deleted successfully."}
 
 @app.post("/api/blogs/{slug_or_id}/comments")
 def add_comment(slug_or_id: str, req: BlogCommentRequest):
-    blogs = read_json_file(BLOGS_FILE, [])
-    blog_id = None
-    for blog in blogs:
-        if blog.get("slug") == slug_or_id or blog.get("id") == slug_or_id:
-            blog_id = blog.get("id")
-            break
-    if not blog_id:
+    blog = db.get_blog(slug_or_id)
+    if not blog:
         raise HTTPException(status_code=404, detail="Blog post not found")
-    
-    comments_db = read_json_file(COMMENTS_FILE, {})
-    if blog_id not in comments_db:
-        comments_db[blog_id] = []
-    
-    new_comment = {
-        "id": str(uuid.uuid4()),
-        "author": req.author,
-        "content": req.content,
-        "timestamp": datetime.utcnow().isoformat()
-    }
-    comments_db[blog_id].append(new_comment)
-    write_json_file(COMMENTS_FILE, comments_db)
+    new_comment = db.insert_comment(
+        blog_id=blog.get("id", ""),
+        blog_slug=blog.get("slug", slug_or_id),
+        comment={"author": req.author, "email": getattr(req, "email", ""), "content": req.content},
+    )
     return {"status": "success", "comment": new_comment}
 
 @app.get("/api/system/ollama-models")
@@ -1014,8 +958,7 @@ class AutoBlogSettingsUpdateRequest(BaseModel):
 
 @app.get("/api/system/auto-blog-settings")
 def get_auto_blog_settings():
-    stored = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
-    # Provide defaults for any missing keys
+    stored = db.get_settings("auto_blog")
     defaults = {
         "enabled": False,
         "niche": "Latest AI News & Developments",
@@ -1040,11 +983,9 @@ def get_auto_blog_settings():
 
 @app.post("/api/system/auto-blog-settings")
 def update_auto_blog_settings(req: AutoBlogSettingsUpdateRequest):
-    # Load existing file to preserve runtime fields (last_run, run_count, etc.)
-    existing = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
-    # Merge: user-submitted config overwrites config keys, runtime keys preserved
+    existing = db.get_settings("auto_blog")
     updated = {**existing, **req.dict()}
-    write_json_file(AUTO_BLOG_SETTINGS_FILE, updated)
+    db.save_settings(updated, "auto_blog")
     return updated
 
 def fetch_trending_search(niche: str):
@@ -1117,10 +1058,9 @@ async def generate_and_post_auto_blog(settings):
             "content": f"# The Future of {niche} in 2026\n\nAutomated post covering trends in {niche}.\n\n### Frequently Asked Questions\n**Q: What are the key trends?**\n*A: Advanced AI integrations and custom agentic frameworks.*\n\n### References\n- [Lumynor Trends](https://lumynor.com)"
         }
         
-    blogs = read_json_file(BLOGS_FILE, [])
     slug = re.sub(r'[^a-z0-9\s-]', '', result_json["title"].lower())
     slug = re.sub(r'[\s-]+', '-', slug).strip('-')
-    
+
     new_blog = {
         "id": str(uuid.uuid4()),
         "title": result_json["title"],
@@ -1136,15 +1076,14 @@ async def generate_and_post_auto_blog(settings):
         "created_at": datetime.utcnow().isoformat(),
         "is_auto_posted": True
     }
-    
-    blogs.append(new_blog)
-    write_json_file(BLOGS_FILE, blogs)
-    
-    # Update runtime tracking fields in settings file
+
+    db.insert_blog(new_blog)
+
+    # Update runtime tracking fields in settings
     now_iso = datetime.utcnow().isoformat()
     settings["last_run"] = now_iso
     settings["run_count"] = settings.get("run_count", 0) + 1
-    write_json_file(AUTO_BLOG_SETTINGS_FILE, settings)
+    db.save_settings(settings)
     
     await manager.broadcast({
         "type": "blog_published",
@@ -1162,7 +1101,7 @@ def expire_stale_blogs():
     (< BLOG_EXPIRY_MIN_VIEWS). High-traffic old posts stay live."""
     days = max(180, min(365, int(os.getenv("BLOG_EXPIRY_DAYS", "270"))))
     min_views = int(os.getenv("BLOG_EXPIRY_MIN_VIEWS", "50"))
-    blogs = read_json_file(BLOGS_FILE, [])
+    blogs = db.get_all_blogs()
     if not blogs:
         return 0
     cutoff = datetime.utcnow() - timedelta(days=days)
@@ -1178,12 +1117,13 @@ def expire_stale_blogs():
             except Exception:
                 created = None
         if created and created < cutoff and int(b.get("views", 0)) < min_views:
-            b["published"] = False
-            b["expiredAt"] = datetime.utcnow().isoformat()
-            b["expiredReason"] = f"auto-expired: >{days}d old, <{min_views} views"
+            db.patch_blog(b["id"], {
+                "published":    False,
+                "expiredAt":    datetime.utcnow().isoformat(),
+                "expiredReason": f"auto-expired: >{days}d old, <{min_views} views",
+            })
             changed += 1
     if changed:
-        write_json_file(BLOGS_FILE, blogs)
         print(f"\U0001f4e6 Auto-unpublished {changed} stale low-traffic post(s) (>{days}d, <{min_views} views)")
     return changed
 
@@ -1201,7 +1141,7 @@ async def auto_blogger_daemon():
                     expire_stale_blogs()
                 except Exception as e:
                     print(f"[expire] error: {e}")
-            settings = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
+            settings = db.get_settings()
             if not settings.get("enabled", False):
                 continue
             
@@ -1322,7 +1262,7 @@ class AutoBlogRunRequest(BaseModel):
 async def auto_generate_blog(req: AutoBlogRunRequest):
     """Full auto-blog pipeline: trending research → keyword research → longform writing → images → SEO."""
     # Merge request with saved settings
-    settings = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
+    settings = db.get_settings()
 
     merged_settings = {
         "niche": req.niche or settings.get("niche", "Technology"),
@@ -1345,7 +1285,7 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
 
     llm_cfg = _build_llm_cfg(merged_settings, gemini_key)
 
-    _all_blogs_ag  = read_json_file(BLOGS_FILE, [])
+    _all_blogs_ag  = db.get_all_blogs()
     _pub_blogs_ag  = [b for b in _all_blogs_ag if b.get("published")]
     _recent_ag     = [b["title"] for b in _all_blogs_ag if b.get("title")][-20:]
 
@@ -1398,8 +1338,7 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
     has_real_image = bool(cover and "placehold.co" not in cover)
     publish = req.auto_publish and seo_ok and has_real_image
 
-    # Save to blogs.json
-    blogs = read_json_file(BLOGS_FILE, [])
+    # Save to Supabase
     new_blog = {
         "id": str(uuid.uuid4()),
         **blog_object,
@@ -1411,13 +1350,12 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
         new_blog["draftReason"] = f"SEO {final_score} below publish threshold {min_score}"
     elif not has_real_image:
         new_blog["draftReason"] = "No real cover image — add before publishing"
-    blogs.append(new_blog)
-    write_json_file(BLOGS_FILE, blogs)
+    db.insert_blog(new_blog)
 
     # Update auto-blog runtime settings
     settings["last_run"] = datetime.utcnow().isoformat()
     settings["run_count"] = settings.get("run_count", 0) + 1
-    write_json_file(AUTO_BLOG_SETTINGS_FILE, settings)
+    db.save_settings(settings)
 
     if publish:
         _fire_publish_webhook(new_blog)
@@ -1458,7 +1396,7 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
 async def get_trending_topics(niche: str = "Technology", keywords: str = ""):
     """Get trending topic suggestions for a niche without generating a full blog."""
     gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
-    settings = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
+    settings = db.get_settings()
     llm_cfg = _build_llm_cfg(settings, gemini_key)
     if llm_cfg.get("provider") not in ("ollama_cloud", "ollama") and not gemini_key:
         raise HTTPException(status_code=400, detail="No LLM key configured. Set GEMINI_API_KEY or OLLAMA_API_KEY in Railway env.")
@@ -1537,9 +1475,9 @@ class AutoBlogSettingsUpdateRequestV2(BaseModel):
 
 @app.post("/api/system/auto-blog-settings/v2")
 def update_auto_blog_settings_v2(req: AutoBlogSettingsUpdateRequestV2):
-    existing = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
+    existing = db.get_settings()
     updated = {**existing, **req.dict()}
-    write_json_file(AUTO_BLOG_SETTINGS_FILE, updated)
+    db.save_settings(updated)
     return updated
 
 
@@ -1560,7 +1498,7 @@ async def generate_and_post_auto_blog_v2(settings: dict):
         return
 
     # Pass recently published titles so Stage 1 picks a fresh, unique topic.
-    _recent_blogs = read_json_file(BLOGS_FILE, [])
+    _recent_blogs = db.get_all_blogs()
     _recent_topics = [b["title"] for b in _recent_blogs if b.get("title")][-20:]
     _pub_blogs_v2  = [b for b in _recent_blogs if b.get("published")]
 
@@ -1625,13 +1563,11 @@ async def generate_and_post_auto_blog_v2(settings: dict):
         elif not has_real_image:
             new_blog["draftReason"] = "No real cover image (all sources failed) — add an image before publishing"
             print(f"[auto_blogger] No real cover image — saved as DRAFT")
-        blogs = read_json_file(BLOGS_FILE, [])
-        blogs.append(new_blog)
-        write_json_file(BLOGS_FILE, blogs)
+        db.insert_blog(new_blog)
 
         settings["last_run"] = datetime.utcnow().isoformat()
         settings["run_count"] = settings.get("run_count", 0) + 1
-        write_json_file(AUTO_BLOG_SETTINGS_FILE, settings)
+        db.save_settings(settings)
 
         if new_blog.get("published"):
             _fire_publish_webhook(new_blog)
@@ -1667,10 +1603,10 @@ async def generate_and_post_auto_blog_v2(settings: dict):
 async def trigger_blog_now():
     """Force the auto-blogger daemon to run on its next tick (within 10 seconds).
     Returns immediately — generation runs in the background and is broadcast via WebSocket."""
-    settings = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
+    settings = db.get_settings()
     settings["enabled"] = True
     settings["last_run"] = "1970-01-01T00:00:00"
-    write_json_file(AUTO_BLOG_SETTINGS_FILE, settings)
+    db.save_settings(settings)
     return {"status": "triggered", "message": "Blog generation will start within 10 seconds. Watch /api/blogs for the new post."}
 
 
@@ -1682,8 +1618,7 @@ async def revise_saved_blog(blog_id: str):
     Source issues trigger Tavily re-research only (no LLM fabrication).
     Returns revision notes, score progression, and publish recommendation.
     """
-    blogs = read_json_file(BLOGS_FILE, [])
-    blog = next((b for b in blogs if b.get("id") == blog_id or b.get("slug") == blog_id), None)
+    blog = db.get_blog(blog_id)
     if not blog:
         raise HTTPException(status_code=404, detail="Blog not found")
 
@@ -1703,7 +1638,7 @@ async def revise_saved_blog(blog_id: str):
             pass  # malformed date — allow revision
 
     gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
-    settings = read_json_file(AUTO_BLOG_SETTINGS_FILE, {})
+    settings = db.get_settings()
     llm_cfg = _build_llm_cfg(settings, gemini_key)
     if llm_cfg.get("provider") not in ("ollama_cloud", "ollama") and not gemini_key:
         raise HTTPException(status_code=400,
@@ -1732,7 +1667,7 @@ async def revise_saved_blog(blog_id: str):
         "faqs":              [],
     } if stored_rb else {}
 
-    _pub_blogs_rev = [b for b in blogs if b.get("published") and b.get("id") != blog_id]
+    _pub_blogs_rev = [b for b in db.get_published_blogs() if b.get("id") != blog_id]
 
     try:
         loop = asyncio.get_event_loop()
@@ -1748,28 +1683,25 @@ async def revise_saved_blog(blog_id: str):
 
     revised = result["revised_blog"]
 
-    # Persist the revised blog back to storage
-    for idx, b in enumerate(blogs):
-        if b.get("id") == blog_id or b.get("slug") == blog_id:
-            blogs[idx] = {
-                **b,
-                "title":          revised.get("title", b["title"]),
-                "slug":           revised.get("slug", b.get("slug", "")),
-                "content":        revised.get("content", b.get("content", "")),
-                "summary":        revised.get("summary", b.get("summary", "")),
-                "metaDescription": revised.get("meta_description", b.get("metaDescription", "")),
-                "references":     revised.get("references", b.get("references", [])),
-                "seoScore":       result["new_seo_score"],
-                "seoGrade":       result["new_seo_grade"],
-                "published": (
-                    result["publish_recommendation"] == "publish"
-                    and bool(b.get("coverImage") and "placehold.co" not in b.get("coverImage", ""))
-                ),
-                "revised_at":     datetime.utcnow().isoformat(),
-                "revision_log":   result["revision_notes"],
-            }
-            write_json_file(BLOGS_FILE, blogs)
-            break
+    # Persist the revised blog back to Supabase
+    cover = blog.get("coverImage", "")
+    db.update_blog(blog["id"], {
+        **blog,
+        "title":           revised.get("title", blog["title"]),
+        "slug":            revised.get("slug", blog.get("slug", "")),
+        "content":         revised.get("content", blog.get("content", "")),
+        "summary":         revised.get("summary", blog.get("summary", "")),
+        "metaDescription": revised.get("meta_description", blog.get("metaDescription", "")),
+        "references":      revised.get("references", blog.get("references", [])),
+        "seoScore":        result["new_seo_score"],
+        "seoGrade":        result["new_seo_grade"],
+        "published": (
+            result["publish_recommendation"] == "publish"
+            and bool(cover and "placehold.co" not in cover)
+        ),
+        "revised_at":      datetime.utcnow().isoformat(),
+        "revision_log":    result["revision_notes"],
+    })
 
     return {
         "status":                 "success",
