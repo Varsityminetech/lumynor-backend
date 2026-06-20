@@ -18,6 +18,7 @@ import indexer
 import activity as act
 import team as tm
 import authority as auth
+import strategy as strat
 
 app = FastAPI(title="Lumynor Systems Engine")
 
@@ -501,6 +502,50 @@ def delete_opportunity(opp_id: str, _admin: dict = Depends(_require_admin)):
 @app.get("/api/authority/weekly")
 def weekly_authority(_admin: dict = Depends(_require_admin)):
     return auth.get_weekly_summary()
+
+
+# ── Strategy OS ───────────────────────────────────────────────────────────────
+
+@app.get("/api/strategy/focus")
+def strategy_focus(_admin: dict = Depends(_require_admin)):
+    return strat.get_daily_focus()
+
+
+@app.get("/api/strategy/matrix")
+def strategy_matrix(_admin: dict = Depends(_require_admin)):
+    return strat.get_matrix()
+
+
+@app.get("/api/strategy/blockers")
+def strategy_blockers(_admin: dict = Depends(_require_admin)):
+    return strat.get_strategic_blockers()
+
+
+@app.post("/api/strategy/attention")
+def log_attention(body: dict, _admin: dict = Depends(_require_admin)):
+    project_slug = body.get("project_slug", "")
+    minutes      = int(body.get("minutes", 0))
+    if not project_slug or minutes <= 0:
+        raise HTTPException(status_code=400, detail="project_slug and minutes required")
+    return strat.log_attention(project_slug, minutes)
+
+
+@app.get("/api/strategy/attention")
+def get_attention(days: int = 7, _admin: dict = Depends(_require_admin)):
+    return strat.get_attention_allocation(days=days)
+
+
+@app.post("/api/strategy/weekly-brief")
+def generate_brief(_admin: dict = Depends(_require_admin)):
+    return strat.generate_weekly_brief()
+
+
+@app.get("/api/strategy/weekly-brief")
+def get_brief(_admin: dict = Depends(_require_admin)):
+    brief = strat.get_latest_brief()
+    if not brief:
+        raise HTTPException(status_code=404, detail="No brief generated yet")
+    return brief
 
 
 @app.get("/api/projects/{slug}")
