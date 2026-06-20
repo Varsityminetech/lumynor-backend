@@ -154,7 +154,7 @@ def login(req: LoginRequest):
 def audit_logs():
     return get_audit_logs()
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, File, UploadFile
 
 class CredentialUpdateRequest(BaseModel):
     newEmail: str
@@ -285,6 +285,52 @@ def update_my_profile(body: dict, auth_user: dict = Depends(_get_supabase_user))
         return db.update_profile_fields(auth_user["id"], body)
     except RuntimeError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/users/avatar")
+async def upload_avatar(
+    file: UploadFile = File(...),
+    auth_user: dict = Depends(_get_supabase_user),
+):
+    allowed = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+    if file.content_type not in allowed:
+        raise HTTPException(status_code=400, detail="Only JPEG, PNG, GIF, WEBP allowed")
+    content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image must be under 5 MB")
+
+    ext  = (file.filename or "jpg").rsplit(".", 1)[-1].lower()
+    path = f"{auth_user['id']}/avatar.{ext}"
+    sb   = db._sb()
+    if not sb:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    try:
+        sb.storage.create_bucket("avatars", options={"public": True})
+    except Exception:
+        pass  # bucket already exists
+
+    try:
+        sb.storage.from_("avatars").upload(
+            path, content,
+            file_options={"content-type": file.content_type, "upsert": "true"},
+        )
+    except Exception:
+        try:
+            sb.storage.from_("avatars").remove([path])
+            sb.storage.from_("avatars").upload(
+                path, content,
+                file_options={"content-type": file.content_type},
+            )
+        except Exception as e2:
+            raise HTTPException(status_code=500, detail=f"Upload failed: {e2}")
+
+    url = sb.storage.from_("avatars").get_public_url(path)
+    try:
+        db.update_profile_fields(auth_user["id"], {"avatar_url": url})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Profile update failed: {e}")
+    return {"avatar_url": url}
 
 
 @app.post("/api/users/saved-blogs/{slug}")

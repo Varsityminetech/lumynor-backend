@@ -17,3 +17,4 @@ python-pptx
 markdown
 beautifulsoup4
 cryptography
+python-multipart

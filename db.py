@@ -319,11 +319,11 @@ def track_reading(user_id: str, blog_slug: str) -> None:
 
 
 def update_profile_fields(user_id: str, fields: dict) -> dict:
-    """Update display_name, bio, avatar_color — safe subset only."""
+    """Update display_name, bio, avatar_color, avatar_url — safe subset only."""
     profile = get_user_profile(user_id)
     if not profile:
         raise RuntimeError("Profile not found")
-    allowed = {"display_name", "bio", "avatar_color"}
+    allowed = {"display_name", "bio", "avatar_color", "avatar_url"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     merged = {**profile, **updates}
     return upsert_user_profile(merged)
