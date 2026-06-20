@@ -278,6 +278,14 @@ def update_role(user_id: str, body: dict, _admin: dict = Depends(_require_admin)
     return {"status": "updated", "role": role}
 
 
+@app.patch("/api/users/me")
+def update_my_profile(body: dict, auth_user: dict = Depends(_get_supabase_user)):
+    try:
+        return db.update_profile_fields(auth_user["id"], body)
+    except RuntimeError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @app.post("/api/users/saved-blogs/{slug}")
 def toggle_saved(slug: str, auth_user: dict = Depends(_get_supabase_user)):
     return {"saved_blogs": db.toggle_saved_blog(auth_user["id"], slug)}
@@ -286,6 +294,12 @@ def toggle_saved(slug: str, auth_user: dict = Depends(_get_supabase_user)):
 @app.post("/api/users/favorite-blogs/{slug}")
 def toggle_favorite(slug: str, auth_user: dict = Depends(_get_supabase_user)):
     return {"favorite_blogs": db.toggle_favorite_blog(auth_user["id"], slug)}
+
+
+@app.post("/api/users/reading-history/{slug}")
+def track_read(slug: str, auth_user: dict = Depends(_get_supabase_user)):
+    db.track_reading(auth_user["id"], slug)
+    return {"status": "tracked"}
 
 
 @app.get("/api/users/community")

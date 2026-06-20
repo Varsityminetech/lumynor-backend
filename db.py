@@ -285,11 +285,6 @@ def set_user_role(user_id: str, role: str) -> None:
     sb.table("user_profiles").update({"role": role}).eq("id", user_id).execute()
 
 
-def get_saved_blogs(user_id: str) -> list:
-    profile = get_user_profile(user_id)
-    return profile.get("saved_blogs") or [] if profile else []
-
-
 def toggle_saved_blog(user_id: str, blog_slug: str) -> list:
     profile = get_user_profile(user_id) or {"id": user_id, "saved_blogs": [], "favorite_blogs": []}
     saved = list(profile.get("saved_blogs") or [])
@@ -310,6 +305,28 @@ def toggle_favorite_blog(user_id: str, blog_slug: str) -> list:
         favs.append(blog_slug)
     upsert_user_profile({**profile, "favorite_blogs": favs})
     return favs
+
+
+def track_reading(user_id: str, blog_slug: str) -> None:
+    profile = get_user_profile(user_id)
+    if not profile:
+        return
+    history = list(profile.get("reading_history") or [])
+    if blog_slug in history:
+        history.remove(blog_slug)
+    history.insert(0, blog_slug)
+    upsert_user_profile({**profile, "reading_history": history[:20]})
+
+
+def update_profile_fields(user_id: str, fields: dict) -> dict:
+    """Update display_name, bio, avatar_color — safe subset only."""
+    profile = get_user_profile(user_id)
+    if not profile:
+        raise RuntimeError("Profile not found")
+    allowed = {"display_name", "bio", "avatar_color"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    merged = {**profile, **updates}
+    return upsert_user_profile(merged)
 
 
 # ── Settings ──────────────────────────────────────────────────────────────────
