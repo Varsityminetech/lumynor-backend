@@ -262,10 +262,35 @@ Write a structured briefing with EXACTLY these 5 sections. Use bullet points. Be
 (1-3 prioritized actions for Danish)"""
 
     try:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        llm    = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.2)
-        result = llm.invoke(prompt)
-        briefing = result.content if hasattr(result, "content") else str(result)
+        ollama_key = os.getenv("OLLAMA_API_KEY", "")
+        if ollama_key:
+            from auto_blogger import _ollama_generate
+            ollama_host = os.getenv("OLLAMA_HOST", "https://ollama.com")
+            writing_models = [m.strip() for m in (os.getenv("OLLAMA_WRITING_MODELS", "") or "").split(",") if m.strip()] \
+                or ["cogito-2.1:671b", "qwen3-coder:480b", "nemotron-3-super", "gpt-oss:120b"]
+            cfg = {
+                "provider": "ollama_cloud",
+                "writing_models": writing_models,
+                "ollama_key": ollama_key,
+                "ollama_host": ollama_host,
+            }
+            last_err = None
+            briefing = None
+            for model in writing_models:
+                try:
+                    briefing = _ollama_generate(prompt, cfg, json_mode=False, timeout=120, max_tokens=1024, model=model)
+                    break
+                except Exception as e:
+                    last_err = e
+            if briefing is None:
+                raise last_err or RuntimeError("No Ollama model responded")
+        else:
+            gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
+            import requests as _req, json as _json
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
+            resp = _req.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=60)
+            resp.raise_for_status()
+            briefing = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
         briefing = f"ATLAS unavailable: {e}"
 
