@@ -2,7 +2,7 @@ import asyncio
 import os
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -445,6 +445,39 @@ def update_project_status(project: str, body: dict, _admin: dict = Depends(_requ
     return act.update_project_status(project, status, body.get("note", ""))
 
 
+# ── Projects API (founder-facing, human override aware) ───────────────────────
+
+@app.get("/api/projects")
+def list_projects(_admin: dict = Depends(_require_admin)):
+    return tm.get_portfolio()
+
+
+@app.get("/api/projects/portfolio")
+def get_portfolio(_admin: dict = Depends(_require_admin)):
+    return tm.get_portfolio()
+
+
+@app.get("/api/projects/{slug}")
+def get_project_detail(slug: str, _admin: dict = Depends(_require_admin)):
+    p = tm.get_project(slug)
+    if not p:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return p
+
+
+@app.patch("/api/projects/{slug}")
+def update_project_detail(slug: str, body: dict, _admin: dict = Depends(_require_admin)):
+    allowed = {
+        'name', 'description', 'strategic_notes', 'owner_name', 'status',
+        'priority', 'strategic_importance', 'current_blocker', 'next_milestone',
+        'target_launch_date', 'notes', 'note',
+    }
+    updates = {k: v for k, v in body.items() if k in allowed}
+    return tm.update_project(slug, human_edit=True, **updates)
+
+
+# ── Team / collaboration endpoints ────────────────────────────────────────────
+
 @app.get("/api/team/projects")
 def team_list_projects(_admin: dict = Depends(_require_admin)):
     return tm.get_projects()
@@ -502,10 +535,22 @@ async def github_webhook(request: Request):
     import json as _json
     payload  = _json.loads(body)
     gh_event = request.headers.get("X-GitHub-Event", "")
-    event    = act.parse_github_event(gh_event, payload)
-    if event:
+    parsed = act.parse_github_event(gh_event, payload)
+    if parsed:
         try:
-            act.create_event(event)
+            act.create_event(parsed)
+            project_slug = parsed.get('project')
+            repo = (parsed.get('metadata_json') or {}).get('repo')
+            if project_slug and project_slug != 'other':
+                now_ts = datetime.now(timezone.utc).isoformat()
+                gh_update: dict = {'last_activity_at': now_ts, 'primary_repo': repo or project_slug}
+                if gh_event == 'push':
+                    gh_update['last_commit_at'] = now_ts
+                elif gh_event == 'pull_request':
+                    gh_update['last_pr_at'] = now_ts
+                elif gh_event == 'deployment_status':
+                    gh_update['last_deploy_at'] = now_ts
+                tm.update_github_fields(project_slug, **gh_update)
         except Exception as e:
             print(f"[activity] GitHub webhook storage error: {e}")
     return {"status": "ok"}
