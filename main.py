@@ -17,6 +17,7 @@ import db
 import indexer
 import activity as act
 import team as tm
+import authority as auth
 
 app = FastAPI(title="Lumynor Systems Engine")
 
@@ -462,6 +463,44 @@ def sync_projects(_admin: dict = Depends(_require_admin)):
     """Create project rows for any event slugs not yet in the projects table."""
     created = tm.sync_projects_from_events()
     return {"created": created, "count": len(created)}
+
+
+# ── Authority OS ───────────────────────────────────────────────────────────────
+
+@app.get("/api/authority/opportunities")
+def list_opportunities(
+    status: str = None,
+    project_slug: str = None,
+    _admin: dict = Depends(_require_admin),
+):
+    return auth.get_opportunities(status=status, project_slug=project_slug)
+
+
+@app.post("/api/authority/scan")
+def scan_opportunities(_admin: dict = Depends(_require_admin)):
+    created = auth.scan_opportunities()
+    return {"created": created, "count": len(created)}
+
+
+@app.patch("/api/authority/opportunities/{opp_id}")
+def update_opportunity(opp_id: str, body: dict, _admin: dict = Depends(_require_admin)):
+    allowed = {"status", "title", "summary", "why_it_matters", "suggested_angle", "importance_score"}
+    updates = {k: v for k, v in body.items() if k in allowed}
+    result = auth.update_opportunity(opp_id, **updates)
+    if not result:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+    return result
+
+
+@app.delete("/api/authority/opportunities/{opp_id}")
+def delete_opportunity(opp_id: str, _admin: dict = Depends(_require_admin)):
+    auth.delete_opportunity(opp_id)
+    return {"deleted": opp_id}
+
+
+@app.get("/api/authority/weekly")
+def weekly_authority(_admin: dict = Depends(_require_admin)):
+    return auth.get_weekly_summary()
 
 
 @app.get("/api/projects/{slug}")
