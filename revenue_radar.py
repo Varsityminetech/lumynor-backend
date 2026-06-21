@@ -591,37 +591,35 @@ def _compute_lead_score(data: dict) -> int:
     LLM extracts raw fields; this function computes the score consistently.
 
     Breakdown:
-      Data completeness  — 35 pts  (contacts we can actually reach them on)
-      Social presence    — 25 pts  (Instagram, Facebook, LinkedIn, Twitter)
-      Reviews            — 25 pts  (rating + count prove they're a real operating business)
-      Authenticity       — 15 pts  (address, established year, verified badge)
+      Reachability   — 40 pts  (phone/WhatsApp is the primary outreach channel)
+      Online presence — 25 pts  (website + social profiles)
+      Reviews         — 25 pts  (rating + review count = proven operating business)
+      Authenticity    — 10 pts  (address, established year, verified)
     """
     score = 0
 
-    # ── Data completeness (35 pts) ────────────────────────────────────────────
+    # ── Reachability (40 pts) ─────────────────────────────────────────────────
     if data.get("company_name", "").strip():          score += 5
-    if data.get("phone") or data.get("whatsapp"):     score += 10
-    if data.get("contact_email"):                     score += 7
-    if data.get("website"):                           score += 7
+    if data.get("phone") or data.get("whatsapp"):     score += 20  # primary outreach — highest weight
+    if data.get("contact_email"):                     score += 8
+    if data.get("address"):                           score += 4
     if data.get("location"):                          score += 3
-    if data.get("buying_signals"):                    score += 3
 
-    # ── Social presence (25 pts) ──────────────────────────────────────────────
-    if data.get("instagram_url"):   score += 10
-    if data.get("facebook_url"):    score += 8
-    if data.get("linkedin_url"):    score += 5
-    if data.get("twitter_url"):     score += 2
+    # ── Online presence (25 pts) ──────────────────────────────────────────────
+    if data.get("website"):           score += 8
+    if data.get("instagram_url"):     score += 8
+    if data.get("facebook_url"):      score += 5
+    if data.get("linkedin_url"):      score += 3
+    if data.get("twitter_url"):       score += 1
 
     # ── Reviews (25 pts) ──────────────────────────────────────────────────────
     rating = float(data.get("review_rating") or 0)
     count  = int(data.get("review_count") or 0)
     if count > 0:
-        # Rating quality
         if rating >= 4.0:   score += 10
         elif rating >= 3.5: score += 7
         elif rating >= 3.0: score += 4
         else:               score += 2
-        # Volume of social proof
         if count >= 200:   score += 15
         elif count >= 100: score += 12
         elif count >= 50:  score += 9
@@ -629,10 +627,9 @@ def _compute_lead_score(data: dict) -> int:
         elif count >= 5:   score += 3
         else:              score += 1
 
-    # ── Authenticity (15 pts) ─────────────────────────────────────────────────
-    if data.get("address"):            score += 5
-    if data.get("established_year"):   score += 5
-    if data.get("verified"):           score += 5
+    # ── Authenticity (10 pts) ─────────────────────────────────────────────────
+    if data.get("established_year"):  score += 5
+    if data.get("verified"):          score += 5
 
     return min(100, score)
 
