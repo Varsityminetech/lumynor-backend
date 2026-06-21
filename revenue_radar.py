@@ -100,46 +100,137 @@ DISCOVERY_QUERIES = {
     },
 }
 
-# Location-specific query templates — {city} is substituted at runtime
-# These are intentionally direct and local-directory-friendly
+# Location-specific query templates — {city} substituted at runtime.
+# Goal: maximum surface area. We want every business in the category, not just "professional" ones.
+# Includes directory-specific, social, contact-number, and platform searches.
 LOCATION_QUERY_TEMPLATES = {
     'district21': {
         'event_organizer': [
+            # Generic — cast widest net first
             'event organizer {city}',
             'event management company {city}',
-            'best event planner {city}',
-            'event management services {city} India',
-            'wedding event organizer {city}',
+            'event planner {city}',
+            'event management {city}',
+            'best event organizer {city}',
+            # Subcategory terms (wedding/corporate/birthday all count)
+            'wedding planner {city}',
+            'corporate event management {city}',
+            'birthday party organizer {city}',
+            'event decorator {city}',
+            'party organizer {city}',
+            # Directory searches — these pages list multiple businesses with phone numbers
+            'event organizer {city} site:justdial.com',
+            'event management {city} site:sulekha.com',
+            'event planner {city} site:indiamart.com',
+            'event organizer {city} site:indiacom.com',
+            'event management company {city} contact number',
+            # Social
+            'event organizer {city} Instagram',
+            'event management company {city} Facebook',
+            # Platform / listing
+            'event organizer {city} WedMeGood',
+            'event planner {city} ShaadiSaga',
+            'event company {city} Wedbook',
+            # Contact-intent
+            'event organizer {city} phone mobile contact',
         ],
         'event_company': [
             'event company {city}',
-            'event production {city} India',
-            'entertainment event company {city}',
+            'event production company {city}',
+            'entertainment company {city}',
+            'event management agency {city}',
+            'experiential marketing {city}',
+            'event company {city} site:justdial.com',
+            'event production {city} site:sulekha.com',
+            'entertainment agency {city} contact number',
+            'event company {city} Instagram',
         ],
         'venue': [
-            'event venue {city}',
             'banquet hall {city}',
-            'wedding venue {city} India',
+            'event venue {city}',
+            'wedding venue {city}',
+            'party hall {city}',
+            'conference hall {city}',
+            'banquet hall {city} site:justdial.com',
+            'wedding venue {city} site:sulekha.com',
+            'banquet hall {city} contact phone',
+            'marriage garden {city}',
+            'farmhouse event venue {city}',
         ],
         'college': [
-            'college event organizer {city}',
-            'cultural fest management {city}',
+            'college cultural fest {city}',
+            'university event committee {city}',
+            'college event management society {city}',
+            'student union {city} college',
+            'management college fest {city}',
         ],
         'festival': [
             'festival organizer {city}',
-            'music festival company {city} India',
+            'music festival {city}',
+            'cultural festival company {city}',
+            'mela organizer {city}',
+            'fair organizer {city} India',
+            'festival management company {city}',
         ],
     },
     'agentforge': {
-        'saas_founder':   ['SaaS startup {city}', 'tech startup founder {city} India'],
-        'startup_studio': ['startup studio {city} India', 'venture builder {city}'],
-        'agency':         ['software agency {city} India', 'tech agency {city}'],
-        'consultant':     ['AI consultant {city} India', 'tech consultant {city}'],
+        'saas_founder': [
+            'SaaS startup {city}',
+            'tech startup {city}',
+            'software startup founder {city}',
+            'B2B SaaS company {city}',
+            'SaaS product company {city}',
+            'tech founder {city} India',
+            'startup {city} site:linkedin.com',
+            'SaaS company {city} contact',
+        ],
+        'startup_studio': [
+            'startup studio {city}',
+            'venture builder {city}',
+            'startup incubator {city}',
+            'startup accelerator {city}',
+            'product studio {city} India',
+        ],
+        'agency': [
+            'software development agency {city}',
+            'tech agency {city}',
+            'IT company {city}',
+            'digital agency {city}',
+            'web development company {city}',
+            'software company {city} site:justdial.com',
+            'IT company {city} contact',
+        ],
+        'consultant': [
+            'AI consultant {city}',
+            'technology consultant {city}',
+            'IT consultant {city}',
+            'tech consultant freelance {city}',
+            'business automation consultant {city}',
+        ],
     },
     'linkforge': {
-        'seo_agency':       ['SEO agency {city} India', 'digital marketing agency {city}'],
-        'saas_company':     ['SaaS company {city} India'],
-        'content_business': ['content marketing agency {city}', 'media company {city}'],
+        'seo_agency': [
+            'SEO agency {city}',
+            'digital marketing agency {city}',
+            'SEO company {city}',
+            'link building agency {city}',
+            'digital marketing company {city} site:justdial.com',
+            'SEO agency {city} contact phone',
+            'online marketing company {city}',
+        ],
+        'saas_company': [
+            'SaaS company {city}',
+            'software product company {city}',
+            'B2B software company {city}',
+            'SaaS startup {city} India',
+        ],
+        'content_business': [
+            'content marketing agency {city}',
+            'content writing company {city}',
+            'media company {city}',
+            'blog publishing company {city}',
+            'digital content agency {city}',
+        ],
     },
 }
 
@@ -248,6 +339,8 @@ def create_lead(data: dict, source: str = 'manual') -> dict:
         "website":         data.get("website", "").strip(),
         "linkedin_url":    data.get("linkedin_url", "").strip(),
         "contact_email":   data.get("contact_email", "").strip(),
+        "phone":           data.get("phone", "").strip(),
+        "whatsapp":        data.get("whatsapp", "").strip(),
         "location":        data.get("location", "").strip(),
         "product_target":  data.get("product_target", ""),
         "category":        data.get("category", ""),
@@ -270,9 +363,9 @@ def update_lead(lead_id: str, data: dict) -> dict:
     if not sb:
         return {}
     allowed = {"company_name", "website", "linkedin_url", "contact_email",
-               "location", "category", "temperature", "relevance_score",
-               "business_size", "digital_maturity", "buying_signals",
-               "notes", "status", "source_url"}
+               "phone", "whatsapp", "location", "category", "temperature",
+               "relevance_score", "business_size", "digital_maturity",
+               "buying_signals", "notes", "status", "source_url"}
     payload = {k: v for k, v in data.items() if k in allowed}
     payload["updated_at"] = _now()
     res = sb.table("revenue_leads").update(payload).eq("id", lead_id).execute()
@@ -308,73 +401,83 @@ def _score_result(result: dict, product: str, category: str) -> dict | None:
     Returns a structured lead dict, or None if the result fails the quality gate.
     """
     meta = PRODUCT_META[product]
-    prompt = f"""You are evaluating a search result to determine if it represents a genuine, high-quality sales lead for {meta['name']}.
+    prompt = f"""You are a lead extraction engine. Your job is to pull structured contact data from search results for our sales database.
 
-Product: {meta['name']}
+Product we sell: {meta['name']}
 Product description: {meta['description']}
-Target audience: {meta['target_description']}
-Category being searched: {category}
+Target category: {category}
 
-Search result:
+Search result to extract from:
 Title: {result.get('title', '')}
 URL: {result.get('url', '')}
 Snippet: {result.get('snippet', '')}
 
-Evaluate this result and respond ONLY with a JSON object:
+Extract ALL contact information available and respond ONLY with this JSON:
 {{
-  "company_name": "exact company name (empty string if not identifiable)",
-  "website": "clean root domain URL e.g. https://acme.com (empty string if not found)",
-  "linkedin_url": "LinkedIn company page URL if visible in title/snippet/URL, else empty string",
-  "contact_email": "any contact email found in snippet, else empty string",
-  "location": "city/country or empty string",
+  "company_name": "name of the business (empty if completely unidentifiable)",
+  "website": "company website URL — NOT the directory URL, the actual company site (empty if not found)",
+  "linkedin_url": "LinkedIn page if visible, else empty",
+  "contact_email": "any email address found, else empty",
+  "phone": "any phone/mobile number found in snippet — keep full format including country code e.g. +91-98765-43210, else empty",
+  "whatsapp": "WhatsApp number if explicitly mentioned, else same as phone if phone found, else empty",
+  "location": "city and state extracted from result, else empty",
   "relevance_score": 0-100,
   "business_size": "startup|smb|enterprise",
   "digital_maturity": "basic|intermediate|advanced",
-  "buying_signals": "specific signals that suggest they might need this product, or empty string",
+  "buying_signals": "any signals they need this product, else empty",
   "temperature": "hot|warm|cold",
   "should_include": true or false,
-  "reject_reason": "why rejected, or empty string if included"
+  "reject_reason": "only if rejecting"
 }}
 
-Rules for should_include=true:
-- Must be a REAL, IDENTIFIABLE business with a clear company name
-- relevance_score must be >= 50
-- Must actually match the target category
-- Source may be a local business directory (JustDial, Sulekha, IndiaMart, Indiacom etc.) — extract the LISTED BUSINESS, not the directory itself
-- A local Indian business with minimal web presence is still a valid lead if it clearly operates in the target category
-- Set should_include=false for: news articles, blog posts, generic "Top 10 lists", government websites, or if no real company name can be extracted
-
-Be practical. A local event organizer in a smaller Indian city is exactly our target customer."""
+Rules:
+- should_include=true if a real business name can be identified AND it clearly operates in the {category} category
+- relevance_score is a DATA COMPLETENESS score, NOT a quality judgement:
+    * 90-100: has company name + phone/WhatsApp + email + website + location + description
+    * 70-89:  has company name + phone/WhatsApp + at least 2 other fields
+    * 50-69:  has company name + phone OR email + location
+    * 30-49:  has company name + location only, or company name + one contact method
+    * Below 30: company name is unclear or unverifiable
+- temperature: "hot" if they have active event/project pipeline visible; "warm" if established business; "cold" if minimal info
+- Directory pages (JustDial, Sulekha, IndiaMart): extract the LISTED BUSINESS details, ignore the directory itself
+- Phone numbers in Indian snippets: +91-XXXXX-XXXXX or 0XXXXXXXXXX — extract them exactly as shown
+- should_include=false ONLY for: pure news articles, government pages, Wikipedia, "Top 10 lists" with no extractable business, or completely unidentifiable source
+- When in doubt, INCLUDE it — our founder reviews before outreach"""
 
     try:
-        raw = _llm(prompt, json_mode=True, max_tokens=400)
+        raw = _llm(prompt, json_mode=True, max_tokens=500)
         scored = _extract_json(raw)
         if not scored:
             return None
         if not scored.get("should_include"):
             return None
-        if scored.get("relevance_score", 0) < 50:
+        if scored.get("relevance_score", 0) < 30:
             return None
         if not scored.get("company_name", "").strip():
             return None
         website = scored.get("website", "").strip()
-        # If LLM didn't extract a clean website but the source URL is a real domain, use it
         if not website and result.get("url", "").startswith("http"):
             url = result["url"]
-            # Only use source URL as website if it's not LinkedIn/social/directory
-            skip_domains = ("linkedin.com", "facebook.com", "twitter.com", "x.com",
-                            "instagram.com", "wikipedia.org", "indiamart.com",
-                            "justdial.com", "yelp.com", "yellowpages")
-            if not any(d in url for d in skip_domains):
+            social_dirs = ("linkedin.com", "facebook.com", "twitter.com", "x.com",
+                           "instagram.com", "wikipedia.org", "indiamart.com",
+                           "justdial.com", "sulekha.com", "yelp.com", "yellowpages",
+                           "indiacom.com", "tradeindia.com")
+            if not any(d in url for d in social_dirs):
                 from urllib.parse import urlparse
                 parsed = urlparse(url)
                 website = f"{parsed.scheme}://{parsed.netloc}"
+
+        # Copy phone → whatsapp if whatsapp empty but phone found (very common in India)
+        phone = scored.get("phone", "").strip()
+        whatsapp = scored.get("whatsapp", "").strip() or phone
 
         return {
             "company_name":    scored["company_name"].strip(),
             "website":         website,
             "linkedin_url":    scored.get("linkedin_url", "").strip(),
             "contact_email":   scored.get("contact_email", "").strip(),
+            "phone":           phone,
+            "whatsapp":        whatsapp,
             "location":        scored.get("location", "").strip(),
             "product_target":  product,
             "category":        category,
@@ -404,7 +507,7 @@ def run_auto_discovery(product: str, category: str, limit: int = 10, location: s
     if category not in DISCOVERY_QUERIES.get(product, {}):
         return {"error": f"Unknown category '{category}' for {product}"}
 
-    limit = min(limit, 25)  # hard cap at 25 per scan
+    limit = min(limit, 100)  # hard cap at 100 per scan
     location = location.strip()
     base_queries = DISCOVERY_QUERIES[product][category]
 
@@ -431,7 +534,7 @@ def run_auto_discovery(product: str, category: str, limit: int = 10, location: s
     for query in queries:
         if saved >= limit:
             break
-        results = _search(query, num=10)
+        results = _search(query, num=15)
         searched += len(results)
         for result in results:
             if saved >= limit:
