@@ -324,28 +324,49 @@ def _search_multi(query: str, num: int = 10, india_region: bool = False) -> list
     except Exception as e:
         print(f"[search] DDGS global error: {e}")
 
-    # 3. Bing — no API key needed, different index from DDG
-    try:
-        import requests as _req
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"}
-        r = _req.get(
-            "https://www.bing.com/search",
-            params={"q": query, "count": num, "mkt": "en-IN" if india_region else "en-US"},
-            headers=headers, timeout=8
-        )
-        if r.ok:
-            import re as _re
-            # Extract title+URL from Bing HTML result snippets
-            titles = _re.findall(r'<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', r.text)
-            snippets = _re.findall(r'<p class="b_algoSlug"[^>]*>(.*?)</p>', r.text)
-            for i, (url, title) in enumerate(titles[:num]):
-                if url.startswith("http") and "bing.com" not in url:
-                    snippet = snippets[i] if i < len(snippets) else ""
-                    # Strip HTML tags from snippet
-                    snippet = _re.sub(r'<[^>]+>', '', snippet)
-                    _add([{"title": _re.sub(r'<[^>]+>', '', title), "url": url, "snippet": snippet}])
-    except Exception as e:
-        print(f"[search] Bing error: {e}")
+    # 3. Google Custom Search API — best quality, requires GOOGLE_CSE_KEY + GOOGLE_CSE_ID env vars
+    import os as _os
+    gkey = _os.environ.get("GOOGLE_CSE_KEY", "")
+    gcx  = _os.environ.get("GOOGLE_CSE_ID", "")
+    if gkey and gcx:
+        try:
+            import requests as _req
+            # Google CSE returns max 10 per request; gl=in biases toward India results
+            params = {
+                "key": gkey, "cx": gcx, "q": query,
+                "num": min(num, 10),
+                "gl": "in" if india_region else "us",   # geolocation
+                "lr": "lang_en",
+            }
+            r = _req.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=10)
+            if r.ok:
+                for item in r.json().get("items", []):
+                    _add([{
+                        "title":   item.get("title", ""),
+                        "url":     item.get("link", ""),
+                        "snippet": item.get("snippet", ""),
+                    }])
+        except Exception as e:
+            print(f"[search] Google CSE error: {e}")
+    else:
+        # Fallback: Bing HTML scrape when Google keys not configured
+        try:
+            import requests as _req, re as _re
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            r = _req.get(
+                "https://www.bing.com/search",
+                params={"q": query, "count": num, "mkt": "en-IN" if india_region else "en-US"},
+                headers=headers, timeout=8,
+            )
+            if r.ok:
+                titles   = _re.findall(r'<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', r.text)
+                snippets = _re.findall(r'<p class="b_algoSlug"[^>]*>(.*?)</p>', r.text)
+                for i, (url, title) in enumerate(titles[:num]):
+                    if url.startswith("http") and "bing.com" not in url:
+                        snip = _re.sub(r'<[^>]+>', '', snippets[i] if i < len(snippets) else "")
+                        _add([{"title": _re.sub(r'<[^>]+>', '', title), "url": url, "snippet": snip}])
+        except Exception as e:
+            print(f"[search] Bing fallback error: {e}")
 
     return combined
 
