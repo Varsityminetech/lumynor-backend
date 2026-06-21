@@ -371,6 +371,59 @@ def _search_places(phrase: str, city: str) -> list:
     return results
 
 
+def _enrich_contacts(name: str, city: str) -> dict:
+    """
+    Given a confirmed business name + city, run targeted searches to find
+    their WhatsApp, phone, Instagram, Facebook, email, and website.
+    Returns a dict of found contact fields (empty strings for not found).
+    """
+    queries = [
+        f'"{name}" {city} WhatsApp phone number',
+        f'"{name}" {city} Instagram',
+        f'"{name}" {city} contact',
+    ]
+    snippets = []
+    for q in queries:
+        hits = _search_multi(q, num=5, india_region=True)
+        for h in hits[:3]:
+            parts = []
+            if h.get("title"):   parts.append(h["title"])
+            if h.get("snippet"): parts.append(h["snippet"])
+            if h.get("url"):     parts.append(h["url"])
+            if parts:
+                snippets.append(" | ".join(parts))
+
+    if not snippets:
+        return {}
+
+    combined = "\n".join(snippets[:9])
+    prompt = f"""Extract contact info for the business "{name}" in {city} from these search results.
+Only extract info that clearly belongs to THIS specific business, not other businesses.
+
+{combined}
+
+Respond ONLY with JSON:
+{{
+  "phone": "phone/mobile with country code if found (e.g. +91-98765-43210), else empty",
+  "whatsapp": "WhatsApp number if explicitly mentioned, else same as phone if found, else empty",
+  "contact_email": "email address if found, else empty",
+  "website": "company own website URL (not JustDial/Sulekha/directory), else empty",
+  "instagram_url": "Instagram profile URL or @handle if found, else empty",
+  "facebook_url": "Facebook page URL if found, else empty",
+  "linkedin_url": "LinkedIn URL if found, else empty"
+}}"""
+    try:
+        raw = _llm(prompt, json_mode=True, max_tokens=300)
+        result = _extract_json(raw) or {}
+        found = [k for k, v in result.items() if v]
+        if found:
+            print(f"[enrich] {name!r} → found: {', '.join(found)}")
+        return result
+    except Exception as e:
+        print(f"[enrich] error for {name!r}: {e}")
+        return {}
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _now() -> str:
@@ -903,7 +956,7 @@ def run_auto_discovery(product: str, category: str, limit: int = 10, location: s
             return lead
         return None
 
-    # ── Pass 1: Google Places API (structured local business data — most reliable) ──
+    # ── Pass 1: Google Places API + contact enrichment ────────────────────────────
     if city:
         place_phrases = _PLACES_QUERIES.get(product, {}).get(category, [])
         for phrase in place_phrases:
@@ -914,6 +967,22 @@ def run_auto_discovery(product: str, category: str, limit: int = 10, location: s
             for result in place_results:
                 if saved >= limit:
                     break
+                # Extract business name from title ("ABC Events - Udaipur" → "ABC Events")
+                biz_name = result["title"].split(" - ")[0].strip()
+                # Search for contact details we can't get from Places alone
+                extra = _enrich_contacts(biz_name, city)
+                if extra:
+                    extra_parts = []
+                    if extra.get("phone"):         extra_parts.append(f"Phone: {extra['phone']}")
+                    if extra.get("whatsapp"):      extra_parts.append(f"WhatsApp: {extra['whatsapp']}")
+                    if extra.get("contact_email"): extra_parts.append(f"Email: {extra['contact_email']}")
+                    if extra.get("website"):       extra_parts.append(f"Website: {extra['website']}")
+                    if extra.get("instagram_url"): extra_parts.append(f"Instagram: {extra['instagram_url']}")
+                    if extra.get("facebook_url"):  extra_parts.append(f"Facebook: {extra['facebook_url']}")
+                    if extra.get("linkedin_url"):  extra_parts.append(f"LinkedIn: {extra['linkedin_url']}")
+                    if extra_parts:
+                        result = dict(result)
+                        result["snippet"] = result["snippet"] + " | " + " | ".join(extra_parts)
                 _process_result(result)
 
     # ── Pass 2: Multi-engine web search (Google CSE + DDG India + Bing) ───────────
