@@ -2425,6 +2425,102 @@ async def weekly_intel_daemon():
             print(f"[weekly_intel] auto-generate error: {e}")
         await _aio.sleep(3600)  # check hourly
 
+# ── Revenue Radar OS — Phase 2 ────────────────────────────────────────────────
+import revenue_radar as rr
+
+# Leads
+@app.get("/api/revenue/leads")
+def revenue_leads_list(
+    product: str = None, temperature: str = None,
+    status: str = None, category: str = None, limit: int = 100,
+    user=Depends(_require_admin)
+):
+    return rr.get_leads(product=product, temperature=temperature,
+                        status=status, category=category, limit=limit)
+
+@app.post("/api/revenue/leads")
+def revenue_lead_create(body: dict, user=Depends(_require_admin)):
+    lead = rr.create_lead(body, source='manual')
+    if not lead:
+        raise HTTPException(status_code=500, detail="Failed to create lead")
+    return lead
+
+@app.patch("/api/revenue/leads/{lead_id}")
+def revenue_lead_update(lead_id: str, body: dict, user=Depends(_require_admin)):
+    return rr.update_lead(lead_id, body)
+
+@app.delete("/api/revenue/leads/{lead_id}")
+def revenue_lead_delete(lead_id: str, user=Depends(_require_admin)):
+    rr.delete_lead(lead_id)
+    return {"ok": True}
+
+@app.post("/api/revenue/leads/{lead_id}/approve")
+def revenue_lead_approve(lead_id: str, user=Depends(_require_admin)):
+    return rr.approve_lead(lead_id)
+
+@app.post("/api/revenue/leads/{lead_id}/reject")
+def revenue_lead_reject(lead_id: str, user=Depends(_require_admin)):
+    return rr.reject_lead(lead_id)
+
+# Auto-discovery
+@app.post("/api/revenue/discover")
+def revenue_discover(body: dict, user=Depends(_require_admin)):
+    product  = body.get("product", "")
+    category = body.get("category", "")
+    limit    = int(body.get("limit", 10))
+    return rr.run_auto_discovery(product, category, limit)
+
+# Contacts
+@app.get("/api/revenue/contacts")
+def revenue_contacts_list(lead_id: str, user=Depends(_require_admin)):
+    return rr.get_contacts(lead_id)
+
+@app.post("/api/revenue/contacts")
+def revenue_contact_create(body: dict, user=Depends(_require_admin)):
+    return rr.create_contact(body)
+
+@app.patch("/api/revenue/contacts/{contact_id}")
+def revenue_contact_update(contact_id: str, body: dict, user=Depends(_require_admin)):
+    return rr.update_contact(contact_id, body)
+
+@app.delete("/api/revenue/contacts/{contact_id}")
+def revenue_contact_delete(contact_id: str, user=Depends(_require_admin)):
+    rr.delete_contact(contact_id)
+    return {"ok": True}
+
+# Market Radar
+@app.get("/api/revenue/signals")
+def revenue_signals_list(product: str = None, user=Depends(_require_admin)):
+    return rr.get_signals(product=product)
+
+@app.post("/api/revenue/signals/scan")
+def revenue_signals_scan(body: dict, user=Depends(_require_admin)):
+    product = body.get("product", "all")
+    return rr.run_market_scan(product)
+
+@app.delete("/api/revenue/signals/{signal_id}")
+def revenue_signal_dismiss(signal_id: str, user=Depends(_require_admin)):
+    rr.dismiss_signal(signal_id)
+    return {"ok": True}
+
+# Launch Readiness
+@app.get("/api/revenue/readiness")
+def revenue_readiness(user=Depends(_require_admin)):
+    return rr.get_launch_readiness()
+
+# Discovery query catalogue (for frontend dropdowns)
+@app.get("/api/revenue/catalogue")
+def revenue_catalogue(user=Depends(_require_admin)):
+    return {
+        prod: {
+            "name": meta["name"],
+            "categories": meta["categories"],
+            "category_queries": list(rr.DISCOVERY_QUERIES.get(prod, {}).keys()),
+        }
+        for prod, meta in rr.PRODUCT_META.items()
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
