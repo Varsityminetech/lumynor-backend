@@ -335,24 +335,33 @@ def create_lead(data: dict, source: str = 'manual') -> dict:
     if not sb:
         return {}
     payload = {
-        "company_name":    data.get("company_name", "").strip(),
-        "website":         data.get("website", "").strip(),
-        "linkedin_url":    data.get("linkedin_url", "").strip(),
-        "contact_email":   data.get("contact_email", "").strip(),
-        "phone":           data.get("phone", "").strip(),
-        "whatsapp":        data.get("whatsapp", "").strip(),
-        "location":        data.get("location", "").strip(),
-        "product_target":  data.get("product_target", ""),
-        "category":        data.get("category", ""),
-        "temperature":     data.get("temperature", "cold"),
-        "relevance_score": int(data.get("relevance_score", 0)),
-        "business_size":   data.get("business_size", "smb"),
+        "company_name":     data.get("company_name", "").strip(),
+        "website":          data.get("website", "").strip(),
+        "linkedin_url":     data.get("linkedin_url", "").strip(),
+        "instagram_url":    data.get("instagram_url", "").strip(),
+        "facebook_url":     data.get("facebook_url", "").strip(),
+        "twitter_url":      data.get("twitter_url", "").strip(),
+        "contact_email":    data.get("contact_email", "").strip(),
+        "phone":            data.get("phone", "").strip(),
+        "whatsapp":         data.get("whatsapp", "").strip(),
+        "address":          data.get("address", "").strip(),
+        "location":         data.get("location", "").strip(),
+        "review_rating":    data.get("review_rating"),
+        "review_count":     int(data.get("review_count") or 0),
+        "review_platform":  data.get("review_platform", "").strip(),
+        "established_year": data.get("established_year"),
+        "verified":         bool(data.get("verified", False)),
+        "product_target":   data.get("product_target", ""),
+        "category":         data.get("category", ""),
+        "temperature":      data.get("temperature", "cold"),
+        "relevance_score":  int(data.get("relevance_score", 0)),
+        "business_size":    data.get("business_size", "smb"),
         "digital_maturity": data.get("digital_maturity", "basic"),
-        "buying_signals":  data.get("buying_signals", ""),
-        "source":          source,
-        "source_url":      data.get("source_url", ""),
-        "notes":           data.get("notes", ""),
-        "status":          "confirmed" if source == "manual" else "pending_review",
+        "buying_signals":   data.get("buying_signals", ""),
+        "source":           source,
+        "source_url":       data.get("source_url", ""),
+        "notes":            data.get("notes", ""),
+        "status":           "confirmed" if source == "manual" else "pending_review",
     }
     res = sb.table("revenue_leads").insert(payload).execute()
     return (res.data or [{}])[0]
@@ -362,10 +371,13 @@ def update_lead(lead_id: str, data: dict) -> dict:
     sb = _sb()
     if not sb:
         return {}
-    allowed = {"company_name", "website", "linkedin_url", "contact_email",
-               "phone", "whatsapp", "location", "category", "temperature",
-               "relevance_score", "business_size", "digital_maturity",
-               "buying_signals", "notes", "status", "source_url"}
+    allowed = {"company_name", "website", "linkedin_url", "instagram_url",
+               "facebook_url", "twitter_url", "contact_email", "phone",
+               "whatsapp", "address", "location", "review_rating",
+               "review_count", "review_platform", "established_year",
+               "verified", "category", "temperature", "relevance_score",
+               "business_size", "digital_maturity", "buying_signals",
+               "notes", "status", "source_url"}
     payload = {k: v for k, v in data.items() if k in allowed}
     payload["updated_at"] = _now()
     res = sb.table("revenue_leads").update(payload).eq("id", lead_id).execute()
@@ -395,67 +407,120 @@ def _existing_company_names(product: str) -> set:
     return {_normalize_company(l.get("company_name", "")) for l in leads}
 
 
+def _compute_lead_score(data: dict) -> int:
+    """
+    Deterministic score from 0-100 based on extracted lead signals.
+    LLM extracts raw fields; this function computes the score consistently.
+
+    Breakdown:
+      Data completeness  — 35 pts  (contacts we can actually reach them on)
+      Social presence    — 25 pts  (Instagram, Facebook, LinkedIn, Twitter)
+      Reviews            — 25 pts  (rating + count prove they're a real operating business)
+      Authenticity       — 15 pts  (address, established year, verified badge)
+    """
+    score = 0
+
+    # ── Data completeness (35 pts) ────────────────────────────────────────────
+    if data.get("company_name", "").strip():          score += 5
+    if data.get("phone") or data.get("whatsapp"):     score += 10
+    if data.get("contact_email"):                     score += 7
+    if data.get("website"):                           score += 7
+    if data.get("location"):                          score += 3
+    if data.get("buying_signals"):                    score += 3
+
+    # ── Social presence (25 pts) ──────────────────────────────────────────────
+    if data.get("instagram_url"):   score += 10
+    if data.get("facebook_url"):    score += 8
+    if data.get("linkedin_url"):    score += 5
+    if data.get("twitter_url"):     score += 2
+
+    # ── Reviews (25 pts) ──────────────────────────────────────────────────────
+    rating = float(data.get("review_rating") or 0)
+    count  = int(data.get("review_count") or 0)
+    if count > 0:
+        # Rating quality
+        if rating >= 4.0:   score += 10
+        elif rating >= 3.5: score += 7
+        elif rating >= 3.0: score += 4
+        else:               score += 2
+        # Volume of social proof
+        if count >= 200:   score += 15
+        elif count >= 100: score += 12
+        elif count >= 50:  score += 9
+        elif count >= 20:  score += 6
+        elif count >= 5:   score += 3
+        else:              score += 1
+
+    # ── Authenticity (15 pts) ─────────────────────────────────────────────────
+    if data.get("address"):            score += 5
+    if data.get("established_year"):   score += 5
+    if data.get("verified"):           score += 5
+
+    return min(100, score)
+
+
 def _score_result(result: dict, product: str, category: str) -> dict | None:
     """
-    Ask the LLM to evaluate a single search result.
-    Returns a structured lead dict, or None if the result fails the quality gate.
+    LLM extracts all available signals from a search result.
+    Score is computed deterministically by _compute_lead_score().
+    Returns a structured lead dict or None if result is not a real business.
     """
     meta = PRODUCT_META[product]
-    prompt = f"""You are a lead extraction engine. Your job is to pull structured contact data from search results for our sales database.
+    prompt = f"""You are a lead data extraction engine. Extract every available signal from this search result for our sales database.
 
 Product we sell: {meta['name']}
-Product description: {meta['description']}
 Target category: {category}
 
-Search result to extract from:
+Search result:
 Title: {result.get('title', '')}
 URL: {result.get('url', '')}
 Snippet: {result.get('snippet', '')}
 
-Extract ALL contact information available and respond ONLY with this JSON:
+Respond ONLY with this JSON — extract everything you can see, leave fields empty string/null if not found:
 {{
-  "company_name": "name of the business (empty if completely unidentifiable)",
-  "website": "company website URL — NOT the directory URL, the actual company site (empty if not found)",
-  "linkedin_url": "LinkedIn page if visible, else empty",
-  "contact_email": "any email address found, else empty",
-  "phone": "any phone/mobile number found in snippet — keep full format including country code e.g. +91-98765-43210, else empty",
+  "company_name": "name of the business (not the directory — the LISTED business)",
+  "website": "company's own website URL (not a directory URL — empty if not found)",
+  "linkedin_url": "LinkedIn company/profile URL if visible, else empty",
+  "instagram_url": "Instagram profile URL or handle (e.g. https://instagram.com/xyz or @xyz), else empty",
+  "facebook_url": "Facebook page URL if visible, else empty",
+  "twitter_url": "Twitter/X profile URL if visible, else empty",
+  "contact_email": "any email address visible, else empty",
+  "phone": "phone/mobile number with country code if shown (e.g. +91-98765-43210), else empty",
   "whatsapp": "WhatsApp number if explicitly mentioned, else same as phone if phone found, else empty",
-  "location": "city and state extracted from result, else empty",
-  "relevance_score": 0-100,
+  "address": "physical street/area address if visible, else empty",
+  "location": "city and state (e.g. Udaipur, Rajasthan), else empty",
+  "review_rating": null or numeric rating e.g. 4.2,
+  "review_count": null or integer number of reviews e.g. 127,
+  "review_platform": "Google|JustDial|Sulekha|Facebook|Yelp|other — whichever platform the reviews are on, else empty",
+  "established_year": null or integer year e.g. 2012,
+  "verified": false or true (true if listing shows verified/trusted badge),
   "business_size": "startup|smb|enterprise",
-  "digital_maturity": "basic|intermediate|advanced",
-  "buying_signals": "any signals they need this product, else empty",
+  "buying_signals": "brief description of why they need our product, else empty",
   "temperature": "hot|warm|cold",
   "should_include": true or false,
-  "reject_reason": "only if rejecting"
+  "reject_reason": "only fill if should_include is false"
 }}
 
-Rules:
-- should_include=true if a real business name can be identified AND it clearly operates in the {category} category
-- relevance_score is a DATA COMPLETENESS score, NOT a quality judgement:
-    * 90-100: has company name + phone/WhatsApp + email + website + location + description
-    * 70-89:  has company name + phone/WhatsApp + at least 2 other fields
-    * 50-69:  has company name + phone OR email + location
-    * 30-49:  has company name + location only, or company name + one contact method
-    * Below 30: company name is unclear or unverifiable
-- temperature: "hot" if they have active event/project pipeline visible; "warm" if established business; "cold" if minimal info
-- Directory pages (JustDial, Sulekha, IndiaMart): extract the LISTED BUSINESS details, ignore the directory itself
-- Phone numbers in Indian snippets: +91-XXXXX-XXXXX or 0XXXXXXXXXX — extract them exactly as shown
-- should_include=false ONLY for: pure news articles, government pages, Wikipedia, "Top 10 lists" with no extractable business, or completely unidentifiable source
-- When in doubt, INCLUDE it — our founder reviews before outreach"""
+Rules for should_include:
+- true: real business name identifiable AND clearly in the {category} category
+- false ONLY for: news articles, Wikipedia, government pages, generic "Top 10" lists with no extractable business, or completely unidentifiable source
+- Directory listings (JustDial, Sulekha, IndiaMart, Indiacom): extract the BUSINESS LISTED, not the directory itself
+- JustDial snippets often have rating like "4.2 ★ · 127 Ratings" — extract those
+- Indian phone formats: +91-XXXXX-XXXXX or 0XXXXXXXXXX or 9XXXXXXXXX — extract as-is
+- When in doubt, include — our founder reviews all auto-discovered leads before outreach"""
 
     try:
-        raw = _llm(prompt, json_mode=True, max_tokens=500)
-        scored = _extract_json(raw)
-        if not scored:
+        raw = _llm(prompt, json_mode=True, max_tokens=600)
+        data = _extract_json(raw)
+        if not data:
             return None
-        if not scored.get("should_include"):
+        if not data.get("should_include"):
             return None
-        if scored.get("relevance_score", 0) < 30:
+        if not data.get("company_name", "").strip():
             return None
-        if not scored.get("company_name", "").strip():
-            return None
-        website = scored.get("website", "").strip()
+
+        # Resolve website — fall back to source URL only if it's not a directory/social
+        website = data.get("website", "").strip()
         if not website and result.get("url", "").startswith("http"):
             url = result["url"]
             social_dirs = ("linkedin.com", "facebook.com", "twitter.com", "x.com",
@@ -467,27 +532,60 @@ Rules:
                 parsed = urlparse(url)
                 website = f"{parsed.scheme}://{parsed.netloc}"
 
-        # Copy phone → whatsapp if whatsapp empty but phone found (very common in India)
-        phone = scored.get("phone", "").strip()
-        whatsapp = scored.get("whatsapp", "").strip() or phone
+        # Instagram from source URL if not extracted by LLM
+        instagram_url = data.get("instagram_url", "").strip()
+        if not instagram_url and "instagram.com" in result.get("url", ""):
+            instagram_url = result["url"]
 
-        return {
-            "company_name":    scored["company_name"].strip(),
+        # Facebook from source URL if not extracted
+        facebook_url = data.get("facebook_url", "").strip()
+        if not facebook_url and "facebook.com" in result.get("url", ""):
+            facebook_url = result["url"]
+
+        phone    = data.get("phone", "").strip()
+        whatsapp = data.get("whatsapp", "").strip() or phone
+
+        # Compute review fields safely
+        try:
+            review_rating = float(data["review_rating"]) if data.get("review_rating") else None
+        except (ValueError, TypeError):
+            review_rating = None
+        try:
+            review_count = int(data["review_count"]) if data.get("review_count") else 0
+        except (ValueError, TypeError):
+            review_count = 0
+        try:
+            established_year = int(data["established_year"]) if data.get("established_year") else None
+        except (ValueError, TypeError):
+            established_year = None
+
+        extracted = {
+            "company_name":    data["company_name"].strip(),
             "website":         website,
-            "linkedin_url":    scored.get("linkedin_url", "").strip(),
-            "contact_email":   scored.get("contact_email", "").strip(),
+            "linkedin_url":    data.get("linkedin_url", "").strip(),
+            "instagram_url":   instagram_url,
+            "facebook_url":    facebook_url,
+            "twitter_url":     data.get("twitter_url", "").strip(),
+            "contact_email":   data.get("contact_email", "").strip(),
             "phone":           phone,
             "whatsapp":        whatsapp,
-            "location":        scored.get("location", "").strip(),
+            "address":         data.get("address", "").strip(),
+            "location":        data.get("location", "").strip(),
+            "review_rating":   review_rating,
+            "review_count":    review_count,
+            "review_platform": data.get("review_platform", "").strip(),
+            "established_year": established_year,
+            "verified":        bool(data.get("verified", False)),
             "product_target":  product,
             "category":        category,
-            "temperature":     scored.get("temperature", "cold"),
-            "relevance_score": min(100, max(0, int(scored.get("relevance_score", 0)))),
-            "business_size":   scored.get("business_size", "smb"),
-            "digital_maturity": scored.get("digital_maturity", "basic"),
-            "buying_signals":  scored.get("buying_signals", ""),
+            "temperature":     data.get("temperature", "cold"),
+            "business_size":   data.get("business_size", "smb"),
+            "buying_signals":  data.get("buying_signals", ""),
             "source_url":      result.get("url", ""),
         }
+        extracted["relevance_score"] = _compute_lead_score(extracted)
+        return extracted
+
     except Exception as e:
         print(f"[revenue_radar] Score error: {e}")
         return None
