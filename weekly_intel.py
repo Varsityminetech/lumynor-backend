@@ -6,7 +6,7 @@ NOT an activity log. Identifies what is happening to Lumynor.
 import re
 import json
 import uuid
-from datetime import datetime, timezone, timedelta, date
+from datetime import datetime, timezone, timedelta
 from db import _sb
 
 
@@ -15,7 +15,7 @@ def _now() -> str:
 
 
 def _week_bounds() -> tuple[str, str]:
-    """Monday–Sunday of the current/most recent complete week (previous 7 days)."""
+    """Rolling 7-day window: yesterday back 6 days (day-of-week agnostic)."""
     today = datetime.now(timezone.utc).date()
     # Always cover the last 7 days regardless of day-of-week
     week_end   = today - timedelta(days=1)

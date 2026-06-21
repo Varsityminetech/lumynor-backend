@@ -382,8 +382,14 @@ def create_activity(body: dict, _admin: dict = Depends(_require_admin)):
 
 
 @app.get("/api/activity")
-def get_activity(_admin: dict = Depends(_require_admin)):
-    return act.get_events()
+def get_activity(
+    project: str = None,
+    status: str = None,
+    priority: str = None,
+    limit: int = 200,
+    _admin: dict = Depends(_require_admin),
+):
+    return act.get_events(limit=limit, project=project, status=status, priority=priority)
 
 
 @app.get("/api/activity/today")
@@ -488,6 +494,8 @@ def scan_opportunities(_admin: dict = Depends(_require_admin)):
 def update_opportunity(opp_id: str, body: dict, _admin: dict = Depends(_require_admin)):
     allowed = {"status", "title", "summary", "why_it_matters", "suggested_angle", "importance_score"}
     updates = {k: v for k, v in body.items() if k in allowed}
+    if not updates:
+        raise HTTPException(status_code=400, detail=f"No valid fields. Allowed: {sorted(allowed)}")
     result = auth.update_opportunity(opp_id, **updates)
     if not result:
         raise HTTPException(status_code=404, detail="Opportunity not found")
@@ -614,7 +622,7 @@ def team_get_project(slug: str, _admin: dict = Depends(_require_admin)):
 
 @app.patch("/api/team/projects/{slug}")
 def team_update_project(slug: str, body: dict, _admin: dict = Depends(_require_admin)):
-    return tm.update_project(slug, **{k: v for k, v in body.items() if k in ("owner_name", "status", "note", "name")})
+    return tm.update_project(slug, human_edit=True, **{k: v for k, v in body.items() if k in ("owner_name", "status", "note", "name")})
 
 
 @app.post("/api/team/projects/{slug}/members")
@@ -654,7 +662,10 @@ async def github_webhook(request: Request):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     import json as _json
-    payload  = _json.loads(body)
+    try:
+        payload = _json.loads(body)
+    except Exception:
+        return {"status": "ignored", "reason": "invalid json"}
     gh_event = request.headers.get("X-GitHub-Event", "")
     parsed = act.parse_github_event(gh_event, payload)
     if parsed:

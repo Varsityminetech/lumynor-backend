@@ -229,7 +229,7 @@ Return ONLY the JSON array."""
         except Exception as e:
             print(f"[authority] insert error: {e}")
 
-    debug = f"LLM returned {len(opportunities_data)} candidates; {len(created)} saved (scored >= 25)"
+    debug = f"LLM returned {len(opportunities_data)} candidates; {len(created)} saved (scored >= 15)"
     print(f"[authority] scan complete: {debug}")
     return {"created": created, "count": len(created), "debug": debug}
 

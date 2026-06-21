@@ -350,15 +350,15 @@ def get_project_momentum() -> dict:
 
         vol = len(recent)
 
-        if blockers and vol == 0:
-            score = "blocked"
-            reason = f"{len(blockers)} unresolved blocker(s), no new activity."
-        elif days_since > 7:
+        if days_since > 7:
             score = "low"
             reason = f"No activity in {days_since} day(s)."
         elif vol >= 5 and (completed or milestones):
             score = "high"
             reason = f"{vol} events this week, {len(completed)} completed, {len(milestones)} milestone(s)."
+        elif blockers and not completed:
+            score = "blocked"
+            reason = f"{len(blockers)} active blocker(s), no completed work this week."
         elif vol >= 2:
             score = "medium"
             reason = f"{vol} events this week."
