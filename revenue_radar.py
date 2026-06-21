@@ -34,61 +34,112 @@ PRODUCT_META = {
 }
 
 # Search query templates per product + category
+# Base queries used when NO location is given — broad India-wide searches
 DISCOVERY_QUERIES = {
     'district21': {
         'event_organizer':  [
-            'event management company India site:linkedin.com',
-            'event organizer company India B2B',
-            'corporate event management India startup',
+            'event management company India',
+            'event organizer company India',
+            'corporate event planner India',
+            'event management services India',
         ],
         'event_company':    [
             'event production company India',
             'experiential marketing agency India',
+            'event entertainment company India',
         ],
         'venue':            [
-            'event venue booking platform India',
-            'banquet hall management software India',
+            'event venue India banquet hall',
+            'wedding venue India event space',
+            'conference venue India',
         ],
         'college':          [
             'college cultural fest organizer India',
-            'student event management association India',
+            'student event management India university',
         ],
         'festival':         [
             'music festival organizer India',
             'food festival event company India',
+            'cultural festival organizer India',
         ],
     },
     'agentforge': {
         'saas_founder':     [
-            'SaaS startup founder AI automation tools',
-            'B2B SaaS product company India startup',
+            'SaaS startup founder AI automation India',
+            'B2B SaaS product company India',
+            'SaaS founder AI tools',
         ],
         'startup_studio':   [
             'startup studio venture builder India',
             'startup studio AI product company',
         ],
         'agency':           [
-            'software development agency AI automation',
+            'software development agency AI automation India',
             'digital product agency India',
+            'tech agency AI tools',
         ],
         'consultant':       [
-            'AI consultant freelance B2B SaaS',
+            'AI consultant B2B SaaS India',
             'technology consultant automation India',
         ],
     },
     'linkforge': {
         'seo_agency':       [
-            'SEO agency link building services',
-            'SEO consulting firm digital marketing',
+            'SEO agency link building services India',
+            'SEO consulting firm digital marketing India',
+            'link building agency India',
         ],
         'saas_company':     [
-            'SaaS company blog content marketing backlinks',
-            'B2B SaaS company SEO strategy',
+            'SaaS company content marketing India',
+            'B2B SaaS company SEO India',
         ],
         'content_business': [
-            'content marketing agency blog publishing',
-            'content-heavy website media company SEO',
+            'content marketing agency India',
+            'media publishing company SEO India',
         ],
+    },
+}
+
+# Location-specific query templates — {city} is substituted at runtime
+# These are intentionally direct and local-directory-friendly
+LOCATION_QUERY_TEMPLATES = {
+    'district21': {
+        'event_organizer': [
+            'event organizer {city}',
+            'event management company {city}',
+            'best event planner {city}',
+            'event management services {city} India',
+            'wedding event organizer {city}',
+        ],
+        'event_company': [
+            'event company {city}',
+            'event production {city} India',
+            'entertainment event company {city}',
+        ],
+        'venue': [
+            'event venue {city}',
+            'banquet hall {city}',
+            'wedding venue {city} India',
+        ],
+        'college': [
+            'college event organizer {city}',
+            'cultural fest management {city}',
+        ],
+        'festival': [
+            'festival organizer {city}',
+            'music festival company {city} India',
+        ],
+    },
+    'agentforge': {
+        'saas_founder':   ['SaaS startup {city}', 'tech startup founder {city} India'],
+        'startup_studio': ['startup studio {city} India', 'venture builder {city}'],
+        'agency':         ['software agency {city} India', 'tech agency {city}'],
+        'consultant':     ['AI consultant {city} India', 'tech consultant {city}'],
+    },
+    'linkforge': {
+        'seo_agency':       ['SEO agency {city} India', 'digital marketing agency {city}'],
+        'saas_company':     ['SaaS company {city} India'],
+        'content_business': ['content marketing agency {city}', 'media company {city}'],
     },
 }
 
@@ -286,12 +337,14 @@ Evaluate this result and respond ONLY with a JSON object:
 }}
 
 Rules for should_include=true:
-- Must be a REAL, IDENTIFIABLE company (not a directory, blog post, or news article)
-- relevance_score must be >= 60
-- Must actually match the target audience
-- Must have a real website or LinkedIn presence
+- Must be a REAL, IDENTIFIABLE business with a clear company name
+- relevance_score must be >= 50
+- Must actually match the target category
+- Source may be a local business directory (JustDial, Sulekha, IndiaMart, Indiacom etc.) — extract the LISTED BUSINESS, not the directory itself
+- A local Indian business with minimal web presence is still a valid lead if it clearly operates in the target category
+- Set should_include=false for: news articles, blog posts, generic "Top 10 lists", government websites, or if no real company name can be extracted
 
-Be strict. Quality over quantity."""
+Be practical. A local event organizer in a smaller Indian city is exactly our target customer."""
 
     try:
         raw = _llm(prompt, json_mode=True, max_tokens=400)
@@ -300,7 +353,7 @@ Be strict. Quality over quantity."""
             return None
         if not scored.get("should_include"):
             return None
-        if scored.get("relevance_score", 0) < 60:
+        if scored.get("relevance_score", 0) < 50:
             return None
         if not scored.get("company_name", "").strip():
             return None
@@ -351,11 +404,21 @@ def run_auto_discovery(product: str, category: str, limit: int = 10, location: s
     if category not in DISCOVERY_QUERIES.get(product, {}):
         return {"error": f"Unknown category '{category}' for {product}"}
 
-    limit = min(limit, 20)  # hard cap at 20 per scan
+    limit = min(limit, 25)  # hard cap at 25 per scan
     location = location.strip()
     base_queries = DISCOVERY_QUERIES[product][category]
-    # Append location to each query if provided, otherwise use as-is
-    queries = [f"{q} {location}" if location else q for q in base_queries]
+
+    if location:
+        # Extract just the city name ("Udaipur" from "Udaipur, India" or "Udaipur, Rajasthan, India")
+        city = location.split(',')[0].strip()
+        loc_templates = LOCATION_QUERY_TEMPLATES.get(product, {}).get(category, [])
+        # Primary: city-first template queries (most targeted for local discovery)
+        queries = [t.replace('{city}', city) for t in loc_templates]
+        # Secondary: append city to base queries as fallback
+        queries += [f"{q} {city}" for q in base_queries]
+    else:
+        queries = base_queries
+
     existing = _existing_company_names(product)
 
     searched = 0
@@ -368,7 +431,7 @@ def run_auto_discovery(product: str, category: str, limit: int = 10, location: s
     for query in queries:
         if saved >= limit:
             break
-        results = _search(query, num=6)
+        results = _search(query, num=10)
         searched += len(results)
         for result in results:
             if saved >= limit:
