@@ -290,6 +290,66 @@ def _search(query: str, num: int = 6) -> list:
     return _search_web(query, num)
 
 
+def _search_multi(query: str, num: int = 10, india_region: bool = False) -> list:
+    """
+    Search across multiple engines and deduplicate by URL.
+    Uses DuckDuckGo (global + India region) and Bing for broader coverage.
+    india_region=True sets DDGS region to in-en which gives far better results
+    for Indian city queries like "event organizer Udaipur".
+    """
+    seen_urls = set()
+    combined  = []
+
+    def _add(results):
+        for r in results:
+            url = r.get("url", "") or r.get("href", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                combined.append(r)
+
+    # 1. DuckDuckGo — India region (best for local Indian queries)
+    if india_region:
+        try:
+            from duckduckgo_search import DDGS
+            with DDGS() as ddgs:
+                hits = ddgs.text(query, region='in-en', max_results=num)
+                _add([{"title": h.get("title",""), "url": h.get("href",""), "snippet": h.get("body","")} for h in (hits or [])])
+        except Exception as e:
+            print(f"[search] DDGS India error: {e}")
+
+    # 2. DuckDuckGo — global (catches international sources)
+    try:
+        from auto_blogger import _search_web
+        _add(_search_web(query, num))
+    except Exception as e:
+        print(f"[search] DDGS global error: {e}")
+
+    # 3. Bing — no API key needed, different index from DDG
+    try:
+        import requests as _req
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"}
+        r = _req.get(
+            "https://www.bing.com/search",
+            params={"q": query, "count": num, "mkt": "en-IN" if india_region else "en-US"},
+            headers=headers, timeout=8
+        )
+        if r.ok:
+            import re as _re
+            # Extract title+URL from Bing HTML result snippets
+            titles = _re.findall(r'<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', r.text)
+            snippets = _re.findall(r'<p class="b_algoSlug"[^>]*>(.*?)</p>', r.text)
+            for i, (url, title) in enumerate(titles[:num]):
+                if url.startswith("http") and "bing.com" not in url:
+                    snippet = snippets[i] if i < len(snippets) else ""
+                    # Strip HTML tags from snippet
+                    snippet = _re.sub(r'<[^>]+>', '', snippet)
+                    _add([{"title": _re.sub(r'<[^>]+>', '', title), "url": url, "snippet": snippet}])
+    except Exception as e:
+        print(f"[search] Bing error: {e}")
+
+    return combined
+
+
 def _normalize_company(name: str) -> str:
     return re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9 ]', '', name.lower())).strip()
 
@@ -459,17 +519,66 @@ def _compute_lead_score(data: dict) -> int:
     return min(100, score)
 
 
-def _score_result(result: dict, product: str, category: str) -> dict | None:
+_MAJOR_CITIES = [
+    'delhi', 'new delhi', 'mumbai', 'bangalore', 'bengaluru', 'hyderabad',
+    'chennai', 'kolkata', 'pune', 'ahmedabad', 'surat', 'noida',
+    'gurgaon', 'gurugram', 'chandigarh', 'lucknow', 'patna', 'jaipur',
+    'indore', 'bhopal', 'nagpur', 'visakhapatnam', 'kochi', 'coimbatore',
+    'thane', 'nashik', 'vadodara', 'ludhiana', 'agra', 'varanasi',
+    'kanpur', 'meerut', 'rajkot', 'amritsar', 'jabalpur',
+]
+
+_CITY_ALIASES = {
+    'delhi':     ['new delhi', 'delhi ncr', 'ncr'],
+    'bangalore': ['bengaluru'],
+    'gurgaon':   ['gurugram'],
+    'mumbai':    ['bombay', 'navi mumbai'],
+    'kolkata':   ['calcutta'],
+    'chennai':   ['madras'],
+}
+
+
+def _location_matches(extracted: str, target_city: str) -> bool:
+    """
+    Returns True if extracted location is compatible with target city.
+    Rejects results that are clearly from a different known major city.
+    Empty extracted location gets benefit of the doubt.
+    """
+    if not extracted or not target_city:
+        return True
+    city = target_city.lower().strip()
+    ext  = extracted.lower().strip()
+    if city in ext:
+        return True
+    # Accept known aliases (e.g. "Bengaluru" when searching "Bangalore")
+    for canonical, aliases in _CITY_ALIASES.items():
+        if city in (canonical, *aliases) and any(a in ext or canonical in ext for a in aliases):
+            return True
+    # Reject if result is clearly a different major Indian city
+    for mc in _MAJOR_CITIES:
+        if mc in ext and mc != city and mc not in city and city not in mc:
+            return False
+    return True
+
+
+def _score_result(result: dict, product: str, category: str, target_city: str = '') -> dict | None:
     """
     LLM extracts all available signals from a search result.
     Score is computed deterministically by _compute_lead_score().
     Returns a structured lead dict or None if result is not a real business.
     """
     meta = PRODUCT_META[product]
+    city_context = (
+        f"\nTARGET LOCATION: {target_city}. ONLY include businesses that are physically located in "
+        f"or primarily serve {target_city.split(',')[0].strip()}. "
+        f"If the result is clearly from a different city (e.g. Delhi, Mumbai, Bangalore) and has no "
+        f"connection to {target_city.split(',')[0].strip()}, set should_include=false."
+    ) if target_city else ""
+
     prompt = f"""You are a lead data extraction engine. Extract every available signal from this search result for our sales database.
 
 Product we sell: {meta['name']}
-Target category: {category}
+Target category: {category}{city_context}
 
 Search result:
 Title: {result.get('title', '')}
@@ -488,10 +597,10 @@ Respond ONLY with this JSON — extract everything you can see, leave fields emp
   "phone": "phone/mobile number with country code if shown (e.g. +91-98765-43210), else empty",
   "whatsapp": "WhatsApp number if explicitly mentioned, else same as phone if phone found, else empty",
   "address": "physical street/area address if visible, else empty",
-  "location": "city and state (e.g. Udaipur, Rajasthan), else empty",
+  "location": "city and state extracted from the result (e.g. Udaipur, Rajasthan), else empty",
   "review_rating": null or numeric rating e.g. 4.2,
   "review_count": null or integer number of reviews e.g. 127,
-  "review_platform": "Google|JustDial|Sulekha|Facebook|Yelp|other — whichever platform the reviews are on, else empty",
+  "review_platform": "Google|JustDial|Sulekha|Facebook|Yelp|other, else empty",
   "established_year": null or integer year e.g. 2012,
   "verified": false or true (true if listing shows verified/trusted badge),
   "business_size": "startup|smb|enterprise",
@@ -502,12 +611,12 @@ Respond ONLY with this JSON — extract everything you can see, leave fields emp
 }}
 
 Rules for should_include:
-- true: real business name identifiable AND clearly in the {category} category
-- false ONLY for: news articles, Wikipedia, government pages, generic "Top 10" lists with no extractable business, or completely unidentifiable source
-- Directory listings (JustDial, Sulekha, IndiaMart, Indiacom): extract the BUSINESS LISTED, not the directory itself
-- JustDial snippets often have rating like "4.2 ★ · 127 Ratings" — extract those
+- true: real business name identifiable AND clearly in the {category} category{' AND located in ' + target_city.split(',')[0].strip() if target_city else ''}
+- false: news articles, Wikipedia, government pages, generic "Top 10" lists with no extractable business, completely unidentifiable source{', or business clearly located in a different city' if target_city else ''}
+- Directory listings (JustDial, Sulekha, IndiaMart): extract the LISTED BUSINESS details, not the directory
+- JustDial snippets show ratings like "4.2 ★ · 127 Ratings" — extract those
 - Indian phone formats: +91-XXXXX-XXXXX or 0XXXXXXXXXX or 9XXXXXXXXX — extract as-is
-- When in doubt, include — our founder reviews all auto-discovered leads before outreach"""
+- When in doubt about whether to include, include — our founder reviews all leads before outreach"""
 
     try:
         raw = _llm(prompt, json_mode=True, max_tokens=600)
@@ -609,13 +718,14 @@ def run_auto_discovery(product: str, category: str, limit: int = 10, location: s
     location = location.strip()
     base_queries = DISCOVERY_QUERIES[product][category]
 
+    city = ''
     if location:
-        # Extract just the city name ("Udaipur" from "Udaipur, India" or "Udaipur, Rajasthan, India")
+        # Extract just the city name ("Udaipur" from "Udaipur, Rajasthan, India")
         city = location.split(',')[0].strip()
         loc_templates = LOCATION_QUERY_TEMPLATES.get(product, {}).get(category, [])
-        # Primary: city-first template queries (most targeted for local discovery)
+        # Primary: city-first template queries
         queries = [t.replace('{city}', city) for t in loc_templates]
-        # Secondary: append city to base queries as fallback
+        # Secondary: base queries appended with city
         queries += [f"{q} {city}" for q in base_queries]
     else:
         queries = base_queries
@@ -624,23 +734,31 @@ def run_auto_discovery(product: str, category: str, limit: int = 10, location: s
 
     searched = 0
     passed_gate = 0
+    location_skipped = 0
     duplicates_skipped = 0
     saved = 0
     saved_leads = []
     seen_in_session = set()
 
+    use_india_region = bool(city)  # India region mode when location is specified
+
     for query in queries:
         if saved >= limit:
             break
-        results = _search(query, num=15)
+        results = _search_multi(query, num=15, india_region=use_india_region)
         searched += len(results)
         for result in results:
             if saved >= limit:
                 break
-            scored = _score_result(result, product, category)
+            scored = _score_result(result, product, category, target_city=location)
             if not scored:
                 continue
             passed_gate += 1
+            # Location post-filter: if we searched for a city and LLM extracted a different major city, skip
+            if city and not _location_matches(scored.get("location", ""), city):
+                location_skipped += 1
+                print(f"[revenue_radar] Location mismatch: wanted {city!r}, got {scored.get('location')!r} — skipping {scored['company_name']}")
+                continue
             norm = _normalize_company(scored["company_name"])
             if norm in existing or norm in seen_in_session:
                 duplicates_skipped += 1
@@ -656,13 +774,14 @@ def run_auto_discovery(product: str, category: str, limit: int = 10, location: s
                 saved_leads.append(lead)
 
     return {
-        "product": product,
-        "category": category,
-        "searched": searched,
-        "passed_gate": passed_gate,
+        "product":            product,
+        "category":           category,
+        "searched":           searched,
+        "passed_gate":        passed_gate,
+        "location_skipped":   location_skipped,
         "duplicates_skipped": duplicates_skipped,
-        "saved": saved,
-        "leads": saved_leads,
+        "saved":              saved,
+        "leads":              saved_leads,
     }
 
 
