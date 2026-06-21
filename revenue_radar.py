@@ -258,6 +258,112 @@ MARKET_RADAR_QUERIES = {
     ],
 }
 
+# ── Google Places query phrases per product+category ─────────────────────────
+# These are sent directly to the Places Text Search API which returns
+# structured local business data — no snippet parsing needed.
+_PLACES_QUERIES = {
+    'district21': {
+        'event_organizer': [
+            'event organizer', 'event management company', 'event planner',
+            'wedding planner', 'party organizer', 'event decorator',
+        ],
+        'event_company': [
+            'event company', 'event production company', 'event entertainment company',
+            'event management agency',
+        ],
+        'venue': [
+            'banquet hall', 'party hall', 'wedding venue', 'event venue',
+            'marriage garden', 'conference hall',
+        ],
+        'college': ['college', 'university', 'management college'],
+        'festival': ['festival organizer', 'cultural event company', 'mela organizer'],
+    },
+    'agentforge': {
+        'saas_founder':   ['software company', 'SaaS company', 'tech startup'],
+        'startup_studio': ['startup incubator', 'tech incubator', 'accelerator'],
+        'agency':         ['software development company', 'IT company', 'digital agency'],
+        'consultant':     ['IT consultant', 'technology consultant', 'business consultant'],
+    },
+    'linkforge': {
+        'seo_agency':       ['SEO company', 'digital marketing company', 'online marketing agency'],
+        'saas_company':     ['software company', 'SaaS company'],
+        'content_business': ['content marketing company', 'media company', 'content agency'],
+    },
+}
+
+
+def _search_places(phrase: str, city: str) -> list:
+    """
+    Google Places Text Search + Place Details for phone/website.
+    Returns individual business records — NOT listing pages.
+    Requires GOOGLE_CSE_KEY env var and Places API enabled in Google Cloud.
+    """
+    import os, requests as _req
+    key = os.environ.get("GOOGLE_CSE_KEY", "")
+    if not key:
+        return []
+
+    # Step 1: Text Search — finds matching businesses in the city
+    try:
+        r = _req.get(
+            "https://maps.googleapis.com/maps/api/place/textsearch/json",
+            params={"query": f"{phrase} in {city}", "key": key, "region": "in", "language": "en"},
+            timeout=12,
+        )
+        if not r.ok:
+            print(f"[places] Text Search HTTP {r.status_code}")
+            return []
+        places = r.json().get("results", [])[:10]
+    except Exception as e:
+        print(f"[places] Text Search error: {e}")
+        return []
+
+    results = []
+    for place in places:
+        name     = place.get("name", "")
+        address  = place.get("formatted_address", "")
+        rating   = place.get("rating")
+        count    = place.get("user_ratings_total", 0)
+        place_id = place.get("place_id", "")
+
+        # Step 2: Place Details — phone number + website (Contact Data SKU, $3/1000)
+        phone = ""
+        website = ""
+        if place_id:
+            try:
+                det = _req.get(
+                    "https://maps.googleapis.com/maps/api/place/details/json",
+                    params={
+                        "place_id": place_id, "key": key,
+                        "fields": "international_phone_number,formatted_phone_number,website",
+                    },
+                    timeout=8,
+                )
+                if det.ok:
+                    ddata = det.json().get("result", {})
+                    phone   = ddata.get("international_phone_number") or ddata.get("formatted_phone_number", "")
+                    website = ddata.get("website", "")
+            except Exception:
+                pass
+
+        # Build a structured snippet the LLM can reliably extract from
+        snippet_parts = [f"{name}"]
+        if phone:   snippet_parts.append(f"Phone: {phone}")
+        if website: snippet_parts.append(f"Website: {website}")
+        if address: snippet_parts.append(f"Address: {address}")
+        if rating:  snippet_parts.append(f"Google Rating: {rating}/5 ({count} reviews)")
+        snippet_parts.append(f"Category: {phrase} in {city}")
+
+        results.append({
+            "title":   f"{name} - {city}",
+            "url":     website or f"https://www.google.com/maps/place/?q=place_id:{place_id}",
+            "snippet": " | ".join(snippet_parts),
+        })
+
+    print(f"[places] '{phrase} in {city}' → {len(results)} businesses")
+    return results
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _now() -> str:
@@ -745,8 +851,47 @@ def run_auto_discovery(product: str, category: str, limit: int = 10, location: s
     saved_leads = []
     seen_in_session = set()
 
-    use_india_region = bool(city)  # India region mode when location is specified
+    use_india_region = bool(city)
 
+    def _process_result(result):
+        """Run one search result through LLM extraction + all filters. Returns lead or None."""
+        nonlocal passed_gate, location_skipped, duplicates_skipped, saved
+        scored = _score_result(result, product, category, target_city=location)
+        if not scored:
+            return None
+        passed_gate += 1
+        if city and not _location_matches(scored.get("location", ""), city):
+            location_skipped += 1
+            print(f"[revenue_radar] Location mismatch: wanted {city!r}, got {scored.get('location')!r} — skipping {scored['company_name']}")
+            return None
+        norm = _normalize_company(scored["company_name"])
+        if norm in existing or norm in seen_in_session:
+            duplicates_skipped += 1
+            return None
+        seen_in_session.add(norm)
+        if scored.get("website") and not _is_url_reachable(scored["website"]):
+            scored["website"] = ""
+        lead = create_lead(scored, source='auto_scan')
+        if lead.get("id"):
+            saved += 1
+            saved_leads.append(lead)
+            return lead
+        return None
+
+    # ── Pass 1: Google Places API (structured local business data — most reliable) ──
+    if city:
+        place_phrases = _PLACES_QUERIES.get(product, {}).get(category, [])
+        for phrase in place_phrases:
+            if saved >= limit:
+                break
+            place_results = _search_places(phrase, city)
+            searched += len(place_results)
+            for result in place_results:
+                if saved >= limit:
+                    break
+                _process_result(result)
+
+    # ── Pass 2: Multi-engine web search (Google CSE + DDG India + Bing) ───────────
     for query in queries:
         if saved >= limit:
             break
@@ -755,28 +900,7 @@ def run_auto_discovery(product: str, category: str, limit: int = 10, location: s
         for result in results:
             if saved >= limit:
                 break
-            scored = _score_result(result, product, category, target_city=location)
-            if not scored:
-                continue
-            passed_gate += 1
-            # Location post-filter: if we searched for a city and LLM extracted a different major city, skip
-            if city and not _location_matches(scored.get("location", ""), city):
-                location_skipped += 1
-                print(f"[revenue_radar] Location mismatch: wanted {city!r}, got {scored.get('location')!r} — skipping {scored['company_name']}")
-                continue
-            norm = _normalize_company(scored["company_name"])
-            if norm in existing or norm in seen_in_session:
-                duplicates_skipped += 1
-                continue
-            seen_in_session.add(norm)
-            # Validate website is reachable — skip lead if URL is dead
-            if scored.get("website") and not _is_url_reachable(scored["website"]):
-                print(f"[revenue_radar] Skipping {scored['company_name']} — website unreachable: {scored['website']}")
-                scored["website"] = ""  # clear dead URL but still save the lead
-            lead = create_lead(scored, source='auto_scan')
-            if lead.get("id"):
-                saved += 1
-                saved_leads.append(lead)
+            _process_result(result)
 
     return {
         "product":            product,
