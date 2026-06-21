@@ -5,7 +5,6 @@ relationship memory, market radar, and launch readiness intelligence.
 """
 import json
 import re
-import uuid
 from datetime import datetime, timezone
 from db import _sb, get_settings
 
@@ -153,6 +152,21 @@ def _normalize_company(name: str) -> str:
     return re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9 ]', '', name.lower())).strip()
 
 
+def _is_url_reachable(url: str) -> bool:
+    """Quick HEAD request to verify a URL is alive. Returns False on any error."""
+    if not url or not url.startswith('http'):
+        url = f'https://{url}' if url else ''
+    if not url:
+        return False
+    try:
+        import requests
+        r = requests.head(url, timeout=5, allow_redirects=True,
+                          headers={'User-Agent': 'Mozilla/5.0'})
+        return r.status_code < 500
+    except Exception:
+        return False
+
+
 # ── Lead CRUD ─────────────────────────────────────────────────────────────────
 
 def get_leads(product: str = None, temperature: str = None, status: str = None,
@@ -181,6 +195,8 @@ def create_lead(data: dict, source: str = 'manual') -> dict:
     payload = {
         "company_name":    data.get("company_name", "").strip(),
         "website":         data.get("website", "").strip(),
+        "linkedin_url":    data.get("linkedin_url", "").strip(),
+        "contact_email":   data.get("contact_email", "").strip(),
         "location":        data.get("location", "").strip(),
         "product_target":  data.get("product_target", ""),
         "category":        data.get("category", ""),
@@ -202,9 +218,10 @@ def update_lead(lead_id: str, data: dict) -> dict:
     sb = _sb()
     if not sb:
         return {}
-    allowed = {"company_name", "website", "location", "category", "temperature",
-               "relevance_score", "business_size", "digital_maturity",
-               "buying_signals", "notes", "status", "source_url"}
+    allowed = {"company_name", "website", "linkedin_url", "contact_email",
+               "location", "category", "temperature", "relevance_score",
+               "business_size", "digital_maturity", "buying_signals",
+               "notes", "status", "source_url"}
     payload = {k: v for k, v in data.items() if k in allowed}
     payload["updated_at"] = _now()
     res = sb.table("revenue_leads").update(payload).eq("id", lead_id).execute()
@@ -255,7 +272,9 @@ Snippet: {result.get('snippet', '')}
 Evaluate this result and respond ONLY with a JSON object:
 {{
   "company_name": "exact company name (empty string if not identifiable)",
-  "website": "clean domain URL or empty string",
+  "website": "clean root domain URL e.g. https://acme.com (empty string if not found)",
+  "linkedin_url": "LinkedIn company page URL if visible in title/snippet/URL, else empty string",
+  "contact_email": "any contact email found in snippet, else empty string",
   "location": "city/country or empty string",
   "relevance_score": 0-100,
   "business_size": "startup|smb|enterprise",
@@ -285,9 +304,24 @@ Be strict. Quality over quantity."""
             return None
         if not scored.get("company_name", "").strip():
             return None
+        website = scored.get("website", "").strip()
+        # If LLM didn't extract a clean website but the source URL is a real domain, use it
+        if not website and result.get("url", "").startswith("http"):
+            url = result["url"]
+            # Only use source URL as website if it's not LinkedIn/social/directory
+            skip_domains = ("linkedin.com", "facebook.com", "twitter.com", "x.com",
+                            "instagram.com", "wikipedia.org", "indiamart.com",
+                            "justdial.com", "yelp.com", "yellowpages")
+            if not any(d in url for d in skip_domains):
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                website = f"{parsed.scheme}://{parsed.netloc}"
+
         return {
             "company_name":    scored["company_name"].strip(),
-            "website":         scored.get("website", result.get("url", "")).strip(),
+            "website":         website,
+            "linkedin_url":    scored.get("linkedin_url", "").strip(),
+            "contact_email":   scored.get("contact_email", "").strip(),
             "location":        scored.get("location", "").strip(),
             "product_target":  product,
             "category":        category,
@@ -348,6 +382,10 @@ def run_auto_discovery(product: str, category: str, limit: int = 10, location: s
                 duplicates_skipped += 1
                 continue
             seen_in_session.add(norm)
+            # Validate website is reachable — skip lead if URL is dead
+            if scored.get("website") and not _is_url_reachable(scored["website"]):
+                print(f"[revenue_radar] Skipping {scored['company_name']} — website unreachable: {scored['website']}")
+                scored["website"] = ""  # clear dead URL but still save the lead
             lead = create_lead(scored, source='auto_scan')
             if lead.get("id"):
                 saved += 1
