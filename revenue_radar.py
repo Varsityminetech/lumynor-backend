@@ -296,11 +296,13 @@ def _search_places(phrase: str, city: str) -> list:
     """
     Google Places Text Search + Place Details for phone/website.
     Returns individual business records — NOT listing pages.
-    Requires GOOGLE_CSE_KEY env var and Places API enabled in Google Cloud.
+    Requires GOOGLE_MAPS_KEY (preferred) or GOOGLE_CSE_KEY env var + Places API enabled.
     """
     import os, requests as _req
-    key = os.environ.get("GOOGLE_CSE_KEY", "")
+    # Prefer dedicated Maps key; fall back to CSE key (same project works if Places API enabled)
+    key = os.environ.get("GOOGLE_MAPS_KEY") or os.environ.get("GOOGLE_CSE_KEY", "")
     if not key:
+        print("[places] No API key found (set GOOGLE_MAPS_KEY or GOOGLE_CSE_KEY)")
         return []
 
     # Step 1: Text Search — finds matching businesses in the city
@@ -313,7 +315,12 @@ def _search_places(phrase: str, city: str) -> list:
         if not r.ok:
             print(f"[places] Text Search HTTP {r.status_code}")
             return []
-        places = r.json().get("results", [])[:10]
+        rdata = r.json()
+        status = rdata.get("status", "")
+        if status not in ("OK", "ZERO_RESULTS"):
+            print(f"[places] API status={status!r} error={rdata.get('error_message', '')} — key may lack Places API permission")
+            return []
+        places = rdata.get("results", [])[:10]
     except Exception as e:
         print(f"[places] Text Search error: {e}")
         return []
@@ -746,7 +753,7 @@ Rules for should_include:
             social_dirs = ("linkedin.com", "facebook.com", "twitter.com", "x.com",
                            "instagram.com", "wikipedia.org", "indiamart.com",
                            "justdial.com", "sulekha.com", "yelp.com", "yellowpages",
-                           "indiacom.com", "tradeindia.com")
+                           "indiacom.com", "tradeindia.com", "google.com", "maps.google")
             if not any(d in url for d in social_dirs):
                 from urllib.parse import urlparse
                 parsed = urlparse(url)
