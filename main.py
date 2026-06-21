@@ -580,6 +580,55 @@ def weekly_generate(_admin: dict = Depends(_require_admin)):
     return wi.generate_weekly_report()
 
 
+# ── ATLAS Chat ────────────────────────────────────────────────────────────────
+
+@app.post("/api/atlas/chat")
+def atlas_chat(body: dict, _admin: dict = Depends(_require_admin)):
+    import atlas_chat as ac
+    question = (body.get("question") or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question required")
+    history = body.get("history") or []
+    return ac.chat(question, history)
+
+
+# ── Daily Digest ──────────────────────────────────────────────────────────────
+
+@app.get("/api/digest/preview")
+def digest_preview(_admin: dict = Depends(_require_admin)):
+    from digest import build_digest_text
+    text = build_digest_text()
+    if not text:
+        raise HTTPException(status_code=500, detail="Could not build digest")
+    return {"text": text}
+
+
+@app.post("/api/digest/send")
+def digest_send(_admin: dict = Depends(_require_admin)):
+    from digest import send_digest
+    return send_digest()
+
+
+@app.get("/api/system/digest-settings")
+def get_digest_settings(_admin: dict = Depends(_require_admin)):
+    stored = db.get_settings("digest")
+    return {
+        "twilioAccountSid": stored.get("twilioAccountSid", ""),
+        "twilioAuthToken":  stored.get("twilioAuthToken", ""),
+        "twilioFrom":       stored.get("twilioFrom", "whatsapp:+14155238886"),
+        "digestTo":         stored.get("digestTo", ""),
+    }
+
+
+@app.post("/api/system/digest-settings")
+def save_digest_settings(body: dict, _admin: dict = Depends(_require_admin)):
+    allowed = {"twilioAccountSid", "twilioAuthToken", "twilioFrom", "digestTo"}
+    updates = {k: v for k, v in body.items() if k in allowed}
+    existing = db.get_settings("digest")
+    db.save_settings({**existing, **updates}, "digest")
+    return {**existing, **updates}
+
+
 @app.get("/api/projects/{slug}")
 def get_project_detail(slug: str, _admin: dict = Depends(_require_admin)):
     p = tm.get_project(slug)
