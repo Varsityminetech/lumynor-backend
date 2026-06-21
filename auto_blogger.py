@@ -205,17 +205,43 @@ def _get_ddgs():
 
 
 def _search_web(query: str, num: int = 8) -> list:
-    """DuckDuckGo instant answer search — returns list of {title, url, snippet}."""
+    """Bing web search (primary) with DuckDuckGo fallback. Returns list of {title, url, snippet}."""
+    # Primary: Bing — broader index, fresher news/blog content, better for research
+    try:
+        import requests as _req, re as _re
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        r = _req.get(
+            "https://www.bing.com/search",
+            params={"q": query, "count": num},
+            headers=headers, timeout=8,
+        )
+        if r.ok:
+            results = []
+            titles   = _re.findall(r'<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', r.text)
+            snippets = _re.findall(r'<p class="b_algoSlug"[^>]*>(.*?)</p>', r.text)
+            for i, (url, title) in enumerate(titles[:num]):
+                if url.startswith("http") and "bing.com" not in url and "microsoft.com" not in url:
+                    snip = _re.sub(r'<[^>]+>', '', snippets[i] if i < len(snippets) else "")
+                    results.append({
+                        "title":   _re.sub(r'<[^>]+>', '', title),
+                        "url":     url,
+                        "snippet": snip,
+                    })
+            if results:
+                return results
+    except Exception as e:
+        print(f"[search] Bing error: {e}")
+
+    # Fallback: DuckDuckGo
     DDGS = _get_ddgs()
     if DDGS is None:
-        print("[search] No DDGS package available")
         return []
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=num))
         return [{"title": r.get("title", ""), "url": r.get("href", "") or r.get("url", ""), "snippet": r.get("body", "")} for r in results]
     except Exception as e:
-        print(f"[search] Error: {e}")
+        print(f"[search] DDG fallback error: {e}")
         return []
 
 

@@ -292,10 +292,12 @@ def _search(query: str, num: int = 6) -> list:
 
 def _search_multi(query: str, num: int = 10, india_region: bool = False) -> list:
     """
-    Search across multiple engines and deduplicate by URL.
-    Uses DuckDuckGo (global + India region) and Bing for broader coverage.
-    india_region=True sets DDGS region to in-en which gives far better results
-    for Indian city queries like "event organizer Udaipur".
+    Multi-engine search deduplicated by URL.
+
+    Engine order (priority high → low):
+      1. Google CSE  — primary; searches configured directories (JustDial, Sulekha, etc.)
+      2. DDG in-en   — India-region DuckDuckGo; best for local Indian city queries
+      3. Bing / DDG  — via auto_blogger._search_web (Bing primary, DDG fallback)
     """
     seen_urls = set()
     combined  = []
@@ -307,36 +309,18 @@ def _search_multi(query: str, num: int = 10, india_region: bool = False) -> list
                 seen_urls.add(url)
                 combined.append(r)
 
-    # 1. DuckDuckGo — India region (best for local Indian queries)
-    if india_region:
-        try:
-            from duckduckgo_search import DDGS
-            with DDGS() as ddgs:
-                hits = ddgs.text(query, region='in-en', max_results=num)
-                _add([{"title": h.get("title",""), "url": h.get("href",""), "snippet": h.get("body","")} for h in (hits or [])])
-        except Exception as e:
-            print(f"[search] DDGS India error: {e}")
-
-    # 2. DuckDuckGo — global (catches international sources)
-    try:
-        from auto_blogger import _search_web
-        _add(_search_web(query, num))
-    except Exception as e:
-        print(f"[search] DDGS global error: {e}")
-
-    # 3. Google Custom Search API — best quality, requires GOOGLE_CSE_KEY + GOOGLE_CSE_ID env vars
+    # 1. Google Custom Search API — primary engine
     import os as _os
     gkey = _os.environ.get("GOOGLE_CSE_KEY", "")
     gcx  = _os.environ.get("GOOGLE_CSE_ID", "")
     if gkey and gcx:
         try:
             import requests as _req
-            # Google CSE returns max 10 per request; gl=in biases toward India results
             params = {
                 "key": gkey, "cx": gcx, "q": query,
                 "num": min(num, 10),
-                "gl": "in" if india_region else "us",   # geolocation
-                "lr": "lang_en",
+                "gl":  "in" if india_region else "us",
+                "lr":  "lang_en",
             }
             r = _req.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=10)
             if r.ok:
@@ -348,25 +332,25 @@ def _search_multi(query: str, num: int = 10, india_region: bool = False) -> list
                     }])
         except Exception as e:
             print(f"[search] Google CSE error: {e}")
-    else:
-        # Fallback: Bing HTML scrape when Google keys not configured
+
+    # 2. DuckDuckGo India region — catches local results Google CSE may miss
+    if india_region:
         try:
-            import requests as _req, re as _re
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            r = _req.get(
-                "https://www.bing.com/search",
-                params={"q": query, "count": num, "mkt": "en-IN" if india_region else "en-US"},
-                headers=headers, timeout=8,
-            )
-            if r.ok:
-                titles   = _re.findall(r'<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', r.text)
-                snippets = _re.findall(r'<p class="b_algoSlug"[^>]*>(.*?)</p>', r.text)
-                for i, (url, title) in enumerate(titles[:num]):
-                    if url.startswith("http") and "bing.com" not in url:
-                        snip = _re.sub(r'<[^>]+>', '', snippets[i] if i < len(snippets) else "")
-                        _add([{"title": _re.sub(r'<[^>]+>', '', title), "url": url, "snippet": snip}])
+            from auto_blogger import _get_ddgs
+            DDGS = _get_ddgs()
+            if DDGS:
+                with DDGS() as ddgs:
+                    hits = ddgs.text(query, region='in-en', max_results=num)
+                    _add([{"title": h.get("title",""), "url": h.get("href",""), "snippet": h.get("body","")} for h in (hits or [])])
         except Exception as e:
-            print(f"[search] Bing fallback error: {e}")
+            print(f"[search] DDGS India error: {e}")
+
+    # 3. Bing (primary) + DDG global (fallback) via auto_blogger
+    try:
+        from auto_blogger import _search_web
+        _add(_search_web(query, num))
+    except Exception as e:
+        print(f"[search] Bing/DDG error: {e}")
 
     return combined
 
