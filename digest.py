@@ -90,6 +90,11 @@ def send_digest() -> dict:
     from_number = stored.get("twilioFrom", "").strip()   # e.g. whatsapp:+14155238886
     to_number   = stored.get("digestTo", "").strip()     # e.g. whatsapp:+919876543210
 
+    if not from_number.startswith('whatsapp:'):
+        from_number = f'whatsapp:{from_number}'
+    if not to_number.startswith('whatsapp:'):
+        to_number = f'whatsapp:{to_number}'
+
     if not all([account_sid, auth_token, from_number, to_number]):
         return {
             "ok": False,
