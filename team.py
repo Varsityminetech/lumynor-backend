@@ -174,6 +174,8 @@ def delete_project(slug: str) -> None:
         raise RuntimeError("DB not configured")
     sb.table("project_members").delete().eq("project_slug", slug).execute()
     sb.table("project_messages").delete().eq("project_slug", slug).execute()
+    sb.table("story_opportunities").delete().eq("project_slug", slug).execute()
+    sb.table("activity_events").delete().eq("project", slug).execute()
     sb.table("projects").delete().eq("slug", slug).execute()
 
 

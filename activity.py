@@ -186,7 +186,6 @@ def _detect_project(repo_name: str) -> str:
     # district21 must be checked before generic "district" to avoid false positives
     if "district21" in name or "district21" in raw.lower():
         return "district21"
-# lumynor-backend should map to "other", not lumynor_website
     if "backend" in name and "lumynor" in name:
         return "other"
     if "website" in name or ("lumynor" in name and "backend" not in name):

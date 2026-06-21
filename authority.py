@@ -197,9 +197,13 @@ Return ONLY the JSON array."""
         print(f"[authority] LLM error: {e}")
         return {"created": [], "count": 0, "debug": f"LLM error: {str(e)[:200]}"}
 
+    valid_slugs = {p["slug"] for p in projects}
     created = []
     for opp in opportunities_data:
         if not opp.get("title") or not opp.get("project_slug"):
+            continue
+        if opp["project_slug"] not in valid_slugs:
+            print(f"[authority] skipping opp with unknown slug: {opp['project_slug']!r}")
             continue
         score = int(opp.get("importance_score") or 0)
         if score < 15:

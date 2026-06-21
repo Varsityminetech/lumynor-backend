@@ -194,7 +194,7 @@ def _opportunity_score(project: dict, authority_opps: list) -> int:
     score = 0
     score += _IMPORTANCE_PTS.get(project.get('strategic_importance', ''), 10)
     score += _PRIORITY_PTS.get(project.get('priority', 'Medium'), 10)
-    if project.get('status') in ('Beta', 'Launch', 'Live'):
+    if project.get('status') in ('Launch Ready', 'Production'):
         score += 15
     if authority_opps:
         slug = project.get('slug', '')
@@ -315,7 +315,7 @@ def get_strategic_blockers() -> list:
         status = p.get('status', '')
         health = p.get('health', 'healthy')
         impact = (
-            "Blocking launch"     if status in ('Beta', 'Launch', 'Live') else
+            "Blocking launch"     if status in ('Launch Ready', 'Production') else
             "Stalling development" if health in ('blocked', 'at_risk') else
             "Limiting progress"
         )

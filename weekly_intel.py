@@ -242,12 +242,14 @@ Rules:
 
     llm_cfg  = _build_llm_cfg(stored, gemini_key)
     llm_data: dict = {}
+    llm_ok = False
     try:
         response = _llm(prompt, llm_cfg, json_mode=False, timeout=180, max_tokens=2500)
         print(f"[weekly_intel] LLM response length: {len(response)}")
         match = re.search(r'\{.*\}', response, re.DOTALL)
         if match:
             llm_data = json.loads(match.group())
+            llm_ok = True
         else:
             print("[weekly_intel] no JSON object in response")
             llm_data = {"error": "LLM response had no JSON object"}
@@ -255,8 +257,8 @@ Rules:
         print(f"[weekly_intel] LLM error: {e}")
         llm_data = {"error": str(e)[:200]}
 
-    # Merge deterministic data
-    llm_data["scorecard"]         = scorecard
+    # Merge deterministic data (always present regardless of LLM result)
+    llm_data["scorecard"]          = scorecard
     llm_data["attention_analysis"] = {"percentages": attention_pct}
 
     row = {
@@ -267,10 +269,15 @@ Rules:
         "raw_json":    llm_data,
         "created_at":  _now(),
     }
-    try:
-        sb.table("weekly_reports").insert(row).execute()
-    except Exception as e:
-        print(f"[weekly_intel] insert error: {e}")
+    # Only persist to DB if LLM succeeded — a failed report would block
+    # should_auto_generate() from retrying for the rest of the week
+    if llm_ok:
+        try:
+            sb.table("weekly_reports").insert(row).execute()
+        except Exception as e:
+            print(f"[weekly_intel] insert error: {e}")
+    else:
+        print("[weekly_intel] skipping DB insert — LLM failed, report not saved")
 
     return row
 

@@ -533,7 +533,10 @@ def strategy_blockers(_admin: dict = Depends(_require_admin)):
 @app.post("/api/strategy/attention")
 def log_attention(body: dict, _admin: dict = Depends(_require_admin)):
     project_slug = body.get("project_slug", "")
-    minutes      = int(body.get("minutes", 0))
+    try:
+        minutes = int(body.get("minutes", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="minutes must be a number")
     if not project_slug or minutes <= 0:
         raise HTTPException(status_code=400, detail="project_slug and minutes required")
     return strat.log_attention(project_slug, minutes)
