@@ -131,23 +131,71 @@ def update_event_status(event_id: str, status: str) -> dict | None:
 def verify_github_signature(body: bytes, signature: str) -> bool:
     if not GITHUB_SECRET:
         return True  # dev mode: no secret configured
-    expected = "sha256=" + hmac.new(GITHUB_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    mac = hmac.new(GITHUB_SECRET.encode(), body, hashlib.sha256)
+    expected = "sha256=" + mac.hexdigest()
     return hmac.compare_digest(expected, signature or "")
 
 
+# Explicit repo-name → project-slug mappings (checked first, highest priority).
+# Add the exact GitHub repo name on the left, project slug on the right.
+_REPO_MAP: dict[str, str] = {
+    # ── AgentForge ──────────────────────────────────────────
+    "agentforge-os":      "agentforge",   # exact GitHub repo name
+    "agentforge":         "agentforge",
+    "agent-forge":        "agentforge",
+    "AgentForge":         "agentforge",
+
+    # ── District 21 ─────────────────────────────────────────
+    "district-21":        "district21",
+    "district21":         "district21",
+    "District21":         "district21",
+    "District-21":        "district21",
+
+    # ── LinkForge ───────────────────────────────────────────
+    "linkforge":          "linkforge",
+    "link-forge":         "linkforge",
+
+    # ── Lumynor Website ─────────────────────────────────────
+    "lumynor_website":    "lumynor_website",  # underscored variant
+    "lumynor-website":    "lumynor_website",
+
+    # ── Lumynor Backend ─────────────────────────────────────
+    "lumynor-backend":    "other",
+
+    # ── Mission Control ─────────────────────────────────────
+    "mission-control":    "mission_control",
+    "missioncontrol":     "mission_control",
+
+    # ── CODEX — update value to the right project slug if needed ──
+    "CODEX":              "other",
+    "codex":              "other",
+}
+
+
 def _detect_project(repo_name: str) -> str:
-    name = (repo_name or "").lower().replace("-", "").replace("_", "")
+    """Map a GitHub repo name to one of the known project slugs."""
+    raw = (repo_name or "").strip()
+
+    # 1. Explicit override map (exact match on raw repo name)
+    if raw in _REPO_MAP:
+        return _REPO_MAP[raw]
+
+    # 2. Normalised substring matching — strip hyphens, underscores, digits for looser matching
+    name = raw.lower().replace("-", "").replace("_", "").replace(" ", "")
+
     if "agentforge" in name:
         return "agentforge"
     if "linkforge" in name:
         return "linkforge"
-    if "district21" in name or "district" in name:
+    # district21 must be checked before generic "district" to avoid false positives
+    if "district21" in name or "district21" in raw.lower():
         return "district21"
-    if "missioncontrol" in name or "mission" in name:
+    if "missioncontrol" in name:
         return "mission_control"
-    if "backend" in name:
+    # lumynor-backend should map to "other", not lumynor_website
+    if "backend" in name and "lumynor" in name:
         return "other"
-    if "website" in name or "lumynor" in name:
+    if "website" in name or ("lumynor" in name and "backend" not in name):
         return "lumynor_website"
     return "other"
 

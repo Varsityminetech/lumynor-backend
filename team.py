@@ -156,11 +156,16 @@ def update_github_fields(slug: str, **kwargs) -> None:
         updates['updated_at'] = _now()
         try:
             sb.table('projects').update(updates).eq('slug', slug).execute()
-        except Exception:
-            # Phase 4 columns may not exist yet — only update base columns
-            safe = {k: v for k, v in updates.items() if k in ('updated_at',)}
+        except Exception as e:
+            # Phase 4 columns may not exist yet — fall back to only the base fields
+            print(f"[team] update_github_fields full update failed ({e}), trying base fields only")
+            base_github = {'last_activity_at', 'recent_activity_count', 'updated_at'}
+            safe = {k: v for k, v in updates.items() if k in base_github}
             if safe:
-                sb.table('projects').update(safe).eq('slug', slug).execute()
+                try:
+                    sb.table('projects').update(safe).eq('slug', slug).execute()
+                except Exception as e2:
+                    print(f"[team] update_github_fields base-field fallback also failed: {e2}")
 
 
 def delete_project(slug: str) -> None:
