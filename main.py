@@ -2509,6 +2509,25 @@ def revenue_signal_dismiss(signal_id: str, user=Depends(_require_admin)):
 def revenue_readiness(user=Depends(_require_admin)):
     return rr.get_launch_readiness()
 
+# Intelligence: Funding + Market Trends
+@app.get("/api/revenue/intelligence")
+def revenue_intelligence_list(
+    product: str = None, type: str = None,
+    user=Depends(_require_admin)
+):
+    return rr.get_intelligence(product=product, scan_type=type)
+
+@app.post("/api/revenue/intelligence/scan")
+def revenue_intelligence_scan(body: dict, user=Depends(_require_admin)):
+    product   = body.get("product", "all")
+    scan_type = body.get("type", "all")
+    return rr.run_intelligence_scan(product, scan_type)
+
+@app.delete("/api/revenue/intelligence/{item_id}")
+def revenue_intelligence_dismiss(item_id: str, user=Depends(_require_admin)):
+    rr.dismiss_intelligence(item_id)
+    return {"ok": True}
+
 # Discovery query catalogue (for frontend dropdowns)
 @app.get("/api/revenue/catalogue")
 def revenue_catalogue(user=Depends(_require_admin)):

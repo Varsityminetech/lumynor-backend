@@ -602,3 +602,171 @@ def get_launch_readiness() -> dict:
         }
 
     return readiness
+
+
+# ── Intelligence: Funding + Market Trends ────────────────────────────────────
+
+FUNDING_QUERIES = {
+    'district21': [
+        'startup accelerator event tech hospitality India 2025 applications open',
+        'India event management startup grant funding 2025',
+        'SaaS startup accelerator India open applications 2025',
+        'event technology venture capital investment India 2025',
+    ],
+    'agentforge': [
+        'AI startup accelerator 2025 open applications agentic',
+        'generative AI SaaS startup accelerator program 2025',
+        'AI agent startup VC funding seed round 2025',
+        'Microsoft Google startup program AI 2025 apply',
+    ],
+    'linkforge': [
+        'SEO SaaS startup accelerator funding 2025',
+        'content marketing tool startup grant accelerator 2025',
+        'B2B SaaS link building startup VC investment 2025',
+        'martech startup accelerator open applications 2025',
+    ],
+    'all': [
+        'Y Combinator application 2025 open',
+        'Techstars accelerator 2025 apply',
+        'Sequoia Surge India startup 2025',
+        'Google for Startups accelerator India 2025',
+        'Microsoft for Startups program apply 2025',
+        'startup India grant scheme 2025 apply',
+        'NASSCOM startup warehouse program 2025',
+    ],
+}
+
+TREND_QUERIES = {
+    'district21': [
+        'event tech startup ideas trending 2025 funded',
+        'hot product ideas events festivals India 2025',
+        'event management software new features 2025 demand',
+    ],
+    'agentforge': [
+        'hottest AI agent product ideas 2025 market demand',
+        'agentic AI use cases funded startups 2025',
+        'new AI automation product trending Product Hunt 2025',
+    ],
+    'linkforge': [
+        'SEO link building new product ideas 2025 trending',
+        'content marketing SaaS hot features 2025 demand',
+        'backlink analysis tool trends 2025 market',
+    ],
+    'all': [
+        'hottest startup ideas funded 2025 B2B SaaS',
+        'trending product categories venture capital 2025',
+        'new product launches Product Hunt trending this week',
+        'underserved market problems startups solving 2025',
+    ],
+}
+
+
+def _score_intelligence(result: dict, product: str, scan_type: str) -> dict | None:
+    product_name = PRODUCT_META.get(product, {}).get('name', product) if product != 'all' else 'Lumynor (all products)'
+    type_label = 'funding opportunity (accelerator, VC, grant, startup program)' if scan_type == 'funding' else 'market trend or hot product idea'
+
+    prompt = f"""You are evaluating a search result for {product_name} — an early-stage startup.
+
+Looking for: {type_label}
+Title: {result.get('title', '')}
+URL: {result.get('url', '')}
+Snippet: {result.get('snippet', '')}
+
+Respond ONLY with JSON:
+{{
+  "title": "clear, concise title (max 90 chars)",
+  "summary": "2-3 sentences: what this is, why it matters for {product_name}, and any key details like eligibility or deadline",
+  "deadline": {"application deadline or program date if mentioned, else empty string" if scan_type == 'funding' else '""'},
+  "importance": "high|medium|low",
+  "should_include": true or false
+}}
+
+Include only if:
+{"- It is a REAL, currently active or upcoming funding program / accelerator / grant / VC firm actively investing" if scan_type == 'funding' else "- It represents a GENUINELY trending market need or validated product idea with evidence (funding, traction, discussion volume)"}
+- It is clearly relevant to {product_name} or early-stage B2B SaaS startups in general
+- Not generic news, opinions without substance, or expired/closed programs
+
+Be strict. Only high-signal items."""
+
+    try:
+        raw = _llm(prompt, json_mode=True, max_tokens=400)
+        scored = _extract_json(raw)
+        if not scored or not scored.get('should_include'):
+            return None
+        if not scored.get('title', '').strip():
+            return None
+        return {
+            'type':       scan_type,
+            'product':    product,
+            'title':      scored['title'].strip()[:200],
+            'summary':    scored.get('summary', '').strip(),
+            'source_url': result.get('url', ''),
+            'deadline':   scored.get('deadline', '').strip(),
+            'importance': scored.get('importance', 'medium'),
+        }
+    except Exception as e:
+        print(f"[revenue_radar] Intelligence score error: {e}")
+        return None
+
+
+def get_intelligence(product: str = None, scan_type: str = None,
+                     include_dismissed: bool = False) -> list:
+    sb = _sb()
+    if not sb:
+        return []
+    q = sb.table('intelligence_items').select('*')
+    if product:
+        q = q.eq('product', product)
+    if scan_type:
+        q = q.eq('type', scan_type)
+    if not include_dismissed:
+        q = q.eq('dismissed', False)
+    return q.order('detected_at', desc=True).limit(100).execute().data or []
+
+
+def run_intelligence_scan(product: str = 'all', scan_type: str = 'all') -> dict:
+    """Scan for funding opportunities and/or market trends for the given product."""
+    sb = _sb()
+    if not sb:
+        return {'error': 'Database not available'}
+
+    existing_urls = {
+        i.get('source_url', '') for i in get_intelligence(include_dismissed=True)
+    }
+
+    types_to_scan = ['funding', 'trend'] if scan_type == 'all' else [scan_type]
+    products_to_scan = PRODUCTS + ['all'] if product == 'all' else [product, 'all']
+    # deduplicate
+    products_to_scan = list(dict.fromkeys(products_to_scan))
+
+    total_saved = 0
+    by_type = {'funding': 0, 'trend': 0}
+
+    for t in types_to_scan:
+        query_map = FUNDING_QUERIES if t == 'funding' else TREND_QUERIES
+        for prod in products_to_scan:
+            queries = query_map.get(prod, [])
+            for query in queries:
+                results = _search(query, num=5)
+                for result in results:
+                    if result.get('url') in existing_urls:
+                        continue
+                    item = _score_intelligence(result, prod, t)
+                    if not item:
+                        continue
+                    res = sb.table('intelligence_items').insert(item).execute()
+                    row = (res.data or [{}])[0]
+                    if row.get('id'):
+                        existing_urls.add(result.get('url'))
+                        total_saved += 1
+                        by_type[t] += 1
+
+    return {'total_saved': total_saved, 'funding': by_type['funding'], 'trends': by_type['trend']}
+
+
+def dismiss_intelligence(item_id: str) -> bool:
+    sb = _sb()
+    if not sb:
+        return False
+    sb.table('intelligence_items').update({'dismissed': True}).eq('id', item_id).execute()
+    return True
