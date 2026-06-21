@@ -2471,6 +2471,10 @@ def revenue_discover(body: dict, user=Depends(_require_admin)):
     location = body.get("location", "")
     return rr.run_auto_discovery(product, category, limit, location)
 
+@app.post("/api/revenue/rescore")
+def revenue_rescore(user=Depends(_require_admin)):
+    return rr.rescore_all_leads()
+
 # Contacts
 @app.get("/api/revenue/contacts")
 def revenue_contacts_list(lead_id: str, user=Depends(_require_admin)):

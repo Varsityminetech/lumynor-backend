@@ -578,6 +578,27 @@ def reject_lead(lead_id: str) -> dict:
     return update_lead(lead_id, {"status": "rejected"})
 
 
+def rescore_all_leads() -> dict:
+    """Recompute relevance_score for every lead using current _compute_lead_score weights."""
+    sb = _sb()
+    if not sb:
+        return {"error": "No DB connection", "updated": 0}
+    leads = sb.table("revenue_leads").select("*").execute().data or []
+    updated = 0
+    errors = 0
+    for lead in leads:
+        try:
+            new_score = _compute_lead_score(lead)
+            if new_score != lead.get("relevance_score"):
+                sb.table("revenue_leads").update({"relevance_score": new_score}).eq("id", lead["id"]).execute()
+                updated += 1
+        except Exception as e:
+            print(f"[rescore] error on lead {lead.get('id')}: {e}")
+            errors += 1
+    print(f"[rescore] done — {updated} updated, {errors} errors, {len(leads)} total")
+    return {"updated": updated, "errors": errors, "total": len(leads)}
+
+
 # ── Auto-Discovery ─────────────────────────────────────────────────────────────
 
 def _existing_company_names(product: str) -> set:
