@@ -303,10 +303,10 @@ Be strict. Quality over quantity."""
         return None
 
 
-def run_auto_discovery(product: str, category: str, limit: int = 10) -> dict:
+def run_auto_discovery(product: str, category: str, limit: int = 10, location: str = '') -> dict:
     """
     Regulated automated lead discovery.
-    - Runs targeted searches for the product+category
+    - Runs targeted searches for the product+category+location
     - Each result is individually scored by LLM (relevance gate >= 60)
     - Deduplicates against existing leads in DB
     - Saves only verified leads as status=pending_review
@@ -318,7 +318,10 @@ def run_auto_discovery(product: str, category: str, limit: int = 10) -> dict:
         return {"error": f"Unknown category '{category}' for {product}"}
 
     limit = min(limit, 20)  # hard cap at 20 per scan
-    queries = DISCOVERY_QUERIES[product][category]
+    location = location.strip()
+    base_queries = DISCOVERY_QUERIES[product][category]
+    # Append location to each query if provided, otherwise use as-is
+    queries = [f"{q} {location}" if location else q for q in base_queries]
     existing = _existing_company_names(product)
 
     searched = 0

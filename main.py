@@ -2468,7 +2468,8 @@ def revenue_discover(body: dict, user=Depends(_require_admin)):
     product  = body.get("product", "")
     category = body.get("category", "")
     limit    = int(body.get("limit", 10))
-    return rr.run_auto_discovery(product, category, limit)
+    location = body.get("location", "")
+    return rr.run_auto_discovery(product, category, limit, location)
 
 # Contacts
 @app.get("/api/revenue/contacts")
