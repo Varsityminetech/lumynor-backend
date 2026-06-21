@@ -15,14 +15,13 @@ _DEFAULT_PROJECT_STATUSES = {
     "linkforge":       {"status": "Development",  "note": ""},
     "district21":      {"status": "Development",  "note": ""},
     "lumynor_website": {"status": "Production",   "note": ""},
-    "mission_control": {"status": "Planning",     "note": ""},
     "other":           {"status": "Development",  "note": ""},
 }
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 SOURCES     = ('github', 'claude', 'codex', 'website', 'manual', 'system')
-PROJECTS    = ('agentforge', 'linkforge', 'district21', 'mission_control', 'lumynor_website', 'other')
+PROJECTS    = ('agentforge', 'linkforge', 'district21', 'lumynor_website', 'other')
 EVENT_TYPES = ('feature_completed', 'bug_fix', 'deployment', 'decision', 'lead', 'blocker', 'review_needed', 'task_update', 'report', 'milestone')
 STATUSES    = ('new', 'in_progress', 'completed', 'blocked', 'review_needed', 'failed')
 PRIORITIES  = ('low', 'normal', 'important', 'critical')
@@ -162,9 +161,6 @@ _REPO_MAP: dict[str, str] = {
     # ── Lumynor Backend ─────────────────────────────────────
     "lumynor-backend":    "other",
 
-    # ── Mission Control ─────────────────────────────────────
-    "mission-control":    "mission_control",
-    "missioncontrol":     "mission_control",
 
     # ── CODEX — update value to the right project slug if needed ──
     "CODEX":              "other",
@@ -190,9 +186,7 @@ def _detect_project(repo_name: str) -> str:
     # district21 must be checked before generic "district" to avoid false positives
     if "district21" in name or "district21" in raw.lower():
         return "district21"
-    if "missioncontrol" in name:
-        return "mission_control"
-    # lumynor-backend should map to "other", not lumynor_website
+# lumynor-backend should map to "other", not lumynor_website
     if "backend" in name and "lumynor" in name:
         return "other"
     if "website" in name or ("lumynor" in name and "backend" not in name):
