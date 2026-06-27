@@ -54,6 +54,7 @@ def _fetch_page_playwright(url: str) -> dict:
         "form_fields": 0,
         "has_favicon": False,
         "primary_ctas": [],
+        "audience_statement": None,
         "hero_text": None,
         "https": url.startswith("https://"),
         "body_text": "",
@@ -167,12 +168,18 @@ def _fetch_page_playwright(url: str) -> dict:
                 )
 
                 # Primary CTA elements — btn-primary styled links/buttons are the
-                # explicit conversion actions (e.g. "Start Your Project", "Submit Inquiry")
+                # explicit conversion actions (e.g. "Start Your Project", "Contact Us")
                 result["primary_ctas"] = [
                     el.text_content().strip()
                     for el in page.query_selector_all('[class*="btn-primary"]')
                     if el.text_content().strip()
                 ][:8]
+
+                # Target audience statement — explicitly labelled element that answers
+                # "who is this for?" Use aria-label="target-audience" on the element.
+                audience_el = page.query_selector('[aria-label="target-audience"]')
+                if audience_el:
+                    result["audience_statement"] = audience_el.text_content().strip()
 
                 # Hero section text — first <section> captures the above-fold content
                 # including audience tag, H1, and primary CTA copy
@@ -223,6 +230,7 @@ def _fetch_page_http(url: str) -> dict:
         "form_fields": 0,
         "has_favicon": False,
         "primary_ctas": [],
+        "audience_statement": None,
         "hero_text": None,
         "https": url.startswith("https://"),
         "body_text": "",
@@ -351,6 +359,10 @@ def _build_context(page: dict, pagespeed: dict) -> str:
             lines.append(f"H1 headings: {page['h1s']}")
             lines.append(f"H2 headings: {page['h2s']}")
             lines.append(f"Navigation links (actual labels, deduplicated): {page['nav_links']}")
+            # Target audience statement (aria-label="target-audience")
+            if page.get("audience_statement"):
+                lines.append(f"★ TARGET AUDIENCE STATEMENT (explicit element with aria-label='target-audience', visible above H1): \"{page['audience_statement']}\"")
+                lines.append("  → C6-04 PASSES: the page explicitly answers 'Who is this for?' via this element.")
             # Primary CTAs are the most important conversion elements
             if page.get("primary_ctas"):
                 lines.append(f"★ PRIMARY CTA ELEMENTS (btn-primary styled — these are the main conversion actions visible on the page): {page['primary_ctas']}")
@@ -494,7 +506,9 @@ ABSOLUTE RULES — violating any of these makes the audit worthless:
 7. Every finding must include: a principle citation AND a specific, actionable fix. Generic fixes are not acceptable.
 8. PRIMARY CTA IDENTIFICATION (C1-02): The "★ PRIMARY CTA ELEMENTS" field lists all btn-primary styled elements — these are the actual high-prominence conversion buttons/links visible on the page. If this field lists items like "Start Your Project", that CTA IS present and visible. Do NOT flag C1-02 as failing if primary CTAs are listed. The nav_links field contains navigation links, not the primary hero CTA.
 9. NAVIGATION COUNT (C2-01): The nav_links field is already deduplicated. Count only the unique items shown. Do NOT report duplicates unless the exact same label appears twice in the deduplicated list.
-10. HERO CONTENT (C1-01, C6-04): The "★ HERO SECTION TEXT" field contains the above-fold content exactly as rendered. If it contains the value proposition and audience statement, C1-01 and C6-04 pass. Check this field first before flagging these items.
+10. HERO CONTENT AND AUDIENCE (C1-01, C6-04): If the "★ TARGET AUDIENCE STATEMENT" field is present, C6-04 PASSES — the page explicitly answers "Who is this for?" NEVER mark C6-04 as failing when this field exists. For C1-01: if the H1 and hero_text are present, the hero communicates a value proposition and C1-01 passes.
+11. HOVER AND ACTIVE STATES (C4-01): CSS :hover and :active pseudo-states CANNOT be observed from a static rendered page. A Playwright render captures the initial idle state only. NEVER flag C4-01 as failing based on a static render — mark it as "Requires interactive testing — cannot verify from static DOM render." Only flag if the auditor's observations explicitly note missing hover states.
+12. LOADING INDICATORS (C4-07): Loading spinners and progress bars are dynamic states that only appear AFTER a user submits a form or triggers an async action. A static Playwright render will NEVER show them. NEVER flag C4-07 as failing based on static render — mark as "Requires form submission testing — cannot verify from static render." Only flag if the auditor explicitly reports that submitting a form shows no feedback.
 """
 
 
