@@ -580,16 +580,47 @@ def weekly_generate(_admin: dict = Depends(_require_admin)):
     return wi.generate_weekly_report()
 
 
-# ── ATLAS Chat ────────────────────────────────────────────────────────────────
+# ── ATLAS Brain ───────────────────────────────────────────────────────────────
+import atlas_brain as ab
 
 @app.post("/api/atlas/chat")
 def atlas_chat(body: dict, _admin: dict = Depends(_require_admin)):
-    import atlas_chat as ac
     question = (body.get("question") or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="question required")
     history = body.get("history") or []
-    return ac.chat(question, history)
+    return ab.chat(question, history)
+
+@app.get("/api/atlas/situation")
+def atlas_situation(_admin: dict = Depends(_require_admin)):
+    return ab.analyze_situation()
+
+@app.get("/api/atlas/proactive/preview")
+def atlas_proactive_preview(_admin: dict = Depends(_require_admin)):
+    situation = ab.analyze_situation()
+    text      = ab.generate_proactive_message(situation)
+    return {"message": text, "situation": situation}
+
+@app.post("/api/atlas/proactive/send")
+def atlas_proactive_send(_admin: dict = Depends(_require_admin)):
+    return ab.run_proactive_check()
+
+@app.get("/api/atlas/settings")
+def atlas_settings_get(_admin: dict = Depends(_require_admin)):
+    stored = db.get_settings("atlas")
+    return {
+        "proactive_enabled":    stored.get("proactive_enabled", True),
+        "proactive_hour_utc":   stored.get("proactive_hour_utc", 14),
+        "proactive_minute":     stored.get("proactive_minute", 30),
+    }
+
+@app.post("/api/atlas/settings")
+def atlas_settings_save(body: dict, _admin: dict = Depends(_require_admin)):
+    allowed = {"proactive_enabled", "proactive_hour_utc", "proactive_minute"}
+    updates = {k: v for k, v in body.items() if k in allowed}
+    existing = db.get_settings("atlas")
+    db.save_settings({**existing, **updates}, "atlas")
+    return {**existing, **updates}
 
 
 # ── Daily Digest ──────────────────────────────────────────────────────────────
@@ -2412,6 +2443,7 @@ async def startup_event():
     asyncio.create_task(auto_blogger_daemon())
     asyncio.create_task(weekly_intel_daemon())
     asyncio.create_task(digest_daemon())
+    asyncio.create_task(atlas_proactive_daemon())
 
 
 async def digest_daemon():
@@ -2441,6 +2473,37 @@ async def digest_daemon():
                 print(f"[digest] Result: {result}")
         except Exception as e:
             print(f"[digest] daemon error: {e}")
+        await _aio.sleep(60)
+
+
+async def atlas_proactive_daemon():
+    """Send ATLAS evening check-in message at configured UTC time (default 14:30 UTC = 20:00 IST)."""
+    import asyncio as _aio
+    from datetime import datetime, timezone
+    await _aio.sleep(120)
+    last_sent_date: str | None = None
+    while True:
+        try:
+            now    = datetime.now(timezone.utc)
+            stored = db.get_settings("atlas")
+            send_hour   = int(stored.get("proactive_hour_utc", 14))
+            send_minute = int(stored.get("proactive_minute", 30))
+            enabled     = stored.get("proactive_enabled", True)
+            to_number   = (db.get_settings("digest").get("digestTo") or "").strip()
+            today = now.date().isoformat()
+            if (
+                enabled
+                and now.hour == send_hour
+                and now.minute == send_minute
+                and last_sent_date != today
+                and to_number
+            ):
+                print(f"[atlas] Sending evening proactive message for {today}")
+                result = ab.run_proactive_check()
+                last_sent_date = today
+                print(f"[atlas] Result: {result.get('ok')} | type={result.get('situation', {}).get('msg_type')}")
+        except Exception as e:
+            print(f"[atlas] daemon error: {e}")
         await _aio.sleep(60)
 
 
