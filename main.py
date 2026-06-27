@@ -623,6 +623,39 @@ def atlas_settings_save(body: dict, _admin: dict = Depends(_require_admin)):
     return {**existing, **updates}
 
 
+# ── Design Audit Agent ────────────────────────────────────────────────────────
+import design_audit as da
+
+@app.post("/api/design-audit/run")
+def design_audit_run(body: dict, _admin: dict = Depends(_require_admin)):
+    url   = (body.get("url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url required")
+    pages         = body.get("pages") or [url]
+    notes         = body.get("notes") or ""
+    auditor_notes = body.get("auditor_notes") or ""
+    report = da.run_audit(url, pages, notes, auditor_notes)
+    if report.get("error"):
+        raise HTTPException(status_code=500, detail=report["error"])
+    return da.save_audit(report)
+
+@app.get("/api/design-audit/history")
+def design_audit_history(limit: int = 20, _admin: dict = Depends(_require_admin)):
+    return da.get_audits(limit)
+
+@app.get("/api/design-audit/{audit_id}")
+def design_audit_get(audit_id: str, _admin: dict = Depends(_require_admin)):
+    report = da.get_audit(audit_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="Audit not found")
+    return report
+
+@app.delete("/api/design-audit/{audit_id}")
+def design_audit_delete(audit_id: str, _admin: dict = Depends(_require_admin)):
+    da.delete_audit(audit_id)
+    return {"ok": True}
+
+
 # ── Daily Digest ──────────────────────────────────────────────────────────────
 
 @app.get("/api/digest/preview")
