@@ -589,6 +589,7 @@ def create_lead(data: dict, source: str = 'manual') -> dict:
         "business_size":    data.get("business_size", "smb"),
         "digital_maturity": data.get("digital_maturity", "basic"),
         "buying_signals":   data.get("buying_signals", ""),
+        "outreach_approach": data.get("outreach_approach", ""),
         "source":           source,
         "source_url":       data.get("source_url", ""),
         "notes":            data.get("notes", ""),
@@ -608,7 +609,7 @@ def update_lead(lead_id: str, data: dict) -> dict:
                "review_count", "review_platform", "established_year",
                "verified", "category", "temperature", "relevance_score",
                "business_size", "digital_maturity", "buying_signals",
-               "notes", "status", "source_url"}
+               "outreach_approach", "notes", "status", "source_url"}
     payload = {k: v for k, v in data.items() if k in allowed}
     payload["updated_at"] = _now()
     res = sb.table("revenue_leads").update(payload).eq("id", lead_id).execute()
@@ -794,6 +795,7 @@ Respond ONLY with this JSON — extract everything you can see, leave fields emp
   "verified": false or true (true if listing shows verified/trusted badge),
   "business_size": "startup|smb|enterprise",
   "buying_signals": "brief description of why they need our product, else empty",
+  "outreach_approach": "1-2 sentence specific approach: which channel (WhatsApp/call/Instagram DM/email), what opening hook to use based on their signals, e.g. 'WhatsApp them — mention their 4.2★ rating shows established clientele, lead with how we eliminate double-bookings digitally', else empty",
   "temperature": "hot|warm|cold",
   "should_include": true or false,
   "reject_reason": "only fill if should_include is false"
@@ -878,8 +880,9 @@ Rules for should_include:
             "category":        category,
             "temperature":     data.get("temperature", "cold"),
             "business_size":   data.get("business_size", "smb"),
-            "buying_signals":  data.get("buying_signals", ""),
-            "source_url":      result.get("url", ""),
+            "buying_signals":     data.get("buying_signals", ""),
+            "outreach_approach":  data.get("outreach_approach", ""),
+            "source_url":         result.get("url", ""),
         }
         extracted["relevance_score"] = _compute_lead_score(extracted)
         return extracted
