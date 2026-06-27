@@ -617,12 +617,14 @@ def get_digest_settings(_admin: dict = Depends(_require_admin)):
         "twilioAuthToken":  stored.get("twilioAuthToken", ""),
         "twilioFrom":       stored.get("twilioFrom", "whatsapp:+14155238886"),
         "digestTo":         stored.get("digestTo", ""),
+        "send_hour_utc":    stored.get("send_hour_utc", 2),
+        "send_minute":      stored.get("send_minute", 30),
     }
 
 
 @app.post("/api/system/digest-settings")
 def save_digest_settings(body: dict, _admin: dict = Depends(_require_admin)):
-    allowed = {"twilioAccountSid", "twilioAuthToken", "twilioFrom", "digestTo"}
+    allowed = {"twilioAccountSid", "twilioAuthToken", "twilioFrom", "digestTo", "send_hour_utc", "send_minute"}
     updates = {k: v for k, v in body.items() if k in allowed}
     existing = db.get_settings("digest")
     db.save_settings({**existing, **updates}, "digest")
@@ -2409,6 +2411,37 @@ def migrate_json_to_supabase():
 async def startup_event():
     asyncio.create_task(auto_blogger_daemon())
     asyncio.create_task(weekly_intel_daemon())
+    asyncio.create_task(digest_daemon())
+
+
+async def digest_daemon():
+    """Auto-send morning digest at configured UTC time (default 02:30 UTC = 08:00 IST)."""
+    import asyncio as _aio
+    from datetime import datetime, timezone
+    await _aio.sleep(90)
+    last_sent_date: str | None = None
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            stored = db.get_settings("digest")
+            send_hour   = int(stored.get("send_hour_utc", 2))
+            send_minute = int(stored.get("send_minute", 30))
+            to_number   = (stored.get("digestTo") or "").strip()
+            today = now.date().isoformat()
+            if (
+                now.hour == send_hour
+                and now.minute == send_minute
+                and last_sent_date != today
+                and to_number
+            ):
+                print(f"[digest] Auto-sending morning digest for {today}")
+                from digest import send_digest
+                result = send_digest()
+                last_sent_date = today
+                print(f"[digest] Result: {result}")
+        except Exception as e:
+            print(f"[digest] daemon error: {e}")
+        await _aio.sleep(60)
 
 
 async def weekly_intel_daemon():
