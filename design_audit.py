@@ -116,12 +116,14 @@ def _fetch_page_playwright(url: str) -> dict:
                     if el.text_content().strip()
                 ][:8]
 
-                # Navigation
-                result["nav_links"] = [
+                # Navigation — deduplicate to avoid counting mobile menu items twice
+                # (both desktop and hidden mobile menus live inside <nav> in the DOM)
+                nav_raw = [
                     el.text_content().strip()
                     for el in page.query_selector_all("nav a")
                     if el.text_content().strip()
                 ]
+                result["nav_links"] = list(dict.fromkeys(nav_raw))
 
                 # Buttons
                 result["button_texts"] = [
