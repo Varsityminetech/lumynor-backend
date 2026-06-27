@@ -53,6 +53,8 @@ def _fetch_page_playwright(url: str) -> dict:
         "footer_links": [],
         "form_fields": 0,
         "has_favicon": False,
+        "primary_ctas": [],
+        "hero_text": None,
         "https": url.startswith("https://"),
         "body_text": "",
     }
@@ -164,6 +166,20 @@ def _fetch_page_playwright(url: str) -> dict:
                     page.query_selector_all("input, select, textarea")
                 )
 
+                # Primary CTA elements — btn-primary styled links/buttons are the
+                # explicit conversion actions (e.g. "Start Your Project", "Submit Inquiry")
+                result["primary_ctas"] = [
+                    el.text_content().strip()
+                    for el in page.query_selector_all('[class*="btn-primary"]')
+                    if el.text_content().strip()
+                ][:8]
+
+                # Hero section text — first <section> captures the above-fold content
+                # including audience tag, H1, and primary CTA copy
+                first_section = page.query_selector("section")
+                if first_section:
+                    result["hero_text"] = " ".join(first_section.inner_text().split())[:600]
+
                 # Body text (rendered)
                 body_text = " ".join(page.inner_text("body").split())
                 result["body_text"] = body_text[:2000]
@@ -206,6 +222,8 @@ def _fetch_page_http(url: str) -> dict:
         "footer_links": [],
         "form_fields": 0,
         "has_favicon": False,
+        "primary_ctas": [],
+        "hero_text": None,
         "https": url.startswith("https://"),
         "body_text": "",
     }
@@ -332,13 +350,20 @@ def _build_context(page: dict, pagespeed: dict) -> str:
         if not page["is_spa"]:
             lines.append(f"H1 headings: {page['h1s']}")
             lines.append(f"H2 headings: {page['h2s']}")
-            lines.append(f"Navigation links (actual labels): {page['nav_links']}")
-            lines.append(f"Button texts (actual labels): {page['button_texts']}")
+            lines.append(f"Navigation links (actual labels, deduplicated): {page['nav_links']}")
+            # Primary CTAs are the most important conversion elements
+            if page.get("primary_ctas"):
+                lines.append(f"★ PRIMARY CTA ELEMENTS (btn-primary styled — these are the main conversion actions visible on the page): {page['primary_ctas']}")
+            else:
+                lines.append("Primary CTA elements: none detected via btn-primary class")
+            lines.append(f"Button texts (all buttons): {page['button_texts']}")
             lines.append(f"Link texts (sample): {page['link_texts'][:20]}")
             lines.append(f"Footer links: {page['footer_links']}")
             lines.append(f"Images: {page['images_total']} total, {page['images_missing_alt']} missing alt attribute")
             lines.append(f"External links without target=_blank: {page['external_links_no_target']}")
             lines.append(f"Form input fields: {page['form_fields']}")
+            if page.get("hero_text"):
+                lines.append(f"★ HERO SECTION TEXT (above-fold content — first section rendered): {page['hero_text']}")
             if page["body_text"]:
                 lines.append(f"Body text sample:\n{page['body_text']}")
 
@@ -467,6 +492,9 @@ ABSOLUTE RULES — violating any of these makes the audit worthless:
 5. For performance items: USE the PageSpeed scores provided. If PageSpeed errored, write "PageSpeed unavailable — cannot verify." NEVER invent LCP/CLS values.
 6. Overall score: start at 10. Deduct 1 per Critical fail (evidence-based only). Deduct 0.5 per High fail (evidence-based only). Items that cannot be verified do NOT cause deductions.
 7. Every finding must include: a principle citation AND a specific, actionable fix. Generic fixes are not acceptable.
+8. PRIMARY CTA IDENTIFICATION (C1-02): The "★ PRIMARY CTA ELEMENTS" field lists all btn-primary styled elements — these are the actual high-prominence conversion buttons/links visible on the page. If this field lists items like "Start Your Project", that CTA IS present and visible. Do NOT flag C1-02 as failing if primary CTAs are listed. The nav_links field contains navigation links, not the primary hero CTA.
+9. NAVIGATION COUNT (C2-01): The nav_links field is already deduplicated. Count only the unique items shown. Do NOT report duplicates unless the exact same label appears twice in the deduplicated list.
+10. HERO CONTENT (C1-01, C6-04): The "★ HERO SECTION TEXT" field contains the above-fold content exactly as rendered. If it contains the value proposition and audience statement, C1-01 and C6-04 pass. Check this field first before flagging these items.
 """
 
 
