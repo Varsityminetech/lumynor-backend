@@ -1,17 +1,187 @@
 """
 Lumynor Design Audit Agent
-Evaluates web pages against the Lumynor UI/UX Design Principles (v1.0, June 2026)
-synthesised from Nielsen, Norman, Yablonski, Spool, van Schneider, Babich,
-Teleanu, Vitale, and Wroblewski.
+Evaluates web pages against the Lumynor UI/UX Design Principles (v1.0, June 2026).
+
+Fetches the live URL (HTML + Google PageSpeed Insights) before calling the LLM
+so every finding is grounded in real data — no hallucination.
 """
 import json
 import re
 import uuid
+import requests
+from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 from db import _sb, get_settings
 
 
-# ── Full audit knowledge base embedded ───────────────────────────────────────
+# ── Live page fetcher ─────────────────────────────────────────────────────────
+
+def _fetch_page(url: str) -> dict:
+    """
+    Fetch a page via HTTP and extract structural data.
+    Detects JS SPAs (React/Vue/Angular) and notes that content is client-rendered.
+    """
+    result = {
+        "url": url,
+        "fetch_error": None,
+        "is_spa": False,
+        "status_code": None,
+        "title": None,
+        "meta_description": None,
+        "h1s": [],
+        "h2s": [],
+        "h3s": [],
+        "nav_links": [],
+        "button_texts": [],
+        "link_texts": [],
+        "images_total": 0,
+        "images_missing_alt": 0,
+        "external_links_no_target": 0,
+        "footer_links": [],
+        "form_fields": 0,
+        "has_favicon": False,
+        "https": url.startswith("https://"),
+        "body_text": "",
+    }
+
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; LumynorAuditBot/1.0)"}
+        resp = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
+        result["status_code"] = resp.status_code
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Detect SPA: body has almost no text and has a root div
+        body_text = " ".join(soup.get_text(" ", strip=True).split())
+        result["is_spa"] = (
+            len(body_text) < 300 and
+            bool(soup.find("div", id=re.compile(r"^(root|app)$")))
+        )
+
+        result["title"] = soup.title.get_text(strip=True) if soup.title else None
+        meta = soup.find("meta", {"name": "description"})
+        result["meta_description"] = meta.get("content", "").strip() if meta else None
+        result["has_favicon"] = bool(
+            soup.find("link", rel=lambda r: r and any("icon" in x for x in r))
+        )
+
+        if not result["is_spa"]:
+            result["h1s"]        = [h.get_text(strip=True) for h in soup.find_all("h1")][:5]
+            result["h2s"]        = [h.get_text(strip=True) for h in soup.find_all("h2")][:8]
+            result["h3s"]        = [h.get_text(strip=True) for h in soup.find_all("h3")][:8]
+            result["nav_links"]  = [a.get_text(strip=True) for a in soup.select("nav a") if a.get_text(strip=True)]
+            result["button_texts"] = [b.get_text(strip=True) for b in soup.find_all("button") if b.get_text(strip=True)][:15]
+            result["link_texts"] = [a.get_text(strip=True) for a in soup.find_all("a") if a.get_text(strip=True)][:30]
+            result["footer_links"] = [a.get_text(strip=True) for a in soup.select("footer a")]
+
+            imgs = soup.find_all("img")
+            result["images_total"]       = len(imgs)
+            result["images_missing_alt"] = len([i for i in imgs if not i.get("alt")])
+
+            ext = [a for a in soup.find_all("a", href=True) if a["href"].startswith("http")]
+            result["external_links_no_target"] = len([a for a in ext if not a.get("target")])
+
+            form_inputs = soup.find_all(["input", "select", "textarea"])
+            result["form_fields"] = len(form_inputs)
+
+            result["body_text"] = body_text[:2000]
+
+    except Exception as exc:
+        result["fetch_error"] = str(exc)[:200]
+
+    return result
+
+
+def _fetch_pagespeed(url: str) -> dict:
+    """
+    Call Google PageSpeed Insights API (unauthenticated, mobile strategy).
+    Returns real Core Web Vitals and Lighthouse scores.
+    """
+    try:
+        api = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&strategy=mobile"
+        resp = requests.get(api, timeout=45)
+        if resp.status_code != 200:
+            return {"error": f"PageSpeed API returned {resp.status_code}"}
+
+        data   = resp.json()
+        cats   = data.get("lighthouseResult", {}).get("categories", {})
+        audits = data.get("lighthouseResult", {}).get("audits", {})
+
+        def score(key):
+            s = cats.get(key, {}).get("score")
+            return round(s * 100) if s is not None else "n/a"
+
+        def metric(key):
+            return audits.get(key, {}).get("displayValue", "n/a")
+
+        return {
+            "performance":     score("performance"),
+            "accessibility":   score("accessibility"),
+            "seo":             score("seo"),
+            "best_practices":  score("best-practices"),
+            "lcp":             metric("largest-contentful-paint"),
+            "cls":             metric("cumulative-layout-shift"),
+            "tbt":             metric("total-blocking-time"),   # proxy for FID
+            "speed_index":     metric("speed-index"),
+            "fcp":             metric("first-contentful-paint"),
+            "images_not_lazy": audits.get("uses-lazy-loading", {}).get("score"),
+            "image_alts":      audits.get("image-alt", {}).get("score"),
+            "tap_targets":     audits.get("tap-targets", {}).get("score"),
+        }
+    except Exception as exc:
+        return {"error": str(exc)[:200]}
+
+
+def _build_context(page: dict, pagespeed: dict) -> str:
+    """Serialise fetched data into a readable block for the LLM prompt."""
+    lines = [f"=== LIVE PAGE DATA: {page['url']} ==="]
+
+    if page.get("fetch_error"):
+        lines.append(f"⚠ HTTP fetch failed: {page['fetch_error']}")
+    else:
+        lines.append(f"Status: {page['status_code']} | HTTPS: {page['https']}")
+        if page["is_spa"]:
+            lines.append("⚠ JavaScript SPA detected — HTML content is client-rendered.")
+            lines.append("  Only <title> and <meta description> are available from source.")
+        lines.append(f"Title: {page['title']}")
+        lines.append(f"Meta description: {page['meta_description']}")
+        lines.append(f"Favicon: {'yes' if page['has_favicon'] else 'no'}")
+
+        if not page["is_spa"]:
+            lines.append(f"H1 headings: {page['h1s']}")
+            lines.append(f"H2 headings: {page['h2s']}")
+            lines.append(f"Navigation links (actual labels): {page['nav_links']}")
+            lines.append(f"Button texts (actual labels): {page['button_texts']}")
+            lines.append(f"Link texts (sample): {page['link_texts'][:20]}")
+            lines.append(f"Footer links: {page['footer_links']}")
+            lines.append(f"Images: {page['images_total']} total, "
+                         f"{page['images_missing_alt']} missing alt attribute")
+            lines.append(f"External links without target=_blank: {page['external_links_no_target']}")
+            lines.append(f"Form input fields: {page['form_fields']}")
+            if page["body_text"]:
+                lines.append(f"Body text sample:\n{page['body_text']}")
+
+    lines.append("")
+    lines.append("=== GOOGLE PAGESPEED INSIGHTS (Mobile) ===")
+    if "error" in pagespeed:
+        lines.append(f"⚠ PageSpeed API error: {pagespeed['error']}")
+    else:
+        lines.append(f"Performance: {pagespeed['performance']}/100")
+        lines.append(f"Accessibility: {pagespeed['accessibility']}/100")
+        lines.append(f"SEO: {pagespeed['seo']}/100")
+        lines.append(f"Best Practices: {pagespeed['best_practices']}/100")
+        lines.append(f"LCP (Largest Contentful Paint): {pagespeed['lcp']}")
+        lines.append(f"CLS (Cumulative Layout Shift): {pagespeed['cls']}")
+        lines.append(f"TBT (Total Blocking Time / FID proxy): {pagespeed['tbt']}")
+        lines.append(f"FCP (First Contentful Paint): {pagespeed['fcp']}")
+        lines.append(f"Speed Index: {pagespeed['speed_index']}")
+        lines.append(f"Lazy loading score: {pagespeed['images_not_lazy']}")
+        lines.append(f"Image alt attribute score: {pagespeed['image_alts']}")
+        lines.append(f"Tap target size score: {pagespeed['tap_targets']}")
+
+    return "\n".join(lines)
+
+
+# ── System prompt ─────────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """You are the Lumynor Design Audit Agent. Your knowledge base is the Lumynor UI/UX Design Principles document (v1.0, June 2026).
 
@@ -81,7 +251,7 @@ CATEGORY 6 — Conversion & Business Goals:
 [C6-05 · High]      Clear next step at the end of every page — no dead ends | Nielsen H3 / Goal-Gradient Effect
 [C6-06 · High]      Contact information findable from every page in under 2 clicks | Nielsen H6 / Spool
 
-HEURISTIC MAP — also assess each Nielsen heuristic:
+HEURISTIC MAP — assess each Nielsen heuristic:
 H1 Visibility of System Status | H2 Match System & Real World | H3 User Control & Freedom
 H4 Consistency & Standards | H5 Error Prevention | H6 Recognition Rather than Recall
 H7 Flexibility & Efficiency | H8 Aesthetic & Minimalist Design | H9 Help Users Recover from Errors
@@ -95,34 +265,25 @@ OUTPUT FORMAT — respond with ONLY valid JSON matching this exact schema:
   "critical_issues": [
     {"id": "C1-01", "issue": "<specific finding>", "page": "<which page>", "principle": "<Designer · Principle Name>", "fix": "<specific actionable fix>"}
   ],
-  "high_issues": [
-    {"id": "C1-03", "issue": "<specific finding>", "page": "<which page>", "principle": "<Designer · Principle Name>", "fix": "<specific actionable fix>"}
-  ],
-  "medium_issues": [
-    {"id": "C1-08", "issue": "<specific finding>", "page": "<which page>", "principle": "<Designer · Principle Name>", "fix": "<specific actionable fix>"}
-  ],
+  "high_issues": [...],
+  "medium_issues": [...],
   "strengths": [
-    {"area": "<strength area>", "detail": "<what specifically is working and why it matters>", "principle": "<principle it satisfies>"}
+    {"area": "<strength area>", "detail": "<what specifically is working>", "principle": "<principle it satisfies>"}
   ],
-  "heuristic_map": {
-    "H1": "pass", "H2": "fail", "H3": "pass", "H4": "pass",
-    "H5": "partial", "H6": "fail", "H7": "pass", "H8": "partial",
-    "H9": "fail", "H10": "pass"
-  },
+  "heuristic_map": {"H1": "pass", "H2": "fail", ...},
   "fix_roadmap": [
     {"priority": 1, "action": "<specific action>", "impact": "High", "effort": "Low", "principle": "<principle>"}
   ]
 }
 
-RULES — non-negotiable:
-- Every finding must cite the specific principle. Format: "Designer/Framework · Principle Name"
-- No finding without a principle citation.
-- No recommendation without a specific, actionable fix.
-- Severity must come from the checklist: Critical / High / Medium only.
-- Heuristic map status: "pass" / "fail" / "partial" only.
-- Fix roadmap must be sorted by Impact × Effort (high impact, low effort first).
-- If a section cannot be evaluated from the provided information, add it to medium_issues with issue: "Cannot evaluate from provided information — manual review required."
-- Overall score: 1–10. Deduct 1 point per Critical fail. Deduct 0.5 per High fail. Start at 10.
+ABSOLUTE RULES — violating any of these makes the audit worthless:
+1. NEVER invent or guess facts that appear in the LIVE PAGE DATA. If nav_links shows ['Work', 'Products', 'Blog', 'About'], those are the exact labels — do not say navigation uses jargon unless one of those specific labels is jargon.
+2. NEVER guess CTA text, headlines, or nav labels. Only report what the fetched data shows.
+3. For checklist items that CAN be verified from fetched data (nav labels, headings, image alt, HTTPS, external link targets, PageSpeed scores), your finding MUST match the data.
+4. For items that require visual inspection (colour contrast, whitespace, animation quality, visual design taste), note issue: "Requires visual review — cannot verify from page source."
+5. For performance items: USE the PageSpeed scores provided. Do not invent LCP/CLS values.
+6. Overall score: start at 10. Deduct 1 per Critical fail (evidence-based only). Deduct 0.5 per High fail (evidence-based only).
+7. Every finding needs: a principle citation AND a specific fix. Generic fixes are not acceptable.
 """
 
 
@@ -130,8 +291,10 @@ RULES — non-negotiable:
 
 def run_audit(url: str, pages: list = None, notes: str = "", auditor_notes: str = "") -> dict:
     """
-    Run a full design audit against the Lumynor Design Principles checklist.
-    Returns a structured report dict.
+    Run a full design audit:
+    1. Fetch the live URL (HTML extraction + PageSpeed Insights)
+    2. Build a factual context block
+    3. Ask the LLM to evaluate against the 41-item checklist
     """
     try:
         from auto_blogger import _build_llm_cfg, _llm
@@ -143,21 +306,37 @@ def run_audit(url: str, pages: list = None, notes: str = "", auditor_notes: str 
     if not gemini_key and stored.get("llmProvider", "gemini") == "gemini":
         return {"error": "LLM not configured — set API key in Settings → Auto Blogger"}
 
-    pages_str = ", ".join(pages) if pages else url
-    notes_section = f"\n\nAUDITOR OBSERVATIONS:\n{notes}" if notes.strip() else ""
-    extra_notes   = f"\n\nADDITIONAL CONTEXT:\n{auditor_notes}" if auditor_notes.strip() else ""
+    # ── Step 1: fetch live data ───────────────────────────────────────────────
+    page_data  = _fetch_page(url)
+    pagespeed  = _fetch_pagespeed(url)
+    live_ctx   = _build_context(page_data, pagespeed)
 
-    user_prompt = f"""Audit the following website against the complete checklist above.
+    # ── Step 2: build prompt ──────────────────────────────────────────────────
+    pages_str   = ", ".join(pages) if pages else "Homepage"
+    notes_block = f"\nAUDITOR OBSERVATIONS (manual notes from reviewer):\n{notes.strip()}" if notes.strip() else ""
+    extra_block = f"\nADDITIONAL CONTEXT:\n{auditor_notes.strip()}" if auditor_notes.strip() else ""
+
+    user_prompt = f"""Audit the website below. Use the LIVE PAGE DATA as ground truth.
 
 URL: {url}
-Pages being audited: {pages_str}{notes_section}{extra_notes}
+Pages to evaluate: {pages_str}
 
-Evaluate every checklist item. For items you cannot assess from the provided information, note them explicitly.
+{live_ctx}
+{notes_block}
+{extra_block}
+
+INSTRUCTIONS:
+- Every finding based on nav labels, headings, button texts, PageSpeed scores, or image alt data must quote or reference the actual fetched value.
+- If the live data shows a page IS client-rendered (SPA), do not report findings about content you cannot see — instead note "SPA: content requires visual review".
+- Use PageSpeed scores for ALL performance findings (C5-01, C5-02). Quote the actual LCP/CLS values.
+- Do NOT assume anything. If you cannot verify it, say so.
+
 Return ONLY valid JSON — no markdown fences, no explanation outside the JSON."""
 
+    # ── Step 3: LLM evaluation ────────────────────────────────────────────────
     try:
         llm_cfg = _build_llm_cfg(stored, gemini_key)
-        raw     = _llm(
+        raw = _llm(
             f"{_SYSTEM_PROMPT}\n\n{user_prompt}",
             llm_cfg,
             json_mode=False,
@@ -165,15 +344,16 @@ Return ONLY valid JSON — no markdown fences, no explanation outside the JSON."
             max_tokens=4000,
         )
 
-        # Extract JSON from response
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         if not match:
             return {"error": "LLM did not return valid JSON", "raw": raw[:500]}
 
         report = json.loads(match.group())
-        report["url"]          = url
-        report["audited_at"]   = datetime.now(timezone.utc).isoformat()
-        report["notes"]        = notes
+        report["url"]        = url
+        report["audited_at"] = datetime.now(timezone.utc).isoformat()
+        report["notes"]      = notes
+        report["pagespeed"]  = pagespeed   # attach raw scores to report
+        report["is_spa"]     = page_data.get("is_spa", False)
         return report
 
     except json.JSONDecodeError as e:
