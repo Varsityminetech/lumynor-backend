@@ -2,11 +2,12 @@
 Lumynor Design Audit Agent
 Evaluates web pages against the Lumynor UI/UX Design Principles (v1.0, June 2026).
 
-Fetches the live URL (HTML + Google PageSpeed Insights) before calling the LLM
-so every finding is grounded in real data — no hallucination.
+Fetches the live URL with a headless Playwright browser (renders React/SPAs fully),
+then queries Google PageSpeed Insights — so every finding is grounded in real data.
 """
 import json
 import re
+import shutil
 import uuid
 import requests
 from bs4 import BeautifulSoup
@@ -14,16 +15,179 @@ from datetime import datetime, timezone
 from db import _sb, get_settings
 
 
-# ── Live page fetcher ─────────────────────────────────────────────────────────
+# ── Live page fetcher (Playwright headless browser) ───────────────────────────
 
-def _fetch_page(url: str) -> dict:
+def _find_system_chromium() -> str | None:
+    """Return path to a system-installed Chromium binary, or None."""
+    for name in ("chromium", "chromium-browser", "google-chrome-stable", "google-chrome"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def _fetch_page_playwright(url: str) -> dict:
     """
-    Fetch a page via HTTP and extract structural data.
-    Detects JS SPAs (React/Vue/Angular) and notes that content is client-rendered.
+    Render the page with a headless Chromium (waits for React/SPA hydration)
+    then extract the full live DOM.
+    """
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+    result = {
+        "url": url,
+        "fetch_error": None,
+        "render_method": "playwright",
+        "is_spa": False,          # We rendered it — content is fully visible
+        "status_code": None,
+        "title": None,
+        "meta_description": None,
+        "h1s": [],
+        "h2s": [],
+        "h3s": [],
+        "nav_links": [],
+        "button_texts": [],
+        "link_texts": [],
+        "images_total": 0,
+        "images_missing_alt": 0,
+        "external_links_no_target": 0,
+        "footer_links": [],
+        "form_fields": 0,
+        "has_favicon": False,
+        "https": url.startswith("https://"),
+        "body_text": "",
+    }
+
+    try:
+        chromium_path = _find_system_chromium()
+        with sync_playwright() as pw:
+            launch_kwargs = {
+                "headless": True,
+                "args": [
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-setuid-sandbox",
+                    "--disable-web-security",
+                ],
+            }
+            if chromium_path:
+                launch_kwargs["executable_path"] = chromium_path
+
+            browser = pw.chromium.launch(**launch_kwargs)
+            context = browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            )
+            page = context.new_page()
+
+            try:
+                resp = page.goto(url, wait_until="networkidle", timeout=30_000)
+                result["status_code"] = resp.status if resp else None
+                # Extra wait for React hydration / lazy mounts
+                page.wait_for_timeout(2_500)
+
+                result["title"] = page.title()
+
+                # Meta description
+                meta = page.query_selector('meta[name="description"]')
+                if meta:
+                    result["meta_description"] = meta.get_attribute("content")
+
+                # Favicon
+                result["has_favicon"] = bool(
+                    page.query_selector('link[rel*="icon"]')
+                )
+
+                # Headings
+                result["h1s"] = [
+                    el.text_content().strip()
+                    for el in page.query_selector_all("h1")
+                    if el.text_content().strip()
+                ][:5]
+                result["h2s"] = [
+                    el.text_content().strip()
+                    for el in page.query_selector_all("h2")
+                    if el.text_content().strip()
+                ][:8]
+                result["h3s"] = [
+                    el.text_content().strip()
+                    for el in page.query_selector_all("h3")
+                    if el.text_content().strip()
+                ][:8]
+
+                # Navigation
+                result["nav_links"] = [
+                    el.text_content().strip()
+                    for el in page.query_selector_all("nav a")
+                    if el.text_content().strip()
+                ]
+
+                # Buttons
+                result["button_texts"] = [
+                    el.text_content().strip()
+                    for el in page.query_selector_all("button")
+                    if el.text_content().strip()
+                ][:15]
+
+                # Links sample
+                result["link_texts"] = [
+                    el.text_content().strip()
+                    for el in page.query_selector_all("a")
+                    if el.text_content().strip()
+                ][:30]
+
+                # Footer links
+                result["footer_links"] = [
+                    el.text_content().strip()
+                    for el in page.query_selector_all("footer a")
+                    if el.text_content().strip()
+                ]
+
+                # Images
+                imgs = page.query_selector_all("img")
+                result["images_total"] = len(imgs)
+                result["images_missing_alt"] = len(
+                    [i for i in imgs if not i.get_attribute("alt")]
+                )
+
+                # External links without target=_blank
+                ext = page.query_selector_all('a[href^="http"]')
+                result["external_links_no_target"] = len(
+                    [a for a in ext if not a.get_attribute("target")]
+                )
+
+                # Form fields
+                result["form_fields"] = len(
+                    page.query_selector_all("input, select, textarea")
+                )
+
+                # Body text (rendered)
+                body_text = " ".join(page.inner_text("body").split())
+                result["body_text"] = body_text[:2000]
+
+            except PWTimeout:
+                result["fetch_error"] = "Page load timed out after 30s"
+            finally:
+                browser.close()
+
+    except ImportError:
+        raise  # let caller fall back to HTTP
+    except Exception as exc:
+        result["fetch_error"] = str(exc)[:300]
+
+    return result
+
+
+def _fetch_page_http(url: str) -> dict:
+    """
+    Plain HTTP fallback — only works for server-rendered pages.
+    Detects JS SPAs and marks content as unverifiable.
     """
     result = {
         "url": url,
         "fetch_error": None,
+        "render_method": "http",
         "is_spa": False,
         "status_code": None,
         "title": None,
@@ -50,11 +214,10 @@ def _fetch_page(url: str) -> dict:
         result["status_code"] = resp.status_code
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Detect SPA: body has almost no text and has a root div
         body_text = " ".join(soup.get_text(" ", strip=True).split())
         result["is_spa"] = (
-            len(body_text) < 300 and
-            bool(soup.find("div", id=re.compile(r"^(root|app)$")))
+            len(body_text) < 300
+            and bool(soup.find("div", id=re.compile(r"^(root|app)$")))
         )
 
         result["title"] = soup.title.get_text(strip=True) if soup.title else None
@@ -65,12 +228,12 @@ def _fetch_page(url: str) -> dict:
         )
 
         if not result["is_spa"]:
-            result["h1s"]        = [h.get_text(strip=True) for h in soup.find_all("h1")][:5]
-            result["h2s"]        = [h.get_text(strip=True) for h in soup.find_all("h2")][:8]
-            result["h3s"]        = [h.get_text(strip=True) for h in soup.find_all("h3")][:8]
-            result["nav_links"]  = [a.get_text(strip=True) for a in soup.select("nav a") if a.get_text(strip=True)]
+            result["h1s"]          = [h.get_text(strip=True) for h in soup.find_all("h1")][:5]
+            result["h2s"]          = [h.get_text(strip=True) for h in soup.find_all("h2")][:8]
+            result["h3s"]          = [h.get_text(strip=True) for h in soup.find_all("h3")][:8]
+            result["nav_links"]    = [a.get_text(strip=True) for a in soup.select("nav a") if a.get_text(strip=True)]
             result["button_texts"] = [b.get_text(strip=True) for b in soup.find_all("button") if b.get_text(strip=True)][:15]
-            result["link_texts"] = [a.get_text(strip=True) for a in soup.find_all("a") if a.get_text(strip=True)][:30]
+            result["link_texts"]   = [a.get_text(strip=True) for a in soup.find_all("a") if a.get_text(strip=True)][:30]
             result["footer_links"] = [a.get_text(strip=True) for a in soup.select("footer a")]
 
             imgs = soup.find_all("img")
@@ -80,16 +243,27 @@ def _fetch_page(url: str) -> dict:
             ext = [a for a in soup.find_all("a", href=True) if a["href"].startswith("http")]
             result["external_links_no_target"] = len([a for a in ext if not a.get("target")])
 
-            form_inputs = soup.find_all(["input", "select", "textarea"])
-            result["form_fields"] = len(form_inputs)
-
-            result["body_text"] = body_text[:2000]
+            result["form_fields"] = len(soup.find_all(["input", "select", "textarea"]))
+            result["body_text"]   = body_text[:2000]
 
     except Exception as exc:
         result["fetch_error"] = str(exc)[:200]
 
     return result
 
+
+def _fetch_page(url: str) -> dict:
+    """Try Playwright first; fall back to plain HTTP if not installed or fails."""
+    try:
+        return _fetch_page_playwright(url)
+    except ImportError:
+        print("[design_audit] playwright not installed — using HTTP fallback")
+    except Exception as exc:
+        print(f"[design_audit] Playwright failed ({exc}) — using HTTP fallback")
+    return _fetch_page_http(url)
+
+
+# ── PageSpeed Insights ────────────────────────────────────────────────────────
 
 def _fetch_pagespeed(url: str) -> dict:
     """
@@ -120,7 +294,7 @@ def _fetch_pagespeed(url: str) -> dict:
             "best_practices":  score("best-practices"),
             "lcp":             metric("largest-contentful-paint"),
             "cls":             metric("cumulative-layout-shift"),
-            "tbt":             metric("total-blocking-time"),   # proxy for FID
+            "tbt":             metric("total-blocking-time"),
             "speed_index":     metric("speed-index"),
             "fcp":             metric("first-contentful-paint"),
             "images_not_lazy": audits.get("uses-lazy-loading", {}).get("score"),
@@ -131,17 +305,24 @@ def _fetch_pagespeed(url: str) -> dict:
         return {"error": str(exc)[:200]}
 
 
+# ── Context builder ───────────────────────────────────────────────────────────
+
 def _build_context(page: dict, pagespeed: dict) -> str:
     """Serialise fetched data into a readable block for the LLM prompt."""
     lines = [f"=== LIVE PAGE DATA: {page['url']} ==="]
 
     if page.get("fetch_error"):
-        lines.append(f"⚠ HTTP fetch failed: {page['fetch_error']}")
+        lines.append(f"⚠ Fetch failed: {page['fetch_error']}")
     else:
-        lines.append(f"Status: {page['status_code']} | HTTPS: {page['https']}")
+        method = page.get("render_method", "http")
+        lines.append(f"Render method: {method.upper()} | Status: {page['status_code']} | HTTPS: {page['https']}")
+
         if page["is_spa"]:
-            lines.append("⚠ JavaScript SPA detected — HTML content is client-rendered.")
-            lines.append("  Only <title> and <meta description> are available from source.")
+            lines.append("⚠ JavaScript SPA detected — HTML content is client-rendered. Only <title> and <meta> available.")
+        else:
+            if method == "playwright":
+                lines.append("✓ Full React/SPA rendered by headless browser — all DOM content is accurate.")
+
         lines.append(f"Title: {page['title']}")
         lines.append(f"Meta description: {page['meta_description']}")
         lines.append(f"Favicon: {'yes' if page['has_favicon'] else 'no'}")
@@ -153,8 +334,7 @@ def _build_context(page: dict, pagespeed: dict) -> str:
             lines.append(f"Button texts (actual labels): {page['button_texts']}")
             lines.append(f"Link texts (sample): {page['link_texts'][:20]}")
             lines.append(f"Footer links: {page['footer_links']}")
-            lines.append(f"Images: {page['images_total']} total, "
-                         f"{page['images_missing_alt']} missing alt attribute")
+            lines.append(f"Images: {page['images_total']} total, {page['images_missing_alt']} missing alt attribute")
             lines.append(f"External links without target=_blank: {page['external_links_no_target']}")
             lines.append(f"Form input fields: {page['form_fields']}")
             if page["body_text"]:
@@ -164,6 +344,7 @@ def _build_context(page: dict, pagespeed: dict) -> str:
     lines.append("=== GOOGLE PAGESPEED INSIGHTS (Mobile) ===")
     if "error" in pagespeed:
         lines.append(f"⚠ PageSpeed API error: {pagespeed['error']}")
+        lines.append("  Do NOT invent performance numbers. Mark C5-01 and C5-02 as 'Requires PageSpeed data — cannot verify.'")
     else:
         lines.append(f"Performance: {pagespeed['performance']}/100")
         lines.append(f"Accessibility: {pagespeed['accessibility']}/100")
@@ -277,13 +458,13 @@ OUTPUT FORMAT — respond with ONLY valid JSON matching this exact schema:
 }
 
 ABSOLUTE RULES — violating any of these makes the audit worthless:
-1. NEVER invent or guess facts that appear in the LIVE PAGE DATA. If nav_links shows ['Work', 'Products', 'Blog', 'About'], those are the exact labels — do not say navigation uses jargon unless one of those specific labels is jargon.
-2. NEVER guess CTA text, headlines, or nav labels. Only report what the fetched data shows.
-3. For checklist items that CAN be verified from fetched data (nav labels, headings, image alt, HTTPS, external link targets, PageSpeed scores), your finding MUST match the data.
-4. For items that require visual inspection (colour contrast, whitespace, animation quality, visual design taste), note issue: "Requires visual review — cannot verify from page source."
-5. For performance items: USE the PageSpeed scores provided. Do not invent LCP/CLS values.
-6. Overall score: start at 10. Deduct 1 per Critical fail (evidence-based only). Deduct 0.5 per High fail (evidence-based only).
-7. Every finding needs: a principle citation AND a specific fix. Generic fixes are not acceptable.
+1. The LIVE PAGE DATA above was captured by a headless browser that fully rendered the React app. It is authoritative. Nav labels, headings, button texts, and link texts shown are EXACTLY what users see.
+2. NEVER invent or assume content not present in the LIVE PAGE DATA. If nav_links shows ['Work', 'Products', 'Blog', 'About'], those are the real labels — report them verbatim.
+3. For checklist items that CAN be verified from fetched data (nav labels, headings, image alt, HTTPS, footer links, PageSpeed scores), your finding MUST match the data exactly.
+4. For items that require visual inspection (colour contrast ratios, whitespace quality, animation quality), note: "Requires visual review — cannot verify from rendered source."
+5. For performance items: USE the PageSpeed scores provided. If PageSpeed errored, write "PageSpeed unavailable — cannot verify." NEVER invent LCP/CLS values.
+6. Overall score: start at 10. Deduct 1 per Critical fail (evidence-based only). Deduct 0.5 per High fail (evidence-based only). Items that cannot be verified do NOT cause deductions.
+7. Every finding must include: a principle citation AND a specific, actionable fix. Generic fixes are not acceptable.
 """
 
 
@@ -292,9 +473,10 @@ ABSOLUTE RULES — violating any of these makes the audit worthless:
 def run_audit(url: str, pages: list = None, notes: str = "", auditor_notes: str = "") -> dict:
     """
     Run a full design audit:
-    1. Fetch the live URL (HTML extraction + PageSpeed Insights)
-    2. Build a factual context block
-    3. Ask the LLM to evaluate against the 41-item checklist
+    1. Render the live URL with Playwright (falls back to HTTP)
+    2. Query Google PageSpeed Insights
+    3. Build a factual context block
+    4. Ask the LLM to evaluate against the 41-item checklist
     """
     try:
         from auto_blogger import _build_llm_cfg, _llm
@@ -307,29 +489,37 @@ def run_audit(url: str, pages: list = None, notes: str = "", auditor_notes: str 
         return {"error": "LLM not configured — set API key in Settings → Auto Blogger"}
 
     # ── Step 1: fetch live data ───────────────────────────────────────────────
-    page_data  = _fetch_page(url)
-    pagespeed  = _fetch_pagespeed(url)
-    live_ctx   = _build_context(page_data, pagespeed)
+    page_data = _fetch_page(url)
+    pagespeed = _fetch_pagespeed(url)
+    live_ctx  = _build_context(page_data, pagespeed)
 
     # ── Step 2: build prompt ──────────────────────────────────────────────────
     pages_str   = ", ".join(pages) if pages else "Homepage"
     notes_block = f"\nAUDITOR OBSERVATIONS (manual notes from reviewer):\n{notes.strip()}" if notes.strip() else ""
     extra_block = f"\nADDITIONAL CONTEXT:\n{auditor_notes.strip()}" if auditor_notes.strip() else ""
 
+    render_note = (
+        "The page was rendered by a headless Chromium browser, so all React/SPA content is fully visible."
+        if page_data.get("render_method") == "playwright"
+        else "The page could not be rendered by browser — content may be incomplete if it's a JavaScript SPA."
+    )
+
     user_prompt = f"""Audit the website below. Use the LIVE PAGE DATA as ground truth.
 
 URL: {url}
 Pages to evaluate: {pages_str}
+Render note: {render_note}
 
 {live_ctx}
 {notes_block}
 {extra_block}
 
 INSTRUCTIONS:
-- Every finding based on nav labels, headings, button texts, PageSpeed scores, or image alt data must quote or reference the actual fetched value.
-- If the live data shows a page IS client-rendered (SPA), do not report findings about content you cannot see — instead note "SPA: content requires visual review".
-- Use PageSpeed scores for ALL performance findings (C5-01, C5-02). Quote the actual LCP/CLS values.
-- Do NOT assume anything. If you cannot verify it, say so.
+- Every finding based on nav labels, headings, button texts, footer links, or PageSpeed scores MUST quote the actual fetched value.
+- The rendered DOM data is accurate — do not second-guess it.
+- If PageSpeed errored, do not penalise performance items — mark them as unverifiable.
+- For visual-only items (contrast ratios, animation quality), note "Requires visual review."
+- Do NOT assume anything not present in the data. If you cannot verify it, say so.
 
 Return ONLY valid JSON — no markdown fences, no explanation outside the JSON."""
 
@@ -349,11 +539,12 @@ Return ONLY valid JSON — no markdown fences, no explanation outside the JSON."
             return {"error": "LLM did not return valid JSON", "raw": raw[:500]}
 
         report = json.loads(match.group())
-        report["url"]        = url
-        report["audited_at"] = datetime.now(timezone.utc).isoformat()
-        report["notes"]      = notes
-        report["pagespeed"]  = pagespeed   # attach raw scores to report
-        report["is_spa"]     = page_data.get("is_spa", False)
+        report["url"]           = url
+        report["audited_at"]    = datetime.now(timezone.utc).isoformat()
+        report["notes"]         = notes
+        report["pagespeed"]     = pagespeed
+        report["is_spa"]        = page_data.get("is_spa", False)
+        report["render_method"] = page_data.get("render_method", "http")
         return report
 
     except json.JSONDecodeError as e:
