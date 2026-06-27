@@ -368,7 +368,9 @@ def _build_context(page: dict, pagespeed: dict) -> str:
         if not page["is_spa"]:
             lines.append(f"H1 headings: {page['h1s']}")
             lines.append(f"H2 headings: {page['h2s']}")
-            lines.append(f"Navigation links (actual labels, deduplicated): {page['nav_links']}")
+            nav_count = len(page['nav_links'])
+            nav_verdict = "PASSES C2-01 (within Miller's 7±2 rule)" if nav_count <= 7 else f"FAILS C2-01 ({nav_count} > 7)"
+            lines.append(f"Navigation links (actual labels, deduplicated — {nav_count} items — {nav_verdict}): {page['nav_links']}")
             # Active nav state
             if page.get("active_nav_links"):
                 lines.append(f"★ ACTIVE NAV LINKS (aria-current='page' — active state IS implemented): {page['active_nav_links']}")
@@ -382,6 +384,8 @@ def _build_context(page: dict, pagespeed: dict) -> str:
             # Primary CTAs are the most important conversion elements
             if page.get("primary_ctas"):
                 lines.append(f"★ PRIMARY CTA ELEMENTS (btn-primary styled — these are the main conversion actions visible on the page): {page['primary_ctas']}")
+                lines.append("  → C1-02 PASSES: a primary CTA is present and visible above the fold.")
+                lines.append("  → C6-01 STATUS: having one btn-primary CTA + a subtle secondary text link is standard UX — this is NOT three competing conversion goals.")
             else:
                 lines.append("Primary CTA elements: none detected via btn-primary class")
             lines.append(f"Button texts (all buttons): {page['button_texts']}")
@@ -392,6 +396,8 @@ def _build_context(page: dict, pagespeed: dict) -> str:
             lines.append(f"Form input fields: {page['form_fields']}")
             if page.get("hero_text"):
                 lines.append(f"★ HERO SECTION TEXT (above-fold content — first section rendered): {page['hero_text']}")
+                if page.get("h1s"):
+                    lines.append("  → C1-01 PASSES: hero section contains a clear H1 and value proposition. Visual layout/density assessment requires visual review — cannot be determined from extracted text.")
             if page["body_text"]:
                 lines.append(f"Body text sample:\n{page['body_text']}")
 
@@ -527,6 +533,9 @@ ABSOLUTE RULES — violating any of these makes the audit worthless:
 12. UNVERIFIABLE ITEMS — PLACEMENT RULE: Any finding that "cannot be verified from static render" or "requires interactive testing" MUST be placed in medium_issues ONLY. It MUST NOT appear in critical_issues or high_issues. This applies to: C4-01 (hover/active CSS states), C4-03 (animation quality), C4-07 (loading indicators), and any other check that requires user interaction. Placing an unverifiable item in high_issues causes incorrect score deductions — this is strictly forbidden.
 13. HOVER STATES (C4-01): CSS :hover and :active are invisible to static renders. If you cannot verify, put ONLY in medium_issues with note "Requires interactive testing." NEVER in high_issues.
 14. LOADING INDICATORS (C4-07): Loading spinners only appear after form submission. NEVER flag C4-07 in high_issues from a static render. Put ONLY in medium_issues if you cannot verify.
+15. NAV ITEM COUNT (C2-01): Miller's Law says 7 ± 2 items. A nav with ≤ 7 items IS within the law and PASSES C2-01. The context block already pre-calculates this verdict. NEVER flag a nav with 5, 6, or 7 items as "could be streamlined" in high_issues — that is NOT a failure. Only flag C2-01 as failing when nav_links count exceeds 7.
+16. PRIMARY CTA VISIBILITY (C1-02): C1-02 asks ONLY: is there a primary CTA visible above the fold? If "★ PRIMARY CTA ELEMENTS" is non-empty, the answer is YES — C1-02 PASSES. A subtle secondary text link ("or chat on WhatsApp") next to the primary button does NOT make C1-02 fail. C1-02 is about CTA presence and visibility, NOT about uniqueness. Do NOT fail C1-02 when primary_ctas is populated.
+17. VISUAL DENSITY (C1-01 scope): C1-01 asks whether the value proposition communicates within 5 seconds. This is verified by: (a) Is there a clear H1? (b) Is there an audience statement? (c) Is there a primary CTA? If yes to all three — C1-01 PASSES. "The text looks dense" is a VISUAL judgement you cannot make from extracted DOM text. The context block pre-calculates C1-01 when hero_text and H1 are both present. Never re-fail C1-01 on grounds of "density" or "too much text" — those require visual review and go in medium_issues at most.
 """
 
 
