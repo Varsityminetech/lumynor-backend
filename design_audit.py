@@ -55,6 +55,7 @@ def _fetch_page_playwright(url: str) -> dict:
         "has_favicon": False,
         "primary_ctas": [],
         "audience_statement": None,
+        "active_nav_links": [],
         "hero_text": None,
         "https": url.startswith("https://"),
         "body_text": "",
@@ -127,6 +128,14 @@ def _fetch_page_playwright(url: str) -> dict:
                     if el.text_content().strip()
                 ]
                 result["nav_links"] = list(dict.fromkeys(nav_raw))
+
+                # Active nav links — links marked with aria-current="page" indicate
+                # the current page state is visually and semantically implemented
+                result["active_nav_links"] = [
+                    el.text_content().strip()
+                    for el in page.query_selector_all('nav a[aria-current="page"]')
+                    if el.text_content().strip()
+                ]
 
                 # Buttons
                 result["button_texts"] = [
@@ -231,6 +240,7 @@ def _fetch_page_http(url: str) -> dict:
         "has_favicon": False,
         "primary_ctas": [],
         "audience_statement": None,
+        "active_nav_links": [],
         "hero_text": None,
         "https": url.startswith("https://"),
         "body_text": "",
@@ -359,6 +369,12 @@ def _build_context(page: dict, pagespeed: dict) -> str:
             lines.append(f"H1 headings: {page['h1s']}")
             lines.append(f"H2 headings: {page['h2s']}")
             lines.append(f"Navigation links (actual labels, deduplicated): {page['nav_links']}")
+            # Active nav state
+            if page.get("active_nav_links"):
+                lines.append(f"★ ACTIVE NAV LINKS (aria-current='page' — active state IS implemented): {page['active_nav_links']}")
+                lines.append("  → C2-03 PASSES: at least one nav link shows the current page state.")
+            else:
+                lines.append("Active nav links (aria-current='page'): none detected on this render")
             # Target audience statement (aria-label="target-audience")
             if page.get("audience_statement"):
                 lines.append(f"★ TARGET AUDIENCE STATEMENT (explicit element with aria-label='target-audience', visible above H1): \"{page['audience_statement']}\"")
@@ -502,13 +518,15 @@ ABSOLUTE RULES — violating any of these makes the audit worthless:
 3. For checklist items that CAN be verified from fetched data (nav labels, headings, image alt, HTTPS, footer links, PageSpeed scores), your finding MUST match the data exactly.
 4. For items that require visual inspection (colour contrast ratios, whitespace quality, animation quality), note: "Requires visual review — cannot verify from rendered source."
 5. For performance items: USE the PageSpeed scores provided. If PageSpeed errored, write "PageSpeed unavailable — cannot verify." NEVER invent LCP/CLS values.
-6. Overall score: start at 10. Deduct 1 per Critical fail (evidence-based only). Deduct 0.5 per High fail (evidence-based only). Items that cannot be verified do NOT cause deductions.
+6. Overall score: start at 10. Deduct 1 per Critical fail (evidence-based only). Deduct 0.5 per High fail (evidence-based only). Items that cannot be verified from a static render do NOT cause deductions and must NOT appear in critical_issues or high_issues.
 7. Every finding must include: a principle citation AND a specific, actionable fix. Generic fixes are not acceptable.
-8. PRIMARY CTA IDENTIFICATION (C1-02): The "★ PRIMARY CTA ELEMENTS" field lists all btn-primary styled elements — these are the actual high-prominence conversion buttons/links visible on the page. If this field lists items like "Start Your Project", that CTA IS present and visible. Do NOT flag C1-02 as failing if primary CTAs are listed. The nav_links field contains navigation links, not the primary hero CTA.
+8. PRIMARY CTA (C1-02): The "★ PRIMARY CTA ELEMENTS" field lists all btn-primary styled elements. If it lists items like "Start Your Project", that CTA IS present and visible. Do NOT flag C1-02 as failing if primary CTAs are listed.
 9. NAVIGATION COUNT (C2-01): The nav_links field is already deduplicated. Count only the unique items shown. Do NOT report duplicates unless the exact same label appears twice in the deduplicated list.
-10. HERO CONTENT AND AUDIENCE (C1-01, C6-04): If the "★ TARGET AUDIENCE STATEMENT" field is present, C6-04 PASSES — the page explicitly answers "Who is this for?" NEVER mark C6-04 as failing when this field exists. For C1-01: if the H1 and hero_text are present, the hero communicates a value proposition and C1-01 passes.
-11. HOVER AND ACTIVE STATES (C4-01): CSS :hover and :active pseudo-states CANNOT be observed from a static rendered page. A Playwright render captures the initial idle state only. NEVER flag C4-01 as failing based on a static render — mark it as "Requires interactive testing — cannot verify from static DOM render." Only flag if the auditor's observations explicitly note missing hover states.
-12. LOADING INDICATORS (C4-07): Loading spinners and progress bars are dynamic states that only appear AFTER a user submits a form or triggers an async action. A static Playwright render will NEVER show them. NEVER flag C4-07 as failing based on static render — mark as "Requires form submission testing — cannot verify from static render." Only flag if the auditor explicitly reports that submitting a form shows no feedback.
+10. HERO AND AUDIENCE (C1-01, C6-04): If "★ TARGET AUDIENCE STATEMENT" field exists, C6-04 PASSES — NEVER mark it failing when this field is present. If H1 and hero_text are present with a value proposition, C1-01 passes.
+11. ACTIVE NAV STATE (C2-03): If "★ ACTIVE NAV LINKS" field is non-empty, C2-03 PASSES — the active state system is implemented. Do NOT flag C2-03 as failing when active_nav_links contains items.
+12. UNVERIFIABLE ITEMS — PLACEMENT RULE: Any finding that "cannot be verified from static render" or "requires interactive testing" MUST be placed in medium_issues ONLY. It MUST NOT appear in critical_issues or high_issues. This applies to: C4-01 (hover/active CSS states), C4-03 (animation quality), C4-07 (loading indicators), and any other check that requires user interaction. Placing an unverifiable item in high_issues causes incorrect score deductions — this is strictly forbidden.
+13. HOVER STATES (C4-01): CSS :hover and :active are invisible to static renders. If you cannot verify, put ONLY in medium_issues with note "Requires interactive testing." NEVER in high_issues.
+14. LOADING INDICATORS (C4-07): Loading spinners only appear after form submission. NEVER flag C4-07 in high_issues from a static render. Put ONLY in medium_issues if you cannot verify.
 """
 
 
