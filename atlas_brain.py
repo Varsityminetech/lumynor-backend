@@ -471,3 +471,103 @@ ATLAS:"""
         return {"answer": answer.strip()}
     except Exception as e:
         return {"answer": f"I hit an issue: {str(e)[:100]}"}
+
+
+# ── Orchestration: let Lumy trigger backend agents from chat ───────────────────
+# main.py calls register_tools() once at startup with the real fn references,
+# since this module can't import main.py (circular). High-impact tools (anything
+# that touches the live site) require an explicit "haan"/"yes" confirmation reply
+# before running.
+
+_TOOLS: dict = {}
+_pending: dict = {}  # from_number -> {"tool": str, "params": dict, "ts": datetime}
+
+_CONFIRM_WINDOW_MIN = 10
+_YES_WORDS = {"yes", "yeah", "yep", "haan", "ha", "han", "confirm", "confirmed", "go", "do it", "karo", "ok", "okay", "sure"}
+_NO_WORDS  = {"no", "nah", "nahi", "nako", "cancel", "stop", "ruk", "ruko"}
+
+
+def register_tools(registry: dict):
+    """registry: {name: {"label": str, "description": str, "fn": callable(params)->dict, "high_impact": bool}}"""
+    global _TOOLS
+    _TOOLS = registry
+
+
+def _classify_intent(question: str) -> dict:
+    """Ask the LLM whether this message is asking Lumy to run a backend action.
+    Returns {"tool": name|None, "params": {}}."""
+    if not _TOOLS:
+        return {"tool": None, "params": {}}
+
+    tools_desc = "\n".join(f"- {name}: {spec['label']} — {spec['description']}" for name, spec in _TOOLS.items())
+    prompt = f"""The founder just sent this WhatsApp message to Lumy, the Lumynor Systems AI.
+Decide if they're asking her to RUN one of these backend actions, or just chatting/asking a question.
+
+AVAILABLE ACTIONS:
+{tools_desc}
+
+MESSAGE: "{question}"
+
+Respond with ONLY a JSON object: {{"tool": "<action name from the list above, or null if this is just a question or chat>", "params": {{}}}}
+If the action is design_audit and the message includes a URL, put it in params as {{"url": "..."}}.
+If the action is revenue_scan and the message names a product, put it in params as {{"product": "..."}}.
+Be conservative — only pick a tool if the founder clearly wants an action run, not just discussed."""
+
+    try:
+        from auto_blogger import _build_llm_cfg, _llm
+        import json as _json
+        stored     = get_settings("auto_blog")
+        gemini_key = stored.get("llmApiKey", "")
+        llm_cfg    = _build_llm_cfg(stored, gemini_key)
+        raw        = _llm(prompt, llm_cfg, json_mode=True, timeout=30, max_tokens=200)
+        parsed     = _json.loads(raw)
+        if parsed.get("tool") not in _TOOLS:
+            parsed["tool"] = None
+        return {"tool": parsed.get("tool"), "params": parsed.get("params") or {}}
+    except Exception:
+        return {"tool": None, "params": {}}
+
+
+def _run_tool(name: str, params: dict) -> str:
+    spec = _TOOLS.get(name)
+    if not spec:
+        return "Woh action ab available nahi hai, beta."
+    try:
+        result = spec["fn"](params)
+        count  = result.get("count") if isinstance(result, dict) else None
+        suffix = f" ({count} found)" if count is not None else ""
+        return f"Ho gaya beta! ✅ *{spec['label']}* complete{suffix}."
+    except Exception as e:
+        return f"Try kiya beta, par error aa gaya: {str(e)[:200]}"
+
+
+def orchestrate(question: str, from_number: str) -> str:
+    """Entry point for the WhatsApp webhook: handles pending confirmations,
+    classifies new requests into tool calls (confirming first if high-impact),
+    and falls back to normal chat() for everything else."""
+    text = (question or "").strip()
+    low  = text.lower()
+
+    pending = _pending.get(from_number)
+    if pending:
+        age_min = (datetime.now(timezone.utc) - pending["ts"]).total_seconds() / 60
+        if age_min <= _CONFIRM_WINDOW_MIN:
+            if low in _YES_WORDS:
+                del _pending[from_number]
+                return _run_tool(pending["tool"], pending["params"])
+            if low in _NO_WORDS:
+                del _pending[from_number]
+                return "Theek hai beta, cancel kar diya."
+        _pending.pop(from_number, None)  # stale or unrelated reply — drop it, handle as a new message
+
+    intent    = _classify_intent(text)
+    tool_name = intent.get("tool")
+    if tool_name:
+        spec = _TOOLS[tool_name]
+        if spec["high_impact"]:
+            _pending[from_number] = {"tool": tool_name, "params": intent["params"], "ts": datetime.now(timezone.utc)}
+            return f"Beta, pakka *{spec['label']}* chalau? Yeh live website pe asar dalega. Reply *haan* to confirm ya *nahi* to cancel."
+        return _run_tool(tool_name, intent["params"])
+
+    result = chat(text)
+    return result.get("answer") or "Sorry beta, samajh nahi paya."

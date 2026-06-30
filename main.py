@@ -822,8 +822,7 @@ async def whatsapp_webhook(request: Request):
 
 async def _handle_whatsapp_message(body: str, from_number: str):
     try:
-        result = ab.chat(body)
-        answer = result.get("answer") or "Sorry, I couldn't put together an answer for that."
+        answer = ab.orchestrate(body, from_number)
     except Exception as e:
         answer = f"Hit an error answering that: {str(e)[:200]}"
     ab.send_whatsapp(answer, from_number)
@@ -2697,6 +2696,54 @@ def revenue_catalogue(user=Depends(_require_admin)):
         }
         for prod, meta in rr.PRODUCT_META.items()
     }
+
+
+# ── Wire Lumy's WhatsApp orchestrator to the real backend agents ───────────────
+# Read-only / contained actions run immediately; anything that touches the live
+# site (publishing) requires a "haan"/"yes" confirmation reply first.
+def _trigger_blog_tool(_params: dict) -> dict:
+    settings = db.get_settings()
+    settings["enabled"] = True
+    settings["last_run"] = "1970-01-01T00:00:00"
+    db.save_settings(settings)
+    return {"status": "triggered"}
+
+
+ab.register_tools({
+    "design_audit": {
+        "label": "Design Audit",
+        "description": "Run a design/UX audit on a Lumynor page and save the report. Params: url (defaults to lumynorsystems.com).",
+        "fn": lambda p: da.save_audit(da.run_audit(
+            p.get("url") or "https://lumynorsystems.com",
+            [p.get("url") or "https://lumynorsystems.com"],
+        )),
+        "high_impact": False,
+    },
+    "authority_scan": {
+        "label": "Authority Scan",
+        "description": "Scan recent activity for publishable story/content opportunities.",
+        "fn": lambda p: auth.scan_opportunities(),
+        "high_impact": False,
+    },
+    "weekly_report": {
+        "label": "Weekly Intelligence Report",
+        "description": "Generate this week's strategic intelligence report.",
+        "fn": lambda p: wi.generate_weekly_report(),
+        "high_impact": False,
+    },
+    "revenue_scan": {
+        "label": "Revenue Signal Scan",
+        "description": "Scan for new revenue/lead signals. Params: product (defaults to 'all').",
+        "fn": lambda p: rr.run_market_scan(p.get("product", "all")),
+        "high_impact": False,
+    },
+    "trigger_blog": {
+        "label": "Publish New Blog Post",
+        "description": "Research, write, and PUBLISH a new blog post live on the website (runs within ~10s).",
+        "fn": _trigger_blog_tool,
+        "high_impact": True,
+    },
+})
 
 
 if __name__ == "__main__":
