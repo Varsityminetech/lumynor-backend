@@ -623,28 +623,6 @@ def atlas_settings_save(body: dict, _admin: dict = Depends(_require_admin)):
     return {**existing, **updates}
 
 
-# ── Temp debug: check stored Twilio config ───────────────────────────────────
-@app.get("/api/internal/check-twilio")
-def _check_twilio(secret: str):
-    if secret != "lmn_check_tw":
-        raise HTTPException(403, "Forbidden")
-    stored = db.get_settings("digest")
-    from_raw = stored.get("twilioFrom", "")
-    to_raw   = stored.get("digestTo", "")
-    sid_set  = bool(stored.get("twilioAccountSid", "").strip())
-    token_set = bool(stored.get("twilioAuthToken", "").strip())
-    from_final = from_raw if from_raw.startswith("whatsapp:") else f"whatsapp:{from_raw}"
-    to_final   = to_raw   if to_raw.startswith("whatsapp:")   else f"whatsapp:{to_raw}"
-    return {
-        "sid_configured": sid_set,
-        "token_configured": token_set,
-        "from_stored": from_raw,
-        "from_final": from_final,
-        "to_stored": to_raw,
-        "to_final": to_final,
-    }
-# ─────────────────────────────────────────────────────────────────────────────
-
 # ── Design Audit Agent ────────────────────────────────────────────────────────
 import design_audit as da
 
