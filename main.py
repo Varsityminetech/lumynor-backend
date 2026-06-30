@@ -2480,7 +2480,11 @@ async def startup_event():
 
 
 async def digest_daemon():
-    """Auto-send morning digest at configured UTC time (default 02:30 UTC = 08:00 IST)."""
+    """Auto-send morning digest at configured UTC time (default 02:30 UTC = 08:00 IST).
+
+    Uses a 15-minute catch-up window so a Railway restart shortly after the
+    scheduled time doesn't silently skip the whole day.
+    """
     import asyncio as _aio
     from datetime import datetime, timezone
     await _aio.sleep(90)
@@ -2493,13 +2497,12 @@ async def digest_daemon():
             send_minute = int(stored.get("send_minute", 30))
             to_number   = (stored.get("digestTo") or "").strip()
             today = now.date().isoformat()
-            if (
-                now.hour == send_hour
-                and now.minute == send_minute
-                and last_sent_date != today
-                and to_number
-            ):
-                print(f"[digest] Auto-sending morning digest for {today}")
+            # Catch-up window: fire any time in [scheduled, scheduled+15min)
+            # so a container restart right after the scheduled minute still sends.
+            sched = send_hour * 60 + send_minute
+            curr  = now.hour * 60 + now.minute
+            if sched <= curr < sched + 15 and last_sent_date != today and to_number:
+                print(f"[digest] Auto-sending morning digest for {today} (curr={curr}, sched={sched})")
                 from digest import send_digest
                 result = send_digest()
                 last_sent_date = today
@@ -2510,7 +2513,10 @@ async def digest_daemon():
 
 
 async def atlas_proactive_daemon():
-    """Send ATLAS evening check-in message at configured UTC time (default 14:30 UTC = 20:00 IST)."""
+    """Send ATLAS evening check-in message at configured UTC time (default 14:30 UTC = 20:00 IST).
+
+    Uses a 15-minute catch-up window — same rationale as digest_daemon.
+    """
     import asyncio as _aio
     from datetime import datetime, timezone
     await _aio.sleep(120)
@@ -2524,14 +2530,10 @@ async def atlas_proactive_daemon():
             enabled     = stored.get("proactive_enabled", True)
             to_number   = (db.get_settings("digest").get("digestTo") or "").strip()
             today = now.date().isoformat()
-            if (
-                enabled
-                and now.hour == send_hour
-                and now.minute == send_minute
-                and last_sent_date != today
-                and to_number
-            ):
-                print(f"[atlas] Sending evening proactive message for {today}")
+            sched = send_hour * 60 + send_minute
+            curr  = now.hour * 60 + now.minute
+            if enabled and sched <= curr < sched + 15 and last_sent_date != today and to_number:
+                print(f"[atlas] Sending evening proactive message for {today} (curr={curr}, sched={sched})")
                 result = ab.run_proactive_check()
                 last_sent_date = today
                 print(f"[atlas] Result: {result.get('ok')} | type={result.get('situation', {}).get('msg_type')}")
