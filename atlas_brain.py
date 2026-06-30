@@ -267,11 +267,19 @@ Write the WhatsApp message now. Do NOT use markdown. Max 5 short lines. Sign off
 
 def send_atlas_message(text: str) -> dict:
     """Send an ATLAS proactive message via Twilio WhatsApp."""
+    stored    = get_settings("digest")
+    to_number = stored.get("digestTo", "").strip()
+    return send_whatsapp(text, to_number)
+
+
+def send_whatsapp(text: str, to_number: str) -> dict:
+    """Send a WhatsApp message to an arbitrary number via Twilio (used for both
+    proactive sends and inbound chat replies)."""
     stored      = get_settings("digest")
     account_sid = stored.get("twilioAccountSid", "").strip()
     auth_token  = stored.get("twilioAuthToken", "").strip()
     from_number = stored.get("twilioFrom", "").strip()
-    to_number   = stored.get("digestTo", "").strip()
+    to_number   = (to_number or "").strip()
 
     if not from_number.startswith("whatsapp:"):
         from_number = f"whatsapp:{from_number}"

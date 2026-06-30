@@ -806,6 +806,29 @@ async def github_webhook(request: Request):
     return {"status": "ok"}
 
 
+@app.post("/api/webhooks/whatsapp", include_in_schema=False)
+async def whatsapp_webhook(request: Request):
+    """Twilio calls this on every inbound WhatsApp message. Replies async (outside
+    Twilio's webhook timeout) by sending a follow-up message via the REST API."""
+    form = await request.form()
+    body = (form.get("Body") or "").strip()
+    from_number = (form.get("From") or "").strip()  # already "whatsapp:+91..."
+
+    if body and from_number:
+        asyncio.create_task(_handle_whatsapp_message(body, from_number))
+
+    return Response(content="<Response></Response>", media_type="application/xml")
+
+
+async def _handle_whatsapp_message(body: str, from_number: str):
+    try:
+        result = ab.chat(body)
+        answer = result.get("answer") or "Sorry, I couldn't put together an answer for that."
+    except Exception as e:
+        answer = f"Hit an error answering that: {str(e)[:200]}"
+    ab.send_whatsapp(answer, from_number)
+
+
 # ── PIPELINE RUNNER ────────────────────────────────────────────────────────────
 
 async def run_pipeline(start_dept: str = "R&D"):
