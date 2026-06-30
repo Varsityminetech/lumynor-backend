@@ -630,8 +630,16 @@ _TEMP_TEST_SECRET = "lmn_test_7x9k2p"
 def _temp_test_digest(secret: str):
     if secret != _TEMP_TEST_SECRET:
         raise HTTPException(403, "Forbidden")
-    from digest import send_digest
-    return send_digest()
+    try:
+        from digest import send_digest, build_digest_text
+        text = build_digest_text()
+        if not text:
+            return {"ok": False, "error": "build_digest_text returned None"}
+        result = send_digest()
+        return result
+    except Exception as exc:
+        import traceback
+        return {"ok": False, "error": str(exc), "trace": traceback.format_exc()[-800:]}
 
 @app.post("/api/internal/test-atlas")
 def _temp_test_atlas(secret: str):
