@@ -623,31 +623,6 @@ def atlas_settings_save(body: dict, _admin: dict = Depends(_require_admin)):
     return {**existing, **updates}
 
 
-# ── Temporary internal test trigger (removed after smoke test) ────────────────
-_TEMP_TEST_SECRET = "lmn_test_7x9k2p"
-
-@app.post("/api/internal/test-digest")
-def _temp_test_digest(secret: str):
-    if secret != _TEMP_TEST_SECRET:
-        raise HTTPException(403, "Forbidden")
-    try:
-        from digest import send_digest, build_digest_text
-        text = build_digest_text()
-        if not text:
-            return {"ok": False, "error": "build_digest_text returned None"}
-        result = send_digest()
-        return result
-    except Exception as exc:
-        import traceback
-        return {"ok": False, "error": str(exc), "trace": traceback.format_exc()[-800:]}
-
-@app.post("/api/internal/test-atlas")
-def _temp_test_atlas(secret: str):
-    if secret != _TEMP_TEST_SECRET:
-        raise HTTPException(403, "Forbidden")
-    return ab.run_proactive_check()
-# ─────────────────────────────────────────────────────────────────────────────
-
 # ── Design Audit Agent ────────────────────────────────────────────────────────
 import design_audit as da
 

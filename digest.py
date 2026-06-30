@@ -49,7 +49,7 @@ def build_digest_text() -> str | None:
     # Yesterday's events — fetch all columns so we can group meaningfully
     events = (
         sb.table("activity_events")
-          .select("project, event_type, title, status, description")
+          .select("project, event_type, title, status")
           .gte("created_at", f"{yest_iso}T00:00:00+00:00")
           .lt("created_at",  f"{today_iso}T00:00:00+00:00")
           .order("created_at", desc=True)
