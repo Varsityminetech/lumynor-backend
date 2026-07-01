@@ -939,7 +939,7 @@ def write_longform_blog(topic: str, angle: str, keywords: dict, research: dict,
 
         int_links = research_brief.get("internal_links", [])
         links_block = "\n".join(
-            f'  <a href="{l["url"]}">{l["anchor"]}</a> — {l.get("context","")}'
+            f'  [{l["anchor"]}]({l["url"]}) — {l.get("context","")}'
             for l in int_links
         )
 
@@ -970,7 +970,7 @@ def write_longform_blog(topic: str, angle: str, keywords: dict, research: dict,
         faq_items = keywords.get("people_also_ask", [])
         faq_block = "\n".join(f"- {q}" for q in faq_items[:5])
         int_links = []
-        links_block = '<a href="/products/agent-forge">Agent Forge</a>, <a href="/contact">talk to our team</a>, <a href="/blog">more insights</a>'
+        links_block = '[Agent Forge](/products/agent-forge), [talk to our team](/contact), [more insights](/blog)'
         refs = research.get("references", [])
 
     refs_text = "\n".join(f"- [{r['title']}]({r['url']})" for r in refs[:6])
@@ -1020,15 +1020,15 @@ EXTERNAL REFERENCES TO CITE:
 5. Use contractions (it's, you'll, don't, they're) — sound human
 6. Add hedged original opinions ("In practice...", "Worth noting is...", "The overlooked part is...")
 7. Use transitions between sections ("Here's the thing...", "What changes everything here is...")
-8. Every H2 section must have real depth — 200-350 words, specific data, at least one example
-9. Include <div class="callout-tip"> boxes for key takeaways and tips
+8. Every ## section must have real depth — 200-350 words, specific data, at least one example
+9. Use > [!TIP] for key takeaways and tips, > [!WARNING] for pitfalls or warnings
 10. Write about what builders and developers ACTUALLY need to know — not surface-level content
 
 ═══ SEO RULES ════════════════════════════════════════════════════════════════
-1. Primary keyword "{primary_kw}" MUST appear in: title, first 100 words, ≥2 H2 headings, meta description
+1. Primary keyword "{primary_kw}" MUST appear in: title, first 100 words, ≥2 ## headings, meta description
 2. Use secondary keywords naturally — never force them
-3. Every H2 title must be specific and actionable, not generic
-4. Use only clean HTML — no [IMAGE: ...] or [INTERNAL: ...] placeholder markers
+3. Every ## heading must be specific and actionable, not generic
+4. Write pure Markdown — no raw HTML tags, no placeholder markers. Links: [text](url). Do not include images.
 
 OUTPUT — Respond ONLY with this exact JSON:
 {{
@@ -1036,7 +1036,7 @@ OUTPUT — Respond ONLY with this exact JSON:
   "meta_description": "140-155 char description with {primary_kw} + CTA",
   "summary": "Engaging 2-3 sentence excerpt for blog listing",
   "read_time": "X min read",
-  "content_html": "FULL HTML (h2/h3/p/ul/ol/li/strong/em/blockquote/div.callout-tip/div.callout-warning)",
+  "content_markdown": "FULL Markdown (## h2, ### h3, **bold**, *italic*, - bullets, 1. numbered, > [!TIP] callout, > [!WARNING] warning, [text](url) links)",
   "faq": [
     {{"question": "FAQ 1", "answer": "2-3 sentence answer"}},
     {{"question": "FAQ 2", "answer": "2-3 sentence answer"}},
@@ -1061,13 +1061,9 @@ OUTPUT — Respond ONLY with this exact JSON:
     result = _llm(prompt, gemini_key, json_mode=True, timeout=280, max_tokens=32768)
     try:
         blog = _parse_json_lenient(result)
-        # Inject references into the HTML content
-        if refs and blog.get("content_html"):
-            ref_html = "<h2>References &amp; Sources</h2><ol>"
-            for r in refs[:6]:
-                ref_html += f'<li><a href="{r["url"]}" target="_blank" rel="noopener noreferrer">{r["title"]}</a></li>'
-            ref_html += "</ol>"
-            blog["content_html"] = blog["content_html"].rstrip() + "\n" + ref_html
+        # Ensure references are stored on the blog object — HTML injection happens in the formatter
+        if refs and not blog.get("references"):
+            blog["references"] = refs
         return blog
     except Exception as e:
         print(f"[write_blog] parse error: {e}, result[:200]={result[:200]}")
@@ -1163,14 +1159,14 @@ Cover each story with real technical depth — what happened, technical implicat
 
 STRUCTURE:
 - Intro paragraph (100-150 words): frame why this batch matters
-- For each story: <h2>N. Story Headline</h2> → 200-250 words of original analysis (synthesize from the sources, do NOT copy verbatim) → cite with inline <a href="SOURCE_URL" target="_blank" rel="noopener noreferrer">source name</a> → end with one sentence: "Builder impact: [concrete implication]."
-- <h2>Key Takeaways for AI Builders</h2> → 200-word conclusion with Lumynor angle and a call to action linking to <a href="/contact">talk to the Lumynor team</a>
+- For each story: ## N. Story Headline → 200-250 words of original analysis (synthesize from sources, do NOT copy verbatim) → cite inline as [source name](SOURCE_URL) → end with one sentence: "Builder impact: [concrete implication]."
+- ## Key Takeaways for AI Builders → 200-word conclusion with Lumynor angle and a call to action linking to [talk to the Lumynor team](/contact)
 - 3-5 FAQ pairs about the news
 
 RULES:
 - 2500-3500 total words — every section needs real original analysis, not summaries or copy-paste
 - Each story analysis must synthesize from the confirmed sources — no verbatim copying
-- HTML only inside content_html — NO markdown
+- Write pure Markdown — no raw HTML tags. Links: [text](url). Headings: ## and ###.
 - BANNED: "game-changer", "revolutionize", "leverage", "delve", "In today's world", "in conclusion", "it's worth noting", "What this means for builders" (repeated phrase — vary the phrasing each time)
 - Tone: opinionated, technical, practitioner — not generic journalism
 
@@ -1180,7 +1176,7 @@ Return ONLY valid JSON (no markdown wrapper):
   "slug": "top-10-ai-news-{slug_date}",
   "summary": "A practitioner breakdown of the 10 biggest AI news stories in {month_year} — what they mean for SaaS and agentic product builders.",
   "meta_description": "Top 10 AI News {month_year}: 10 biggest stories analyzed for SaaS and AI product builders by Lumynor Systems.",
-  "content_html": "<p>intro...</p><h2>1. First Headline</h2><p>analysis...</p>...",
+  "content_markdown": "Intro paragraph...\n\n## 1. First Headline\n\nAnalysis...",
   "primary_keyword": "{primary_kw}",
   "secondary_keywords": ["AI headlines {month_year}", "artificial intelligence news this week", "AI model releases {month_year}", "latest AI updates", "agentic AI news"],
   "tags": ["AI News", "Weekly Roundup", "Machine Learning", "Agentic AI", "SaaS"],
@@ -1482,21 +1478,28 @@ def validate_seo(blog: dict) -> dict:
     """
     title   = (blog.get("title")          or "").strip()
     summary = (blog.get("meta_description") or blog.get("summary") or "").strip()
-    # Accept both "content_html" (pipeline drafts) and "content" (stored blogs)
-    content = (blog.get("content_html") or blog.get("content") or "").strip()
-    # Accept both "primary_keyword" (pipeline) and "primaryKeyword" (stored/API)
+    # Accept content_markdown (new pipeline), content_html (old pipeline), or content (stored blogs)
+    content = (blog.get("content_markdown") or blog.get("content_html") or blog.get("content") or "").strip()
+    # Detect format: Markdown if it has ## headings and no HTML block tags
+    _md = bool(re.search(r'^##\s', content, re.M)) and not bool(re.search(r'<(h[1-6]|p|div)\b', content, re.I))
     primary = (blog.get("primary_keyword") or blog.get("primaryKeyword") or "").strip()
     cover   = (blog.get("coverImage")      or blog.get("cover_image") or "").strip()
     references = blog.get("references") or []
     research_brief = blog.get("research_brief") or {}
 
-    # Accept both "secondary_keywords" (pipeline) and "secondaryKeywords" (stored/API)
     sec_raw = blog.get("secondary_keywords") or blog.get("secondaryKeywords") or ""
     secondary = ([k.strip() for k in sec_raw.split(",") if k.strip()]
                  if isinstance(sec_raw, str)
                  else [str(k).strip() for k in (sec_raw or []) if str(k).strip()])
 
-    clean = re.sub(r'\s+', ' ', re.sub(r'<[^>]*>', ' ', content)).strip()
+    # Clean text — strip both HTML tags and Markdown markers so all text checks are format-agnostic
+    _stripped = re.sub(r'<[^>]*>', ' ', content)
+    _stripped = re.sub(r'^#{1,6}\s+', '', _stripped, flags=re.M)
+    _stripped = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', _stripped)
+    _stripped = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', _stripped)
+    _stripped = re.sub(r'^>\s*\[![A-Z]+\]\s*', '', _stripped, flags=re.M)
+    _stripped = re.sub(r'^>\s*', '', _stripped, flags=re.M)
+    clean = re.sub(r'\s+', ' ', _stripped).strip()
     words = clean.split()
     word_count = len(words)
     clean_lower = clean.lower()
@@ -1557,7 +1560,8 @@ def validate_seo(blog: dict) -> dict:
         lose("topic_intent", 2, "No research brief found — unique angle may be missing")
 
     # ── 2. Research Quality (15 pts) ─────────────────────────────────────────
-    ext_links = re.findall(r'href=["\']https?://[^"\']+["\']', content, re.I)
+    ext_links = (re.findall(r'\(https?://[^)\s]+\)', content)
+                 if _md else re.findall(r'href=["\']https?://[^"\']+["\']', content, re.I))
     TRUSTED = (
         # AI / model labs
         "openai.com", "anthropic.com", "deepmind.google", "nvidia.com",
@@ -1638,8 +1642,11 @@ def validate_seo(blog: dict) -> dict:
              "Primary keyword not in first 150 words",
              f"Mention '{primary}' naturally within the opening paragraph")
 
-    h_texts = " ".join(re.sub(r'<[^>]+>', '', h)
-                       for h in re.findall(r'<h[23][^>]*>.*?</h[23]>', content, re.I | re.S)).lower()
+    if _md:
+        h_texts = " ".join(re.findall(r'^#{2,3}\s+(.+)$', content, re.M)).lower()
+    else:
+        h_texts = " ".join(re.sub(r'<[^>]+>', '', h)
+                           for h in re.findall(r'<h[23][^>]*>.*?</h[23]>', content, re.I | re.S)).lower()
     if p in h_texts:
         ok("Primary keyword in at least one H2/H3 heading")
     else:
@@ -1700,9 +1707,14 @@ def validate_seo(blog: dict) -> dict:
         ok("Title appears accurate and non-clickbait")
 
     # ── 5. Content Structure (10 pts) ─────────────────────────────────────────
-    h1s = re.findall(r'<h1[^>]*>.*?</h1>', content, re.I | re.S)
-    h2s = re.findall(r'<h2[^>]*>.*?</h2>', content, re.I | re.S)
-    h3s = re.findall(r'<h3[^>]*>.*?</h3>', content, re.I | re.S)
+    if _md:
+        h1s = re.findall(r'^#\s+.+$', content, re.M)
+        h2s = re.findall(r'^##\s+.+$', content, re.M)
+        h3s = re.findall(r'^###\s+.+$', content, re.M)
+    else:
+        h1s = re.findall(r'<h1[^>]*>.*?</h1>', content, re.I | re.S)
+        h2s = re.findall(r'<h2[^>]*>.*?</h2>', content, re.I | re.S)
+        h3s = re.findall(r'<h3[^>]*>.*?</h3>', content, re.I | re.S)
 
     if len(h1s) <= 1:
         ok(f"H1 count: {len(h1s)} — correct (title is the H1)")
@@ -1731,8 +1743,9 @@ def validate_seo(blog: dict) -> dict:
              "No H3 sub-sections — missing depth in structure",
              "Add H3 sub-headings under major H2 sections for detail")
 
-    if re.search(r'<h[23][^>]*>[^<]*(conclusion|summary|takeaway|key points|what this means|wrap)',
-                 content, re.I):
+    _concl_pat = (r'^#{2,3}\s+.*(conclusion|summary|takeaway|key points|what this means|wrap)'
+                  if _md else r'<h[23][^>]*>[^<]*(conclusion|summary|takeaway|key points|what this means|wrap)')
+    if re.search(_concl_pat, content, re.I | (re.M if _md else 0)):
         ok("Conclusion / key takeaways section present")
     else:
         lose("structure", 2,
@@ -1821,8 +1834,11 @@ def validate_seo(blog: dict) -> dict:
              "Rewrite intro to start with a specific fact, event, question, or contrarian insight")
 
     # ── 8. Internal & External Links (10 pts) ────────────────────────────────
-    int_links = re.findall(
-        r'href=["\'](?:https?://(?:www\.)?lumynor\.com|/)[^"\']*["\']', content, re.I)
+    if _md:
+        int_links = re.findall(r'\]\((?:https?://(?:www\.)?lumynor\.com)?/[^)]+\)', content)
+    else:
+        int_links = re.findall(
+            r'href=["\'](?:https?://(?:www\.)?lumynor\.com|/)[^"\']*["\']', content, re.I)
     if len(int_links) >= 3:
         ok(f"Internal links: {len(int_links)} — good")
     elif len(int_links) >= 1:
@@ -1834,8 +1850,11 @@ def validate_seo(blog: dict) -> dict:
              "No internal links — missing key on-page SEO and engagement signal",
              "Add 3-5 internal links to Lumynor service/product pages and related blog posts")
 
-    bad_anchors = re.findall(r'<a\s[^>]*>\s*(?:click here|read more|here|this link)\s*</a>',
-                             content, re.I)
+    if _md:
+        bad_anchors = re.findall(r'\[(?:click here|read more|here|this link)\]\(', content, re.I)
+    else:
+        bad_anchors = re.findall(r'<a\s[^>]*>\s*(?:click here|read more|here|this link)\s*</a>',
+                                 content, re.I)
     if bad_anchors:
         lose("links", 3,
              f"Bad anchor text: '{bad_anchors[0]}' — use descriptive text",
@@ -1844,26 +1863,41 @@ def validate_seo(blog: dict) -> dict:
         ok(f"External links: {len(ext_links)} with descriptive anchors")
 
     # ── 9. FAQ / Schema / Image SEO (5 pts) ──────────────────────────────────
-    if re.search(r'<h[23][^>]*>[^<]*(FAQ|Frequently Asked|Common Questions)', content, re.I):
+    _faq_pat  = (r'^#{2,3}\s+.*(FAQ|Frequently Asked|Common Questions)' if _md
+                 else r'<h[23][^>]*>[^<]*(FAQ|Frequently Asked|Common Questions)')
+    _refs_pat = (r'^#{2,3}\s+.*(References|Sources|Citations)' if _md
+                 else r'<h[23][^>]*>[^<]*(References|Sources|Citations)')
+    _faq_flag = re.M if _md else 0
+
+    if re.search(_faq_pat, content, re.I | _faq_flag) or blog.get("faq"):
         ok("FAQ section present — eligible for rich results")
     else:
         lose("faq_schema_image", 2,
              "No FAQ section — missing schema opportunity and search snippet eligibility",
-             "Add a 'Frequently Asked Questions' H2 with 4-6 relevant questions and concise answers")
+             "Add a 'Frequently Asked Questions' ## section with 4-6 questions and concise answers")
 
-    if re.search(r'application/ld\+json', content, re.I):
-        ok("Structured data (JSON-LD) present — eligible for rich results")
+    if _md:
+        # Schema.org is injected by the formatter — award the point if FAQ is present
+        if blog.get("faq"):
+            ok("Structured data (JSON-LD) will be injected by formatter")
+        else:
+            lose("faq_schema_image", 1,
+                 "No FAQ data — formatter cannot generate FAQPage schema",
+                 "Provide FAQ items so formatter can inject Article + FAQPage JSON-LD")
     else:
-        lose("faq_schema_image", 1,
-             "No structured data (JSON-LD) found — missing schema.org markup",
-             "Add Article and FAQPage JSON-LD schema for Google rich results eligibility")
+        if re.search(r'application/ld\+json', content, re.I):
+            ok("Structured data (JSON-LD) present — eligible for rich results")
+        else:
+            lose("faq_schema_image", 1,
+                 "No structured data (JSON-LD) found — missing schema.org markup",
+                 "Add Article and FAQPage JSON-LD schema for Google rich results eligibility")
 
-    if re.search(r'<h[23][^>]*>[^<]*(References|Sources|Citations)', content, re.I):
-        ok("References / Sources section present")
+    if re.search(_refs_pat, content, re.I | _faq_flag) or (blog.get("references") and _md):
+        ok("References / Sources present")
     else:
         lose("faq_schema_image", 1,
              "No References section",
-             "Add a 'References & Sources' H2 section at the bottom of the article")
+             "Add a '## References & Sources' section or ensure references list is populated")
 
     has_real_image = bool(cover and "placehold.co" not in cover)
     if has_real_image:
@@ -1972,7 +2006,14 @@ _DEFINITIVE_RED_FLAGS = (
 
 def _sentence_fingerprints(text: str) -> list:
     """Return normalised sentence strings (lowercased, punctuation stripped) for dedup."""
-    raw = re.split(r'(?<=[.!?])\s+', re.sub(r'<[^>]+>', ' ', text))
+    # Strip both HTML tags and Markdown syntax markers
+    stripped = re.sub(r'<[^>]+>', ' ', text)
+    stripped = re.sub(r'^#{1,6}\s+', '', stripped, flags=re.M)  # ## headings
+    stripped = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', stripped)  # **bold** / *italic*
+    stripped = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', stripped)   # [text](url)
+    stripped = re.sub(r'^>\s*\[![A-Z]+\]\s*', '', stripped, flags=re.M)  # > [!TIP]
+    stripped = re.sub(r'^>\s*', '', stripped, flags=re.M)           # > blockquote
+    raw = re.split(r'(?<=[.!?])\s+', stripped)
     return [re.sub(r'[^a-z0-9 ]', '', s.lower()).strip() for s in raw if len(s.strip()) > 40]
 
 
@@ -1999,9 +2040,17 @@ def validate_credibility(blog: dict) -> dict:
     Returns the same shape as validate_seo (score, grade, status, issues, fixes,
     hard_fail_reasons) so it can be fed into revise_blog_credibility().
     """
-    _ck     = "content_html" if "content_html" in blog else "content"
+    _ck     = ("content_markdown" if "content_markdown" in blog
+               else "content_html" if "content_html" in blog else "content")
     content = (blog.get(_ck) or "").strip()
-    clean   = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', content)).strip()
+    # Strip both HTML tags and Markdown syntax markers for all text-level checks
+    _s = re.sub(r'<[^>]+>', ' ', content)
+    _s = re.sub(r'^#{1,6}\s+', '', _s, flags=re.M)
+    _s = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', _s)
+    _s = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', _s)
+    _s = re.sub(r'^>\s*\[![A-Z]+\]\s*', '', _s, flags=re.M)
+    _s = re.sub(r'^>\s*', '', _s, flags=re.M)
+    clean   = re.sub(r'\s+', ' ', _s).strip()
     clean_l = clean.lower()
 
     cat = {
@@ -2268,7 +2317,8 @@ def revise_blog_plagiarism(blog: dict, plag_report: dict, llm_cfg,
 
     Returns {"revised_blog", "new_plagiarism_score", "score_progression", "flagged", "notes"}
     """
-    _ck        = "content_html" if "content_html" in blog else "content"
+    _ck        = ("content_markdown" if "content_markdown" in blog
+                  else "content_html" if "content_html" in blog else "content")
     notes      = []
     current    = dict(blog)
     tavily_key = tavily_key or os.getenv("TAVILY_API_KEY", "")
@@ -2282,7 +2332,7 @@ def revise_blog_plagiarism(blog: dict, plag_report: dict, llm_cfg,
 
         notes.append(f"\n── Plagiarism Loop {loop_num}/{max_loops} ({len(flagged)} flagged) ──")
         content      = current.get(_ck, "")
-        fmt          = "HTML" if _ck == "content_html" else "text"
+        fmt          = "Markdown" if _ck == "content_markdown" else ("HTML" if _ck == "content_html" else "text")
 
         sentences_list = "\n".join(
             f'{i + 1}. "{f["sentence"]}"  [found on: {f.get("source_title") or f.get("found_at","")}]'
@@ -2347,7 +2397,9 @@ def revise_blog_credibility(blog: dict, cred_report: dict, llm_cfg, max_loops: i
       6. Re-audit; exit early if score >= 90
     Returns {"revised_blog": dict, "new_credibility_score": int, "notes": list}
     """
-    _ck    = "content_html" if "content_html" in blog else "content"
+    _ck    = ("content_markdown" if "content_markdown" in blog
+              else "content_html" if "content_html" in blog else "content")
+    _fmt   = "Markdown" if _ck == "content_markdown" else "HTML"
     notes  = []
     current = dict(blog)
     score_progression = [cred_report.get("score", 0)]
@@ -2398,22 +2450,22 @@ def revise_blog_credibility(blog: dict, cred_report: dict, llm_cfg, max_loops: i
             notes.append("  No actionable fixes — stopping early")
             break
 
-        prompt = f"""You are a credibility editor. Apply ONLY the listed surgical fixes to the article HTML.
+        prompt = f"""You are a credibility editor. Apply ONLY the listed surgical fixes to the article {_fmt}.
 Do NOT change the meaning, add new facts, invent sources, or alter the overall structure.
-Return ONLY the revised full HTML (the content_html value) — no JSON wrapper, no markdown.
+Return ONLY the revised full {_fmt} — no JSON wrapper, no code fences.
 
 FIXES TO APPLY:
 {chr(10).join(f"  {i+1}. {f}" for i, f in enumerate(fixes_needed))}
 
 ALL OTHER ISSUES (for awareness only): {issues_text[:300]}
 
-ARTICLE HTML:
+ARTICLE {_fmt.upper()}:
 {content[:12000]}"""
 
         try:
             revised_html = _llm(prompt, llm_cfg, json_mode=False, timeout=120, max_tokens=8000)
-            # Strip any accidental markdown code fences
-            revised_html = re.sub(r'^```html?\s*', '', revised_html.strip(), flags=re.I)
+            # Strip any accidental code fences
+            revised_html = re.sub(r'^```(?:html|markdown)?\s*', '', revised_html.strip(), flags=re.I)
             revised_html = re.sub(r'\s*```$', '', revised_html.strip())
             if len(revised_html) > 500:
                 current[_ck] = revised_html
@@ -2445,6 +2497,134 @@ ARTICLE HTML:
     }
 
 
+# ── HTML FORMATTER ─────────────────────────────────────────────────────────────
+
+def format_blog_html(blog: dict, section_imgs: list = None,
+                     published_blogs: list = None) -> dict:
+    """
+    Convert content_markdown → branded HTML. Called only on Preview or Publish —
+    never during the audit/rewrite stage so auditors always see clean content.
+
+    Injects: section images, internal links, FAQ section, References section,
+    schema.org Article + FAQPage JSON-LD.
+    Returns blog dict with 'content_html' and 'content' set (both = same HTML).
+    Old blogs that already have HTML content and no content_markdown are returned
+    unchanged.
+    """
+    import markdown as _md_lib
+
+    md_content = blog.get("content_markdown", "")
+    if not md_content:
+        # Old blog — already HTML; nothing to format
+        return dict(blog)
+
+    # ── 1. Markdown → HTML ────────────────────────────────────────────────────
+    html = _md_lib.markdown(
+        md_content,
+        extensions=["extra", "tables", "fenced_code", "toc"],
+        extension_configs={"toc": {"toc_depth": "2-3"}},
+    )
+
+    # ── 2. Branded callout divs ───────────────────────────────────────────────
+    # > [!TIP] and > [!WARNING] render as <blockquote><p>[!TIP]\ncontent</p></blockquote>
+    html = re.sub(
+        r'<blockquote>\s*<p>\[!TIP\]\s*(.*?)</p>\s*</blockquote>',
+        lambda m: f'<div class="callout-tip"><p>{m.group(1).strip()}</p></div>',
+        html, flags=re.DOTALL | re.I,
+    )
+    html = re.sub(
+        r'<blockquote>\s*<p>\[!WARNING\]\s*(.*?)</p>\s*</blockquote>',
+        lambda m: f'<div class="callout-warning"><p>{m.group(1).strip()}</p></div>',
+        html, flags=re.DOTALL | re.I,
+    )
+
+    # ── 3. Section images — embed after every 2nd+ H2 ────────────────────────
+    if section_imgs:
+        parts = re.split(r'(<h2[^>]*>.*?</h2>)', html, flags=re.DOTALL)
+        out, h2_seen, img_idx = [], 0, 0
+        for seg in parts:
+            out.append(seg)
+            if re.match(r'<h2', seg.strip(), re.I) and img_idx < len(section_imgs):
+                h2_seen += 1
+                if h2_seen >= 2:
+                    im  = section_imgs[img_idx]
+                    cap = im.get("alt", "")
+                    atr = im.get("attribution", "")
+                    if atr:
+                        cap = f'{cap} <span class="blog-credit">{atr}</span>' if cap else atr
+                    out.append(
+                        f'<figure class="blog-figure">'
+                        f'<img src="{im["url"]}" alt="{im.get("alt","")}" '
+                        f'loading="lazy" style="width:100%;height:auto;border-radius:0;" />'
+                        f'<figcaption>{cap}</figcaption></figure>'
+                    )
+                    img_idx += 1
+        html = "".join(out)
+
+    # ── 4. Internal links to related published posts ──────────────────────────
+    if published_blogs:
+        related = _find_related_blog_links(blog, published_blogs, n=2)
+        if related and not any(r["url"] in html for r in related):
+            rel_links = " | ".join(f'<a href="{r["url"]}">{r["anchor"]}</a>' for r in related)
+            html = html.rstrip() + (
+                f'\n<p>Want to go deeper? {rel_links} — '
+                f'or <a href="/contact">talk to the Lumynor team</a> about '
+                f'building your own agentic product.</p>'
+            )
+
+    # ── 5. FAQ section HTML ───────────────────────────────────────────────────
+    faq_items = blog.get("faq", []) or []
+    if faq_items and not re.search(r'<h[23][^>]*>[^<]*(FAQ|Frequently Asked)', html, re.I):
+        faq_html = "<h2>Frequently Asked Questions</h2>"
+        for it in faq_items:
+            q = (it.get("question") or "").strip()
+            a = (it.get("answer") or "").strip()
+            if q and a:
+                faq_html += f"<h3>{q}</h3><p>{a}</p>"
+        html = html.rstrip() + "\n" + faq_html
+
+    # ── 6. References section HTML ────────────────────────────────────────────
+    refs = blog.get("references", [])
+    if refs and not re.search(r'<h[23][^>]*>[^<]*(References|Sources|Citations)', html, re.I):
+        ref_html = "<h2>References &amp; Sources</h2><ol>"
+        for r in refs[:6]:
+            ref_html += (f'<li><a href="{r["url"]}" target="_blank" '
+                         f'rel="noopener noreferrer">{r["title"]}</a></li>')
+        ref_html += "</ol>"
+        html = html.rstrip() + "\n" + ref_html
+
+    # ── 7. schema.org Article + FAQPage JSON-LD ──────────────────────────────
+    title_ld = (blog.get("title") or "").replace('"', '\\"')
+    desc_ld  = (blog.get("summary") or blog.get("meta_description") or "")[:160].replace('"', '\\"')
+    faq_ld   = "".join(
+        f'{{"@type":"Question","name":"{it.get("question","").replace(chr(34),chr(39))}",'
+        f'"acceptedAnswer":{{"@type":"Answer","text":"{it.get("answer","").replace(chr(34),chr(39))[:300]}"}}}}'
+        + ("," if i < len(faq_items) - 1 else "")
+        for i, it in enumerate(faq_items[:8])
+    )
+    schema = (
+        f'<script type="application/ld+json">'
+        f'{{"@context":"https://schema.org","@type":"Article",'
+        f'"headline":"{title_ld}","description":"{desc_ld}",'
+        f'"author":{{"@type":"Organization","name":"Lumynor Systems"}},'
+        f'"publisher":{{"@type":"Organization","name":"Lumynor Systems","url":"https://lumynor.com"}}}}'
+        f'</script>'
+    )
+    if faq_ld:
+        schema += (
+            f'\n<script type="application/ld+json">'
+            f'{{"@context":"https://schema.org","@type":"FAQPage",'
+            f'"mainEntity":[{faq_ld}]}}'
+            f'</script>'
+        )
+    html = schema + "\n" + html
+
+    out = dict(blog)
+    out["content_html"] = html
+    out["content"]      = html
+    return out
+
+
 # ── STAGE 6b: SEO REFINEMENT (auto-fix to hit 90+) ────────────────────────────
 
 def refine_blog_seo(blog: dict, seo_report: dict, gemini_key: str) -> dict:
@@ -2453,9 +2633,10 @@ def refine_blog_seo(blog: dict, seo_report: dict, gemini_key: str) -> dict:
     Does NOT rewrite the longform body — protects word count and content quality.
     Works with both 'content_html' (pipeline drafts) and 'content' (stored blogs).
     """
-    # Accept both key conventions used across the codebase
     primary_kw = (blog.get("primary_keyword") or blog.get("primaryKeyword") or "").strip()
-    _ck = "content_html" if "content_html" in blog else "content"
+    _ck = ("content_markdown" if "content_markdown" in blog
+           else "content_html" if "content_html" in blog else "content")
+    _fmt = "Markdown" if _ck == "content_markdown" else "HTML"
     content = blog.get(_ck, "")
     issues_text = " | ".join(seo_report.get("issues", []))
 
@@ -3401,7 +3582,8 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
             research_brief = {"core_angle": f"Top 10 AI headlines roundup for {month_year}",
                               "lumynor_perspective": "What these AI developments mean for SaaS and agentic product builders",
                               "suggested_outline": [], "faqs": [], "_present": True}
-            word_count = len(re.sub(r'<[^>]+>', ' ', blog_content.get("content_html", "")).split())
+            _raw_wc = blog_content.get("content_markdown", blog_content.get("content_html", ""))
+            word_count = len(re.sub(r'[#*_`>\[\]()]', ' ', re.sub(r'<[^>]+>', ' ', _raw_wc)).split())
             log.append(f"📝 Roundup written: {word_count} words")
         except Exception as _re:
             log.append(f"⚠️ Roundup failed ({str(_re)[:80]}) — falling back to deep-dive")
@@ -3454,7 +3636,8 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
                 if _attempt == 3:
                     raise
                 log.append(f"⚠️ Write attempt {_attempt} failed ({str(e)[:60]}), retrying...")
-        word_count = len(re.sub('<[^>]+>', '', blog_content.get("content_html", "")).split())
+        _raw_wc2 = blog_content.get("content_markdown", blog_content.get("content_html", ""))
+        word_count = len(re.sub(r'[#*_`>\[\]()]', ' ', re.sub(r'<[^>]+>', ' ', _raw_wc2)).split())
 
     # Stage 5: Source images — done ONCE and reused on any quality rewrite below.
     image_prompts = blog_content.get("image_prompts", [])
@@ -3479,135 +3662,48 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
 
     def _finalize_draft(draft):
         """Embed images, inject FAQ, resolve placeholders, clamp meta, SEO-validate + refine.
-        Returns (processed_draft, seo_report). Captures section_imgs/research/gemini_key."""
-        # Embed section images after successive H2 headings
-        ch = draft.get("content_html", "")
-        if section_imgs and "<h2" in ch:
-            parts = re.split(r'(<h2[^>]*>.*?</h2>)', ch, flags=re.DOTALL)
-            out, h2_seen, img_idx = [], 0, 0
-            for seg in parts:
-                out.append(seg)
-                if seg.strip().lower().startswith("<h2") and img_idx < len(section_imgs):
-                    h2_seen += 1
-                    if h2_seen >= 2:
-                        im = section_imgs[img_idx]
-                        caption = im.get("alt", "")
-                        attr = im.get("attribution", "")
-                        if attr:
-                            caption = f'{caption} <span class="blog-credit">{attr}</span>' if caption else attr
-                        out.append(
-                            f'<figure class="blog-figure"><img src="{im["url"]}" alt="{im.get("alt","")}" '
-                            f'loading="lazy" style="width:100%;height:auto;border-radius:0;" />'
-                            f'<figcaption>{caption}</figcaption></figure>'
-                        )
-                        img_idx += 1
-            draft["content_html"] = "".join(out)
+        Returns (processed_draft, seo_report). Captures section_imgs/research/gemini_key.
+        HTML formatting (images, links, schema, FAQ HTML) is handled by format_blog_html()
+        which runs after all audits pass. This function only does content-level work."""
+        # Key where the LLM wrote content (new: content_markdown; old: content_html/content)
+        _dk = ("content_markdown" if "content_markdown" in draft
+               else "content_html" if "content_html" in draft else "content")
 
-        draft["content_html"] = _resolve_content_placeholders(draft.get("content_html", ""))
-
-        faq_items = draft.get("faq", []) or []
-        ch2 = draft.get("content_html", "").rstrip()
-        if faq_items and not re.search(r'<h[23][^>]*>[^<]*(FAQ|Frequently Asked)', ch2, re.I):
-            faq_html = "<h2>Frequently Asked Questions</h2>"
-            for it in faq_items:
-                q = (it.get("question") or "").strip()
-                a = (it.get("answer") or "").strip()
-                if q and a:
-                    faq_html += f"<h3>{q}</h3><p>{a}</p>"
-            draft["content_html"] = ch2 + "\n" + faq_html
-
+        # Clamp meta description
         summary = _clamp_summary(draft.get("summary") or draft.get("meta_description") or "")
         draft["summary"] = summary
         if not draft.get("meta_description"):
             draft["meta_description"] = summary
 
-        # Inject research_brief so validate_seo can award the "unique angle" check.
-        # The full brief is too large for the blog object — pass a lightweight sentinel.
+        # Inject research_brief sentinel so validate_seo awards the "unique angle" check
         if research_brief and not draft.get("research_brief"):
             draft["research_brief"] = {"_present": True}
 
-        # Inject dynamic internal links to published sibling posts (pillar ↔ cluster).
-        if published_blogs:
-            _related = _find_related_blog_links(draft, published_blogs, n=2)
-            _ch3 = draft.get("content_html", "")
-            if _related and not any(r["url"] in _ch3 for r in _related):
-                rel_links = " | ".join(f'<a href="{r["url"]}">{r["anchor"]}</a>' for r in _related)
-                il_block = (
-                    f'<p>Want to go deeper? {rel_links} — '
-                    f'or <a href="/contact">talk to the Lumynor team</a> about '
-                    f'building your own agentic product.</p>'
-                )
-                draft["content_html"] = _ch3 + "\n" + il_block
-
-        # Inject schema.org Article + FAQPage JSON-LD for structured data / rich results.
-        ch_ld = draft.get("content_html", "")
-        if "<script type=\"application/ld+json\">" not in ch_ld:
-            title_ld  = (draft.get("title") or "").replace('"', '\\"')
-            desc_ld   = (draft.get("summary") or draft.get("meta_description") or "")[:160].replace('"', '\\"')
-            faq_items_ld = draft.get("faq", []) or []
-            # Also pull FAQ items already embedded in the HTML
-            if not faq_items_ld:
-                faq_items_ld = [
-                    {"question": re.sub(r'<[^>]+>', '', q), "answer": re.sub(r'<[^>]+>', '', a)}
-                    for q, a in re.findall(r'<h3[^>]*>(.*?)</h3>\s*<p[^>]*>(.*?)</p>',
-                                           ch_ld, re.DOTALL | re.I)
-                ]
-            faq_ld_items = "".join(
-                f'{{"@type":"Question","name":"{it.get("question","").replace(chr(34), chr(39))}",'
-                f'"acceptedAnswer":{{"@type":"Answer","text":"{it.get("answer","").replace(chr(34), chr(39))[:300]}"}}}}'
-                + ("," if i < len(faq_items_ld) - 1 else "")
-                for i, it in enumerate(faq_items_ld[:8])
-            )
-            schema_blocks = (
-                f'<script type="application/ld+json">'
-                f'{{"@context":"https://schema.org","@type":"Article",'
-                f'"headline":"{title_ld}","description":"{desc_ld}",'
-                f'"author":{{"@type":"Organization","name":"Lumynor Systems"}},'
-                f'"publisher":{{"@type":"Organization","name":"Lumynor Systems",'
-                f'"url":"https://lumynor.com"}}}}'
-                f'</script>'
-            )
-            if faq_ld_items:
-                schema_blocks += (
-                    f'\n<script type="application/ld+json">'
-                    f'{{"@context":"https://schema.org","@type":"FAQPage",'
-                    f'"mainEntity":[{faq_ld_items}]}}'
-                    f'</script>'
-                )
-            draft["content_html"] = schema_blocks + "\n" + ch_ld
-
-        # Repetition check — deduplicate repeated sentences before SEO validation
-        _dupes = _find_repeated_sentences(draft.get("content_html", ""))
+        # Repetition check on Markdown/content — deduplicate before SEO validation
+        _dupes = _find_repeated_sentences(draft.get(_dk, ""))
         if _dupes:
-            _ck = "content_html"
+            _fmt = "Markdown" if _dk == "content_markdown" else "HTML"
             _rep_prompt = (
-                "You are a copy editor. The following article contains repeated sentences "
-                "(exact or near-exact duplicates). Rewrite ONLY the second and subsequent "
-                "occurrences of each repeated sentence with fresh phrasing that conveys the same idea. "
-                "Return ONLY the full revised HTML — no JSON, no markdown wrapper.\n\n"
+                f"You are a copy editor. The following article contains repeated sentences "
+                f"(exact or near-exact duplicates). Rewrite ONLY the second and subsequent "
+                f"occurrences of each repeated sentence with fresh phrasing that conveys the same idea. "
+                f"Return ONLY the full revised {_fmt} — no JSON, no code fences.\n\n"
                 f"REPEATED SENTENCES:\n" + "\n".join(f'- "{s[:100]}"' for s in _dupes[:8]) +
-                f"\n\nARTICLE HTML:\n{draft.get(_ck, '')[:12000]}"
+                f"\n\nARTICLE {_fmt.upper()}:\n{draft.get(_dk, '')[:12000]}"
             )
             try:
-                _dedup_html = _llm(_rep_prompt, gemini_key, json_mode=False, timeout=90, max_tokens=8000)
-                _dedup_html = re.sub(r'^```html?\s*', '', _dedup_html.strip(), flags=re.I)
-                _dedup_html = re.sub(r'\s*```$', '', _dedup_html.strip())
-                if len(_dedup_html) > 500:
-                    draft[_ck] = _dedup_html
+                _dedup = _llm(_rep_prompt, gemini_key, json_mode=False, timeout=90, max_tokens=8000)
+                _dedup = re.sub(r'^```(?:html|markdown)?\s*', '', _dedup.strip(), flags=re.I)
+                _dedup = re.sub(r'\s*```$', '', _dedup.strip())
+                if len(_dedup) > 500:
+                    draft[_dk] = _dedup
             except Exception as _de:
                 print(f"[repetition_fix] {_de}")
 
-        # SEO validate + refine (target 90+)
+        # SEO validate + refine (target 90+) — validate_seo handles both Markdown and HTML
         seo = validate_seo(draft)
         if seo["score"] < 90 and seo.get("issues"):
             draft = refine_blog_seo(draft, seo, gemini_key)
-            refs = research.get("references", [])
-            if refs and "References" not in draft.get("content_html", ""):
-                ref_html = "<h2>References &amp; Sources</h2><ol>"
-                for r in refs[:6]:
-                    ref_html += f'<li><a href="{r["url"]}" target="_blank" rel="noopener noreferrer">{r["title"]}</a></li>'
-                ref_html += "</ol>"
-                draft["content_html"] = draft["content_html"].rstrip() + "\n" + ref_html
             seo = validate_seo(draft)
         return draft, seo
 
@@ -3681,7 +3777,8 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
         "category": category,
         "author": author,
         "summary": blog_content.get("summary", blog_content.get("meta_description", "")),
-        "content": blog_content.get("content_html", ""),
+        "content_markdown": blog_content.get("content_markdown", ""),
+        "content": "",  # Populated by format_blog_html() on Preview/Publish
         "published": auto_publish,
         "coverImage": cover_image,
         "coverImageAttribution": cover_attribution,
@@ -3691,7 +3788,7 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
         "metaDescription": blog_content.get("meta_description", ""),
         "readTime": blog_content.get("read_time", f"{max(1, word_count // 200)} min read"),
         "tags": blog_content.get("tags", [niche.lower(), category.lower()]),
-        "faq": [],   # FAQ is embedded in content HTML above; keep this empty to avoid double-render
+        "faq": blog_content.get("faq", []),
         "images": images,
         "references": blog_content.get("references", research.get("references", [])),
         "seoScore": seo_report["score"],
@@ -3705,6 +3802,7 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
             "lumynor_perspective": research_brief.get("lumynor_perspective", ""),
             "sections": len(research_brief.get("suggested_outline", [])),
         },
+        "_section_imgs": section_imgs,
         "pipelineLog": log
     }
 

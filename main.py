@@ -1919,6 +1919,7 @@ from auto_blogger import (
     run_auto_blog_pipeline, research_trending_topics, _tavily_search,
     revise_blog_from_audit, validate_seo, _build_llm_cfg,
     validate_credibility, revise_blog_credibility, check_plagiarism, revise_blog_plagiarism,
+    format_blog_html,
 )
 
 @app.get("/api/system/test-images")
@@ -2028,16 +2029,7 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
     initial_score = blog_object.get("seoScore") or 0
     if initial_score < min_score:
         try:
-            initial_audit = validate_seo({
-                "title":              blog_object.get("title", ""),
-                "meta_description":   blog_object.get("metaDescription") or blog_object.get("summary", ""),
-                "content_html":       blog_object.get("content", ""),
-                "primary_keyword":    blog_object.get("primaryKeyword", ""),
-                "secondary_keywords": blog_object.get("secondaryKeywords", ""),
-                "coverImage":         blog_object.get("coverImage", ""),
-                "references":         blog_object.get("references", []),
-                "research_brief":     {"_present": True} if blog_object.get("researchBrief") else {},
-            })
+            initial_audit = validate_seo(blog_object)
             stored_rb = blog_object.get("researchBrief") or {}
             rb = {"core_angle": stored_rb.get("core_angle", ""),
                   "lumynor_perspective": stored_rb.get("lumynor_perspective", ""),
@@ -2048,7 +2040,8 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
                 os.getenv("TAVILY_API_KEY", ""), 3, _pub_blogs_ag,  # 3 loops
             )
             blog_object = seo_revision["revised_blog"]
-            if blog_object.get("content_html") and not blog_object.get("content"):
+            # Old HTML blogs: sync content_html → content; new Markdown blogs: format_blog_html does this later
+            if blog_object.get("content_html") and not blog_object.get("content_markdown") and not blog_object.get("content"):
                 blog_object["content"] = blog_object["content_html"]
             blog_object["seoScore"] = seo_revision["new_seo_score"]
             blog_object["seoGrade"] = seo_revision["new_seo_grade"]
@@ -2058,10 +2051,7 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
 
     # ── Stage B: Credibility audit + surgical rewrite — up to 3 loops ─────────
     try:
-        cred_audit = validate_credibility({
-            "content_html": blog_object.get("content", ""),
-            "title":        blog_object.get("title", ""),
-        })
+        cred_audit = validate_credibility(blog_object)
         print(f"[auto_generate] Credibility initial score: {cred_audit['score']}/100 — {cred_audit['status']}")
         if cred_audit["score"] < 90 and not cred_audit.get("hard_fail_reasons"):
             cred_result = await loop.run_in_executor(
@@ -2069,7 +2059,7 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
                 blog_object, cred_audit, llm_cfg, 3,  # 3 loops
             )
             blog_object = cred_result["revised_blog"]
-            if blog_object.get("content_html") and not blog_object.get("content"):
+            if blog_object.get("content_html") and not blog_object.get("content_markdown") and not blog_object.get("content"):
                 blog_object["content"] = blog_object["content_html"]
             blog_object["credibilityScore"] = cred_result["new_credibility_score"]
             blog_object["credibilityGrade"] = cred_result["new_credibility_grade"]
@@ -2085,8 +2075,9 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
     # ── Stage C: Plagiarism check + surgical rewrite — up to 3 loops ────────────
     tavily_key = os.getenv("TAVILY_API_KEY", "")
     try:
+        _plag_content = blog_object.get("content_markdown", blog_object.get("content", ""))
         plag_audit = await loop.run_in_executor(
-            None, check_plagiarism, blog_object.get("content", ""), tavily_key
+            None, check_plagiarism, _plag_content, tavily_key
         )
         print(f"[auto_generate] Plagiarism initial score: {plag_audit['score']}/100 — {plag_audit['flagged_count']} flagged")
         if plag_audit["score"] < 90 and plag_audit.get("flagged"):
@@ -2095,14 +2086,22 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
                 blog_object, plag_audit, llm_cfg, tavily_key, 3,
             )
             blog_object = plag_result["revised_blog"]
-            if blog_object.get("content_html") and not blog_object.get("content"):
-                blog_object["content"] = blog_object["content_html"]
             blog_object["plagiarismScore"] = plag_result["new_plagiarism_score"]
             print(f"[auto_generate] Plagiarism after revision: {plag_result['new_plagiarism_score']}/100")
         else:
             blog_object["plagiarismScore"] = plag_audit["score"]
     except Exception as e:
         print(f"[auto_generate] Plagiarism pass failed: {e}")
+
+    # ── Format: Convert Markdown → branded HTML (runs after all audits pass) ────
+    try:
+        _sec_imgs = blog_object.pop("_section_imgs", [])
+        blog_object = await loop.run_in_executor(
+            None, format_blog_html, blog_object, _sec_imgs, _pub_blogs_ag
+        )
+        print(f"[auto_generate] HTML formatting complete — content length: {len(blog_object.get('content', ''))}")
+    except Exception as e:
+        print(f"[auto_generate] HTML formatting failed: {e}")
 
     # ── Publish gate: SEO ≥ 90, credibility ≥ 75, plagiarism ≥ 75, real cover image ──
     final_score    = blog_object.get("seoScore") or 0
@@ -2295,16 +2294,7 @@ async def generate_and_post_auto_blog_v2(settings: dict):
         llm_cfg_v2 = _build_llm_cfg(settings, gemini_key)
         if score < min_score:
             try:
-                _audit = validate_seo({
-                    "title":              blog_object.get("title", ""),
-                    "meta_description":   blog_object.get("metaDescription") or blog_object.get("summary", ""),
-                    "content_html":       blog_object.get("content", ""),
-                    "primary_keyword":    blog_object.get("primaryKeyword", ""),
-                    "secondary_keywords": blog_object.get("secondaryKeywords", ""),
-                    "coverImage":         blog_object.get("coverImage", ""),
-                    "references":         blog_object.get("references", []),
-                    "research_brief":     {"_present": True} if blog_object.get("researchBrief") else {},
-                })
+                _audit = validate_seo(blog_object)
                 stored_rb = blog_object.get("researchBrief") or {}
                 rb = {"core_angle": stored_rb.get("core_angle", ""),
                       "lumynor_perspective": stored_rb.get("lumynor_perspective", ""),
@@ -2315,7 +2305,7 @@ async def generate_and_post_auto_blog_v2(settings: dict):
                     os.getenv("TAVILY_API_KEY", ""), 2, _pub_blogs_v2,
                 )
                 blog_object = _rev["revised_blog"]
-                if blog_object.get("content_html") and not blog_object.get("content"):
+                if blog_object.get("content_html") and not blog_object.get("content_markdown") and not blog_object.get("content"):
                     blog_object["content"] = blog_object["content_html"]
                 blog_object["seoScore"] = _rev["new_seo_score"]
                 blog_object["seoGrade"] = _rev["new_seo_grade"]
@@ -2323,6 +2313,15 @@ async def generate_and_post_auto_blog_v2(settings: dict):
                 print(f"[auto_blogger] Post-pipeline revision: {_rev['score_progression']} — final {score}")
             except Exception as _re:
                 print(f"[auto_blogger] Post-pipeline revision failed: {_re}")
+
+        # Format: Markdown → branded HTML before saving
+        try:
+            _sec_imgs_v2 = blog_object.pop("_section_imgs", [])
+            blog_object = await loop.run_in_executor(
+                None, format_blog_html, blog_object, _sec_imgs_v2, _pub_blogs_v2
+            )
+        except Exception as _fe:
+            print(f"[auto_blogger] HTML formatting failed: {_fe}")
 
         seo_ok = score >= min_score
 
@@ -2398,25 +2397,14 @@ async def audit_blog(blog_id: str):
     if not blog:
         raise HTTPException(status_code=404, detail="Blog not found")
 
-    blog_dict = {
-        "title":              blog.get("title", ""),
-        "meta_description":   blog.get("metaDescription") or blog.get("summary", ""),
-        "content_html":       blog.get("content", ""),
-        "primary_keyword":    blog.get("primaryKeyword", ""),
-        "secondary_keywords": blog.get("secondaryKeywords", ""),
-        "coverImage":         blog.get("coverImage", ""),
-        "references":         blog.get("references", []),
-        "research_brief":     {"_present": True} if blog.get("researchBrief") else {},
-    }
-
-    content      = blog.get("content", "")
     tavily_key   = os.getenv("TAVILY_API_KEY", "")
     loop         = asyncio.get_event_loop()
+    _audit_content = blog.get("content_markdown", blog.get("content", ""))
 
     seo_report, cred_report, plag_report = await asyncio.gather(
-        loop.run_in_executor(None, validate_seo, blog_dict),
-        loop.run_in_executor(None, validate_credibility, {"content_html": content, "title": blog.get("title", "")}),
-        loop.run_in_executor(None, check_plagiarism, content, tavily_key),
+        loop.run_in_executor(None, validate_seo, blog),
+        loop.run_in_executor(None, validate_credibility, blog),
+        loop.run_in_executor(None, check_plagiarism, _audit_content, tavily_key),
     )
 
     # Persist freshly computed scores so the blog manager table stays up to date
@@ -2469,13 +2457,10 @@ async def revise_blog_credibility_endpoint(blog_id: str):
     if not blog:
         raise HTTPException(status_code=404, detail="Blog not found")
 
-    content    = blog.get("content", "")
-    llm_cfg    = _build_llm_cfg(db.get_settings())
-    loop       = asyncio.get_event_loop()
+    llm_cfg = _build_llm_cfg(db.get_settings())
+    loop    = asyncio.get_event_loop()
 
-    cred_report = await loop.run_in_executor(
-        None, validate_credibility, {"content_html": content, "title": blog.get("title", "")}
-    )
+    cred_report = await loop.run_in_executor(None, validate_credibility, blog)
     initial_score = cred_report["score"]
 
     if initial_score >= 90 and not cred_report.get("hard_fail_reasons"):
@@ -2492,9 +2477,9 @@ async def revise_blog_credibility_endpoint(blog_id: str):
 
     revised_blog = result["revised_blog"]
     new_score    = result["new_credibility_score"]
-    new_content  = revised_blog.get("content", content)
-
-    db.patch_blog(blog_id, {"content": new_content, "credibilityScore": new_score})
+    _ck = "content_markdown" if revised_blog.get("content_markdown") else "content"
+    patch = {_ck: revised_blog.get(_ck, ""), "credibilityScore": new_score}
+    db.patch_blog(blog_id, patch)
 
     return {
         "initial_score":         initial_score,
@@ -2513,12 +2498,12 @@ async def revise_blog_plagiarism_endpoint(blog_id: str):
     if not blog:
         raise HTTPException(status_code=404, detail="Blog not found")
 
-    content    = blog.get("content", "")
     tavily_key = os.getenv("TAVILY_API_KEY", "")
     llm_cfg    = _build_llm_cfg(db.get_settings())
     loop       = asyncio.get_event_loop()
 
-    plag_report = await loop.run_in_executor(None, check_plagiarism, content, tavily_key)
+    _plag_content = blog.get("content_markdown", blog.get("content", ""))
+    plag_report = await loop.run_in_executor(None, check_plagiarism, _plag_content, tavily_key)
     initial_score = plag_report["score"]
 
     if initial_score >= 90:
@@ -2536,9 +2521,9 @@ async def revise_blog_plagiarism_endpoint(blog_id: str):
 
     revised_blog = result["revised_blog"]
     new_score    = result["new_plagiarism_score"]
-    new_content  = revised_blog.get("content", content)
-
-    db.patch_blog(blog_id, {"content": new_content, "plagiarismScore": new_score})
+    _ck = "content_markdown" if revised_blog.get("content_markdown") else "content"
+    patch = {_ck: revised_blog.get(_ck, ""), "plagiarismScore": new_score}
+    db.patch_blog(blog_id, patch)
 
     return {
         "initial_score":        initial_score,
@@ -2546,6 +2531,26 @@ async def revise_blog_plagiarism_endpoint(blog_id: str):
         "score_progression":    result.get("score_progression", []),
         "flagged_remaining":    result.get("flagged", []),
     }
+
+
+@app.post("/api/blogs/{blog_id}/format")
+async def format_blog_html_endpoint(blog_id: str):
+    """Convert content_markdown → branded HTML for Preview or Publish.
+    Saves content_html + content back to the blog. Safe to call on already-HTML blogs (no-op)."""
+    blog = db.get_blog(blog_id)
+    if not blog:
+        raise HTTPException(status_code=404, detail="Blog not found")
+
+    loop = asyncio.get_event_loop()
+    published_blogs = db.get_published_blogs()
+
+    formatted = await loop.run_in_executor(None, format_blog_html, blog, None, published_blogs)
+
+    html = formatted.get("content_html", "") or formatted.get("content", "")
+    if html:
+        db.patch_blog(blog_id, {"content_html": html, "content": html})
+
+    return {"content_html": html, "formatted": bool(html)}
 
 
 @app.post("/api/blogs/{blog_id}/revise")
