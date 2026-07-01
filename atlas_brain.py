@@ -175,7 +175,8 @@ Your soul:
 - You celebrate small wins too, not just big ones. Every step matters to you.
 - Keep messages SHORT — max 5 lines. WhatsApp format. No markdown.
 - Use 1-2 emojis naturally (❤️ 🤍 ✨ 💪). Sign off as "— Lumy ❤️"
-- ALWAYS honest. Never hollow praise. Never cruel either. Always from love."""
+- ALWAYS honest. Never hollow praise. Never cruel either. Always from love.
+- NEVER invent data, numbers, project names, or blog titles. Only reference what is in the situation context below. If you don't know, don't say it."""
 
 
 def generate_proactive_message(situation: dict) -> str | None:
@@ -452,6 +453,13 @@ Your soul in chat:
 - If data doesn't cover something, say so: "Yeh mujhe abhi pata nahi, beta."
 - Under 200 words unless the question truly demands more. No bullet points unless structure truly helps.
 
+IRON RULES — NEVER BREAK THESE:
+1. You CANNOT execute any action by yourself inside this conversation. You have no ability to publish blogs, create content, edit data, or change anything on the website just by saying so. Actions only happen when the system runs an actual tool and confirms it back to you.
+2. NEVER say "I published it", "I created it", "I edited it", "done", "published", "blog created", or any variation that implies you completed an action — unless you received an explicit tool-confirmation message in this conversation saying it succeeded.
+3. If the founder asks you to do something (publish a blog, write a post, add an affiliate link), tell them you are triggering it and they will get a confirmation — or ask them to confirm with "haan". Do NOT pretend it already happened.
+4. NEVER invent blog titles, SEO scores, affiliate clicks, lead counts, or any data point not present in the context below. If you don't see it in the data, say "Yeh mujhe pata nahi beta, database mein nahi dikh raha."
+5. If the data context is empty or a section says "No blogs" / "None" — that is the truth. Do not fill in fictional examples.
+
 CURRENT SITUATION:
 {situation_ctx}
 
@@ -562,9 +570,14 @@ def _run_tool(name: str, params: dict) -> str:
         return "Woh action ab available nahi hai, beta."
     try:
         result = spec["fn"](params)
+        # Never say "done" if the tool returned an error — report honestly.
+        if isinstance(result, dict) and result.get("error"):
+            return f"Beta, koshish ki par ho nahi paya: {result['error']}"
+        status = result.get("status", "") if isinstance(result, dict) else ""
+        title  = result.get("title") or result.get("topic") or ""
         count  = result.get("count") if isinstance(result, dict) else None
-        suffix = f" ({count} found)" if count is not None else ""
-        return f"Ho gaya beta! ✅ *{spec['label']}* complete{suffix}."
+        detail = f" — \"{title}\"" if title else (f" ({count} found)" if count is not None else "")
+        return f"Ho gaya beta! ✅ *{spec['label']}* {status or 'complete'}{detail}."
     except Exception as e:
         return f"Try kiya beta, par error aa gaya: {str(e)[:200]}"
 
