@@ -2123,9 +2123,10 @@ def validate_credibility(blog: dict) -> dict:
 
     # ── 5. Editorial standards (10 pts) ───────────────────────────────────────
     # Check for fabrication signals: quotes with no attributed speaker, "experts say" without naming them
-    anon_expert = len(re.findall(r'"[^"]{20,}"(?!\s*(?:—|–|,)\s*\w)', content))
+    # Use clean (HTML-stripped) text so HTML attribute values don't count as quotes
+    anon_expert = len(re.findall(r'"[^"]{20,}"(?!\s*(?:—|–|,)\s*\w)', clean))
     if anon_expert > 3:
-        lose("editorial", 5, f"{anon_expert} unattributed quote(s) — unclear who said this",
+        lose("editorial", 5, f"{anon_expert} unattributed quote(s) in visible text — unclear who said this",
              "Every quotation must name the speaker and source")
     else:
         ok("Quotes appear attributed or are not present")
@@ -2161,6 +2162,99 @@ def validate_credibility(blog: dict) -> dict:
         "fixes": fixes,
         "hard_fail_reasons": hard_fails,
         "repeated_sentences": repeated,
+    }
+
+
+def check_plagiarism(content: str, tavily_key: str = "") -> dict:
+    """
+    Sample distinctive sentences from the visible blog text and search for them
+    verbatim on the web. Any sentence found on a non-Lumynor external source is
+    flagged as potential plagiarism.
+
+    Returns:
+      score        — 0-100 (100 = fully original, 0 = everything found externally)
+      checked      — number of sentences sampled
+      flagged      — list of {sentence, found_at, source_title}
+      status       — "Original" / "Likely plagiarised" / "Review needed"
+    """
+    # Work on clean text only — no HTML
+    clean = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', content)).strip()
+
+    # Split into sentences on . ! ? boundaries
+    raw_sentences = re.split(r'(?<=[.!?])\s+', clean)
+
+    # Keep sentences that are substantive and specific (40-200 chars)
+    GENERIC_OPENERS = (
+        "in conclusion", "in summary", "in this article", "it is important",
+        "one of the most", "when it comes to", "as mentioned", "as we have seen",
+        "the following", "there are many", "it is worth noting",
+    )
+    candidates = [
+        s.strip() for s in raw_sentences
+        if 40 < len(s.strip()) < 200
+        and not any(s.strip().lower().startswith(g) for g in GENERIC_OPENERS)
+        and sum(1 for c in s if c.isupper()) < len(s) * 0.4  # skip all-caps headings
+    ]
+
+    if not candidates:
+        return {"score": 100, "checked": 0, "flagged": [], "flagged_count": 0,
+                "status": "No checkable sentences found"}
+
+    # Sample evenly: up to 8 sentences spread across the article
+    step     = max(1, len(candidates) // 8)
+    samples  = candidates[::step][:8]
+    tavily_key = tavily_key or os.getenv("TAVILY_API_KEY", "")
+    flagged  = []
+
+    for sentence in samples:
+        # Use first 80 chars of sentence as the quoted search query
+        query = f'"{sentence[:80]}"'
+        results = []
+        if tavily_key:
+            results = _tavily_search(query, tavily_key, num=3, depth="basic", days=3650)
+        else:
+            results = _search_web(query, 3)
+
+        for r in results:
+            url   = (r.get("url") or "").lower()
+            title = r.get("title") or ""
+            if not url:
+                continue
+            # Skip our own site and empty hits
+            if "lumynor" in url:
+                continue
+            # Check if the result content actually contains the sentence verbatim
+            snippet = (r.get("content") or r.get("snippet") or "").lower()
+            # Require at least 60% of the sentence words to appear in the snippet
+            # (exact match is unreliable due to encoding; word-overlap is more robust)
+            sentence_words = set(re.sub(r'[^a-z0-9 ]', '', sentence.lower()).split())
+            snippet_words  = set(re.sub(r'[^a-z0-9 ]', '', snippet).split())
+            significant    = {w for w in sentence_words if len(w) > 4}
+            if significant and len(significant & snippet_words) / len(significant) >= 0.6:
+                flagged.append({
+                    "sentence":     sentence[:120],
+                    "found_at":     r.get("url", ""),
+                    "source_title": title[:80],
+                    "overlap_pct":  round(len(significant & snippet_words) / len(significant) * 100),
+                })
+                break  # One confirmed hit per sentence is enough
+
+    n_clean  = len(samples) - len(flagged)
+    score    = round(n_clean / len(samples) * 100) if samples else 100
+
+    if score >= 90:
+        status = "Original"
+    elif score >= 70:
+        status = "Review needed — some passages match external sources"
+    else:
+        status = "Likely plagiarised — multiple passages found on external sites"
+
+    return {
+        "score":        score,
+        "checked":      len(samples),
+        "flagged_count": len(flagged),
+        "flagged":      flagged,
+        "status":       status,
     }
 
 

@@ -1918,7 +1918,7 @@ async def auto_blogger_daemon():
 from auto_blogger import (
     run_auto_blog_pipeline, research_trending_topics, _tavily_search,
     revise_blog_from_audit, validate_seo, _build_llm_cfg,
-    validate_credibility, revise_blog_credibility,
+    validate_credibility, revise_blog_credibility, check_plagiarism,
 )
 
 @app.get("/api/system/test-images")
@@ -2383,8 +2383,15 @@ async def audit_blog(blog_id: str):
         "research_brief":     {"_present": True} if blog.get("researchBrief") else {},
     }
 
-    seo_report  = validate_seo(blog_dict)
-    cred_report = validate_credibility({"content_html": blog.get("content", ""), "title": blog.get("title", "")})
+    content      = blog.get("content", "")
+    tavily_key   = os.getenv("TAVILY_API_KEY", "")
+    loop         = asyncio.get_event_loop()
+
+    seo_report, cred_report, plag_report = await asyncio.gather(
+        loop.run_in_executor(None, validate_seo, blog_dict),
+        loop.run_in_executor(None, validate_credibility, {"content_html": content, "title": blog.get("title", "")}),
+        loop.run_in_executor(None, check_plagiarism, content, tavily_key),
+    )
 
     return {
         "blog_id":    blog_id,
@@ -2411,6 +2418,13 @@ async def audit_blog(blog_id: str):
             "fixes":           cred_report.get("fixes", []),
             "hard_fails":      cred_report.get("hard_fail_reasons", []),
             "repeated_sentences": cred_report.get("repeated_sentences", []),
+        },
+        "plagiarism": {
+            "score":        plag_report["score"],
+            "status":       plag_report["status"],
+            "checked":      plag_report["checked"],
+            "flagged_count": plag_report["flagged_count"],
+            "flagged":      plag_report["flagged"],
         },
     }
 
