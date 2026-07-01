@@ -10,7 +10,7 @@ from auth import (
     seed_users, seed_audit, authenticate_user, create_access_token,
     decode_token, append_audit_log, get_audit_logs, update_user_credentials
 )
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, JSONResponse
 from agent_graph import company_app, set_broadcast_callback, set_raw_broadcast_callback
 from exporter import markdown_to_docx, markdown_to_pptx
 import db
@@ -1985,10 +1985,156 @@ class AutoBlogRunRequest(BaseModel):
     unsplash_key: str = ""
     pexels_key: str = ""
 
+async def _auto_generate_bg(merged_settings: dict, gemini_key: str, llm_cfg: dict,
+                            auto_publish_flag: bool, settings_snapshot: dict,
+                            _pub_blogs_ag: list, _recent_ag: list):
+    """Full pipeline running as a fire-and-forget background task."""
+    loop = asyncio.get_event_loop()
+    try:
+        blog_object = await loop.run_in_executor(
+            None, run_auto_blog_pipeline, merged_settings, gemini_key, _recent_ag, _pub_blogs_ag
+        )
+    except Exception as e:
+        print(f"[auto_generate_bg] Pipeline failed: {e}")
+        await manager.broadcast({"type": "blog_error", "message": f"Auto-blog pipeline failed: {e}"})
+        return
+
+    # ── Stage A: SEO surgical revision — up to 3 loops ───────────────────────────
+    min_score = int(os.getenv("BLOG_MIN_PUBLISH_SCORE", "90"))
+    initial_score = blog_object.get("seoScore") or 0
+    if initial_score < min_score:
+        try:
+            initial_audit = validate_seo(blog_object)
+            stored_rb = blog_object.get("researchBrief") or {}
+            rb = {"core_angle": stored_rb.get("core_angle", ""),
+                  "lumynor_perspective": stored_rb.get("lumynor_perspective", ""),
+                  "main_facts": [], "key_statistics": [], "claims_to_avoid": [], "faqs": []} if stored_rb else {}
+            seo_revision = await loop.run_in_executor(
+                None, revise_blog_from_audit,
+                blog_object, initial_audit, rb, llm_cfg,
+                os.getenv("TAVILY_API_KEY", ""), 3, _pub_blogs_ag,
+            )
+            blog_object = seo_revision["revised_blog"]
+            if blog_object.get("content_html") and not blog_object.get("content_markdown") and not blog_object.get("content"):
+                blog_object["content"] = blog_object["content_html"]
+            blog_object["seoScore"] = seo_revision["new_seo_score"]
+            blog_object["seoGrade"] = seo_revision["new_seo_grade"]
+            print(f"[auto_generate_bg] SEO revision: {initial_score} → {blog_object['seoScore']}/100")
+        except Exception as e:
+            print(f"[auto_generate_bg] SEO revision failed: {e}")
+
+    # ── Stage B: Credibility audit + surgical rewrite — up to 3 loops ─────────
+    try:
+        cred_audit = validate_credibility(blog_object)
+        print(f"[auto_generate_bg] Credibility initial score: {cred_audit['score']}/100 — {cred_audit['status']}")
+        if cred_audit["score"] < 90 and not cred_audit.get("hard_fail_reasons"):
+            cred_result = await loop.run_in_executor(
+                None, revise_blog_credibility,
+                blog_object, cred_audit, llm_cfg, 3,
+            )
+            blog_object = cred_result["revised_blog"]
+            if blog_object.get("content_html") and not blog_object.get("content_markdown") and not blog_object.get("content"):
+                blog_object["content"] = blog_object["content_html"]
+            blog_object["credibilityScore"] = cred_result["new_credibility_score"]
+            blog_object["credibilityGrade"] = cred_result["new_credibility_grade"]
+            print(f"[auto_generate_bg] Credibility after revision: {cred_result['new_credibility_score']}/100")
+        elif cred_audit.get("hard_fail_reasons"):
+            print(f"[auto_generate_bg] Credibility hard fail — skipping rewrite: {cred_audit['hard_fail_reasons']}")
+            blog_object["credibilityScore"] = cred_audit["score"]
+        else:
+            blog_object["credibilityScore"] = cred_audit["score"]
+    except Exception as e:
+        print(f"[auto_generate_bg] Credibility pass failed: {e}")
+
+    # ── Stage C: Plagiarism check + surgical rewrite — up to 3 loops ────────────
+    tavily_key = os.getenv("TAVILY_API_KEY", "")
+    try:
+        _plag_content = blog_object.get("content_markdown", blog_object.get("content", ""))
+        plag_audit = await loop.run_in_executor(
+            None, check_plagiarism, _plag_content, tavily_key
+        )
+        print(f"[auto_generate_bg] Plagiarism initial score: {plag_audit['score']}/100 — {plag_audit['flagged_count']} flagged")
+        if plag_audit["score"] < 90 and plag_audit.get("flagged"):
+            plag_result = await loop.run_in_executor(
+                None, revise_blog_plagiarism,
+                blog_object, plag_audit, llm_cfg, tavily_key, 3,
+            )
+            blog_object = plag_result["revised_blog"]
+            blog_object["plagiarismScore"] = plag_result["new_plagiarism_score"]
+            print(f"[auto_generate_bg] Plagiarism after revision: {plag_result['new_plagiarism_score']}/100")
+        else:
+            blog_object["plagiarismScore"] = plag_audit["score"]
+    except Exception as e:
+        print(f"[auto_generate_bg] Plagiarism pass failed: {e}")
+
+    # ── Format: Convert Markdown → branded HTML (runs after all audits pass) ────
+    try:
+        _sec_imgs = blog_object.pop("_section_imgs", [])
+        blog_object = await loop.run_in_executor(
+            None, format_blog_html, blog_object, _sec_imgs, _pub_blogs_ag
+        )
+        print(f"[auto_generate_bg] HTML formatting complete — content length: {len(blog_object.get('content', ''))}")
+    except Exception as e:
+        print(f"[auto_generate_bg] HTML formatting failed: {e}")
+        if blog_object.get("content_markdown") and not blog_object.get("content"):
+            blog_object["content"] = blog_object["content_markdown"]
+
+    # ── Publish gate: SEO ≥ 90, credibility ≥ 75, plagiarism ≥ 75, real cover image ──
+    final_score    = blog_object.get("seoScore") or 0
+    cred_score     = blog_object.get("credibilityScore") or 0
+    plag_score     = blog_object.get("plagiarismScore") or 100
+    seo_ok         = final_score >= min_score
+    cred_ok        = cred_score >= 75 or cred_score == 0
+    plag_ok        = plag_score >= 75
+    cover          = blog_object.get("coverImage") or ""
+    has_real_image = bool(cover and "placehold.co" not in cover)
+    publish = auto_publish_flag and seo_ok and cred_ok and plag_ok and has_real_image
+
+    new_blog = {
+        "id": str(uuid.uuid4()),
+        **blog_object,
+        "created_at": datetime.utcnow().isoformat(),
+        "is_auto_posted": True,
+        "published": publish,
+    }
+    if not seo_ok:
+        new_blog["draftReason"] = f"SEO {final_score}/100 below publish threshold {min_score}"
+    elif not cred_ok:
+        new_blog["draftReason"] = f"Credibility {cred_score}/100 below minimum 75 — review sources and claims"
+    elif not plag_ok:
+        new_blog["draftReason"] = f"Plagiarism score {plag_score}/100 below minimum 75 — content too similar to external sources"
+    elif not has_real_image:
+        new_blog["draftReason"] = "No real cover image — add before publishing"
+    db.insert_blog(new_blog)
+
+    settings_snapshot["last_run"] = datetime.utcnow().isoformat()
+    settings_snapshot["run_count"] = settings_snapshot.get("run_count", 0) + 1
+    db.save_settings(settings_snapshot)
+
+    if publish:
+        _fire_publish_webhook(new_blog)
+        _send_email_alert(
+            f"Published: {new_blog['title']}",
+            f"SEO score: {final_score}/100\nSlug: {new_blog.get('slug')}\nURL: /blog/{new_blog.get('slug')}"
+        )
+    elif new_blog.get("draftReason"):
+        _send_email_alert(
+            f"Draft saved for review: {new_blog.get('title', 'Untitled')}",
+            f"Reason: {new_blog['draftReason']}\nSEO score: {final_score}/100\n"
+            f"Review queue: /api/blogs/review-queue"
+        )
+
+    await manager.broadcast({
+        "type": "blog_published" if publish else "blog_draft",
+        "blog": new_blog,
+        "message": f"{'📰 Published' if publish else '📝 Saved as draft'}: '{new_blog['title']}' (SEO: {final_score}/100)"
+    })
+    print(f"[auto_generate_bg] Done — blog_id={new_blog['id']} published={publish}")
+
+
 @app.post("/api/blogs/auto-generate")
 async def auto_generate_blog(req: AutoBlogRunRequest):
-    """Full auto-blog pipeline: trending research → keyword research → longform writing → images → SEO."""
-    # Merge request with saved settings
+    """Kick off the full auto-blog pipeline as a background task and return 202 immediately."""
     settings = db.get_settings()
 
     merged_settings = {
@@ -2011,167 +2157,26 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
         raise HTTPException(status_code=400, detail="No LLM key configured. Set GEMINI_API_KEY or OLLAMA_API_KEY in Railway environment.")
 
     llm_cfg = _build_llm_cfg(merged_settings, gemini_key)
+    _all_blogs_ag = db.get_all_blogs()
+    _pub_blogs_ag = [b for b in _all_blogs_ag if b.get("published")]
+    _recent_ag    = [b["title"] for b in _all_blogs_ag if b.get("title")][-20:]
+    auto_publish_flag = bool(merged_settings.get("auto_publish"))
 
-    _all_blogs_ag  = db.get_all_blogs()
-    _pub_blogs_ag  = [b for b in _all_blogs_ag if b.get("published")]
-    _recent_ag     = [b["title"] for b in _all_blogs_ag if b.get("title")][-20:]
+    asyncio.create_task(_auto_generate_bg(
+        merged_settings, gemini_key, llm_cfg,
+        auto_publish_flag, settings,
+        _pub_blogs_ag, _recent_ag,
+    ))
 
-    try:
-        loop = asyncio.get_event_loop()
-        blog_object = await loop.run_in_executor(
-            None, run_auto_blog_pipeline, merged_settings, gemini_key, _recent_ag, _pub_blogs_ag
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Auto-blog pipeline failed: {str(e)}")
-
-    # ── Stage A: SEO surgical revision — up to 3 loops ───────────────────────────
-    min_score = int(os.getenv("BLOG_MIN_PUBLISH_SCORE", "90"))
-    initial_score = blog_object.get("seoScore") or 0
-    if initial_score < min_score:
-        try:
-            initial_audit = validate_seo(blog_object)
-            stored_rb = blog_object.get("researchBrief") or {}
-            rb = {"core_angle": stored_rb.get("core_angle", ""),
-                  "lumynor_perspective": stored_rb.get("lumynor_perspective", ""),
-                  "main_facts": [], "key_statistics": [], "claims_to_avoid": [], "faqs": []} if stored_rb else {}
-            seo_revision = await loop.run_in_executor(
-                None, revise_blog_from_audit,
-                blog_object, initial_audit, rb, llm_cfg,
-                os.getenv("TAVILY_API_KEY", ""), 3, _pub_blogs_ag,  # 3 loops
-            )
-            blog_object = seo_revision["revised_blog"]
-            # Old HTML blogs: sync content_html → content; new Markdown blogs: format_blog_html does this later
-            if blog_object.get("content_html") and not blog_object.get("content_markdown") and not blog_object.get("content"):
-                blog_object["content"] = blog_object["content_html"]
-            blog_object["seoScore"] = seo_revision["new_seo_score"]
-            blog_object["seoGrade"] = seo_revision["new_seo_grade"]
-            print(f"[auto_generate] SEO revision: {initial_score} → {blog_object['seoScore']}/100")
-        except Exception as e:
-            print(f"[auto_generate] SEO revision failed: {e}")
-
-    # ── Stage B: Credibility audit + surgical rewrite — up to 3 loops ─────────
-    try:
-        cred_audit = validate_credibility(blog_object)
-        print(f"[auto_generate] Credibility initial score: {cred_audit['score']}/100 — {cred_audit['status']}")
-        if cred_audit["score"] < 90 and not cred_audit.get("hard_fail_reasons"):
-            cred_result = await loop.run_in_executor(
-                None, revise_blog_credibility,
-                blog_object, cred_audit, llm_cfg, 3,  # 3 loops
-            )
-            blog_object = cred_result["revised_blog"]
-            if blog_object.get("content_html") and not blog_object.get("content_markdown") and not blog_object.get("content"):
-                blog_object["content"] = blog_object["content_html"]
-            blog_object["credibilityScore"] = cred_result["new_credibility_score"]
-            blog_object["credibilityGrade"] = cred_result["new_credibility_grade"]
-            print(f"[auto_generate] Credibility after revision: {cred_result['new_credibility_score']}/100")
-        elif cred_audit.get("hard_fail_reasons"):
-            print(f"[auto_generate] Credibility hard fail — skipping rewrite: {cred_audit['hard_fail_reasons']}")
-            blog_object["credibilityScore"] = cred_audit["score"]
-        else:
-            blog_object["credibilityScore"] = cred_audit["score"]
-    except Exception as e:
-        print(f"[auto_generate] Credibility pass failed: {e}")
-
-    # ── Stage C: Plagiarism check + surgical rewrite — up to 3 loops ────────────
-    tavily_key = os.getenv("TAVILY_API_KEY", "")
-    try:
-        _plag_content = blog_object.get("content_markdown", blog_object.get("content", ""))
-        plag_audit = await loop.run_in_executor(
-            None, check_plagiarism, _plag_content, tavily_key
-        )
-        print(f"[auto_generate] Plagiarism initial score: {plag_audit['score']}/100 — {plag_audit['flagged_count']} flagged")
-        if plag_audit["score"] < 90 and plag_audit.get("flagged"):
-            plag_result = await loop.run_in_executor(
-                None, revise_blog_plagiarism,
-                blog_object, plag_audit, llm_cfg, tavily_key, 3,
-            )
-            blog_object = plag_result["revised_blog"]
-            blog_object["plagiarismScore"] = plag_result["new_plagiarism_score"]
-            print(f"[auto_generate] Plagiarism after revision: {plag_result['new_plagiarism_score']}/100")
-        else:
-            blog_object["plagiarismScore"] = plag_audit["score"]
-    except Exception as e:
-        print(f"[auto_generate] Plagiarism pass failed: {e}")
-
-    # ── Format: Convert Markdown → branded HTML (runs after all audits pass) ────
-    try:
-        _sec_imgs = blog_object.pop("_section_imgs", [])
-        blog_object = await loop.run_in_executor(
-            None, format_blog_html, blog_object, _sec_imgs, _pub_blogs_ag
-        )
-        print(f"[auto_generate] HTML formatting complete — content length: {len(blog_object.get('content', ''))}")
-    except Exception as e:
-        print(f"[auto_generate] HTML formatting failed: {e}")
-        if blog_object.get("content_markdown") and not blog_object.get("content"):
-            blog_object["content"] = blog_object["content_markdown"]
-
-    # ── Publish gate: SEO ≥ 90, credibility ≥ 75, plagiarism ≥ 75, real cover image ──
-    final_score    = blog_object.get("seoScore") or 0
-    cred_score     = blog_object.get("credibilityScore") or 0
-    plag_score     = blog_object.get("plagiarismScore") or 100  # missing = never ran = assume clean
-    seo_ok         = final_score >= min_score
-    cred_ok        = cred_score >= 75 or cred_score == 0
-    plag_ok        = plag_score >= 75
-    cover          = blog_object.get("coverImage") or ""
-    has_real_image = bool(cover and "placehold.co" not in cover)
-    publish = req.auto_publish and seo_ok and cred_ok and plag_ok and has_real_image
-
-    # Save to Supabase
-    new_blog = {
-        "id": str(uuid.uuid4()),
-        **blog_object,
-        "created_at": datetime.utcnow().isoformat(),
-        "is_auto_posted": True,
-        "published": publish,
-    }
-    if not seo_ok:
-        new_blog["draftReason"] = f"SEO {final_score}/100 below publish threshold {min_score}"
-    elif not cred_ok:
-        new_blog["draftReason"] = f"Credibility {cred_score}/100 below minimum 75 — review sources and claims"
-    elif not plag_ok:
-        new_blog["draftReason"] = f"Plagiarism score {plag_score}/100 below minimum 75 — content too similar to external sources"
-    elif not has_real_image:
-        new_blog["draftReason"] = "No real cover image — add before publishing"
-    db.insert_blog(new_blog)
-
-    # Update auto-blog runtime settings
-    settings["last_run"] = datetime.utcnow().isoformat()
-    settings["run_count"] = settings.get("run_count", 0) + 1
-    db.save_settings(settings)
-
-    if publish:
-        _fire_publish_webhook(new_blog)
-        _send_email_alert(
-            f"Published: {new_blog['title']}",
-            f"SEO score: {final_score}/100\nSlug: {new_blog.get('slug')}\nURL: /blog/{new_blog.get('slug')}"
-        )
-    elif new_blog.get("draftReason"):
-        _send_email_alert(
-            f"Draft saved for review: {new_blog.get('title', 'Untitled')}",
-            f"Reason: {new_blog['draftReason']}\nSEO score: {final_score}/100\n"
-            f"Review queue: /api/blogs/review-queue"
-        )
-
-    await manager.broadcast({
-        "type": "blog_published" if publish else "blog_draft",
-        "blog": new_blog,
-        "message": f"{'📰 Published' if publish else '📝 Saved as draft'}: '{new_blog['title']}' (SEO: {final_score}/100)"
-    })
-
-    return {
-        "status": "success",
-        "blog": new_blog,
-        "initial_seo_score": initial_score,
-        "final_seo_score": final_score,
-        "published": publish,
-        "pipeline_log": blog_object.get("pipelineLog", []),
-        "credibility_score": blog_object.get("credibilityScore", 0),
-        "seo_report": {
-            "score": final_score,
-            "grade": new_blog.get("seoGrade"),
-            "word_count": new_blog.get("wordCount"),
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "queued",
+            "message": "Blog generation started. Poll /api/blogs for the new post or watch WebSocket for completion.",
+            "niche": merged_settings["niche"],
+            "keywords": merged_settings["keywords"],
         }
-    }
+    )
 
 
 @app.get("/api/trending-topics")
