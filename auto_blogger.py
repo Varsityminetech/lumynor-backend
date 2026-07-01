@@ -204,9 +204,39 @@ def _get_ddgs():
             return None
 
 
+def _serper_search(query: str, key: str, num: int = 8) -> list:
+    """Google Search via Serper.dev API. Returns list of {title, url, snippet}."""
+    try:
+        import requests as _req
+        r = _req.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": key, "Content-Type": "application/json"},
+            json={"q": query, "num": num},
+            timeout=10,
+        )
+        if r.ok:
+            results = [
+                {"title": item.get("title", ""), "url": item.get("link", ""), "snippet": item.get("snippet", "")}
+                for item in r.json().get("organic", [])[:num]
+            ]
+            if results:
+                return results
+    except Exception as e:
+        print(f"[search] Serper error: {e}")
+    return []
+
+
 def _search_web(query: str, num: int = 8) -> list:
-    """Bing web search (primary) with DuckDuckGo fallback. Returns list of {title, url, snippet}."""
-    # Primary: Bing — broader index, fresher news/blog content, better for research
+    """Web search with priority chain: Google (Serper) → Bing → DuckDuckGo.
+    Returns list of {title, url, snippet}."""
+    # 1st: Google via Serper.dev (real Google results, most relevant)
+    _serper_key = os.getenv("SERPER_API_KEY", "")
+    if _serper_key:
+        results = _serper_search(query, _serper_key, num)
+        if results:
+            return results
+
+    # 2nd: Bing (free scrape, broad index)
     try:
         import requests as _req, re as _re
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
@@ -232,7 +262,7 @@ def _search_web(query: str, num: int = 8) -> list:
     except Exception as e:
         print(f"[search] Bing error: {e}")
 
-    # Fallback: DuckDuckGo
+    # 3rd: DuckDuckGo (last resort)
     DDGS = _get_ddgs()
     if DDGS is None:
         return []
@@ -247,7 +277,7 @@ def _search_web(query: str, num: int = 8) -> list:
 
 # ── TAVILY SEARCH + TRUSTED SOURCE TIERS ─────────────────────────────────────
 # Tavily gives full page content (not just snippets) and date-aware freshness
-# filtering. Falls back to DuckDuckGo when TAVILY_API_KEY is not set.
+# filtering. Priority chain: Tavily → Google (Serper) → Bing → DDG.
 
 _TAVILY_URL = "https://api.tavily.com/search"
 
@@ -3670,7 +3700,11 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
         log.append(f"🧠 LLM: ollama_cloud · models={'/'.join(llm_cfg.get('writing_models', []))} (best-quality chain, no fast model)")
     else:
         log.append("🧠 LLM: gemini (gemini-2.5-flash)")
-    log.append(f"🔎 Research: {'Tavily (advanced)' if tavily_key else 'DuckDuckGo (fallback)'}")
+    _serper_key_log = os.getenv("SERPER_API_KEY", "")
+    _search_chain = ("Tavily (advanced)" if tavily_key else "") + \
+                    (" → Google/Serper" if _serper_key_log else "") + \
+                    " → Bing → DDG"
+    log.append(f"🔎 Research chain: {_search_chain.lstrip(' → ')}")
 
     # Stage 1: Cluster queue → pick pending topic, or crawl for a new pillar topic.
     # If settings has pending_cluster_topics, consume the first one instead of
