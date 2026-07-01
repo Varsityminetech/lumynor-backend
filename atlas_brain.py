@@ -510,7 +510,7 @@ ATLAS:"""
 _TOOLS: dict = {}
 _pending: dict = {}  # from_number -> {"tool": str, "params": dict, "ts": datetime}
 
-_CONFIRM_WINDOW_MIN = 10
+_CONFIRM_WINDOW_MIN = 30
 _YES_WORDS = {"yes", "yeah", "yep", "haan", "ha", "han", "confirm", "confirmed", "go", "do it", "karo", "ok", "okay", "sure"}
 _NO_WORDS  = {"no", "nah", "nahi", "nako", "cancel", "stop", "ruk", "ruko"}
 
@@ -599,7 +599,11 @@ def orchestrate(question: str, from_number: str, history: list = None) -> str:
             if low in _NO_WORDS:
                 del _pending[from_number]
                 return "Theek hai beta, cancel kar diya."
-        _pending.pop(from_number, None)  # stale or unrelated reply — drop it, handle as a new message
+        else:
+            # Confirmation window expired — tell the user explicitly instead of silently dropping
+            label = _TOOLS.get(pending["tool"], {}).get("label", pending["tool"])
+            _pending.pop(from_number, None)
+            return f"Beta, 30 minute ho gaye — *{label}* ka confirmation nahi mila, toh woh cancel ho gaya. Agar chahiye toh dobara bol."
 
     intent    = _classify_intent(text)
     tool_name = intent.get("tool")
