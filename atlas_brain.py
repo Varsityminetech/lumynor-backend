@@ -361,6 +361,20 @@ def chat(question: str, history: list = None) -> dict:
           .limit(30).execute().data or []
     )
 
+    # Blog summary
+    try:
+        import db as _db
+        all_blogs = _db.get_all_blogs()
+        blog_summary = "\n".join(
+            f"- [{b.get('slug','')}] \"{b.get('title','')}\" | published={b.get('published')} | seo={b.get('seoScore','?')}"
+            for b in all_blogs[:20]
+        ) or "No blogs."
+        affiliate_links = _db.get_affiliate_links()
+        affiliate_ctx = ", ".join(f"{l['keyword']}→{l['url']}" for l in affiliate_links[:10]) or "None."
+    except Exception:
+        blog_summary   = "Unavailable."
+        affiliate_ctx  = "Unavailable."
+
     # Strategy focus
     try:
         import strategy as strat
@@ -458,6 +472,12 @@ AUTHORITY OPPORTUNITIES:
 
 REVENUE LEADS (top 30):
 {leads_ctx}
+
+BLOG POSTS (latest 20):
+{blog_summary}
+
+AFFILIATE LINKS:
+{affiliate_ctx}
 {f"{chr(10)}CONVERSATION SO FAR:{chr(10)}{history_ctx}" if history_ctx else ""}
 Founder: {question}
 ATLAS:"""
@@ -500,7 +520,7 @@ def _classify_intent(question: str) -> dict:
         return {"tool": None, "params": {}}
 
     tools_desc = "\n".join(f"- {name}: {spec['label']} — {spec['description']}" for name, spec in _TOOLS.items())
-    prompt = f"""The founder just sent this WhatsApp message to Lumy, the Lumynor Systems AI.
+    prompt = f"""The founder just sent this message to Lumy, the Lumynor Systems AI.
 Decide if they're asking her to RUN one of these backend actions, or just chatting/asking a question.
 
 AVAILABLE ACTIONS:
@@ -509,8 +529,16 @@ AVAILABLE ACTIONS:
 MESSAGE: "{question}"
 
 Respond with ONLY a JSON object: {{"tool": "<action name from the list above, or null if this is just a question or chat>", "params": {{}}}}
-If the action is design_audit and the message includes a URL, put it in params as {{"url": "..."}}.
-If the action is revenue_scan and the message names a product, put it in params as {{"product": "..."}}.
+
+Param extraction rules:
+- design_audit: if message has a URL → {{"url": "..."}}
+- revenue_scan: if message names a product → {{"product": "..."}}
+- write_blog: extract the topic/idea → {{"topic": "...", "keyword": "...", "publish": true/false}}. If they say "publish it" or "make it live" set publish=true, otherwise false (goes to draft).
+- publish_blog: extract which blog → {{"title_contains": "...", "blog_slug": "..."}}. Use title_contains if they describe the blog by name, blog_slug if they say the slug.
+- unpublish_blog: same as publish_blog → {{"title_contains": "...", "blog_slug": "..."}}
+- add_affiliate: extract keyword and URL → {{"keyword": "...", "url": "..."}}
+- remove_affiliate: extract keyword → {{"keyword": "..."}}
+- list_blogs: no params needed → {{}}
 Be conservative — only pick a tool if the founder clearly wants an action run, not just discussed."""
 
     try:
@@ -541,8 +569,8 @@ def _run_tool(name: str, params: dict) -> str:
         return f"Try kiya beta, par error aa gaya: {str(e)[:200]}"
 
 
-def orchestrate(question: str, from_number: str) -> str:
-    """Entry point for the WhatsApp webhook: handles pending confirmations,
+def orchestrate(question: str, from_number: str, history: list = None) -> str:
+    """Entry point for WhatsApp webhook and dashboard chat: handles pending confirmations,
     classifies new requests into tool calls (confirming first if high-impact),
     and falls back to normal chat() for everything else."""
     text = (question or "").strip()
@@ -569,5 +597,5 @@ def orchestrate(question: str, from_number: str) -> str:
             return f"Beta, pakka *{spec['label']}* chalau? Yeh live website pe asar dalega. Reply *haan* to confirm ya *nahi* to cancel."
         return _run_tool(tool_name, intent["params"])
 
-    result = chat(text)
+    result = chat(text, history=history)
     return result.get("answer") or "Sorry beta, samajh nahi paya."

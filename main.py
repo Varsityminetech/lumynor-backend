@@ -588,8 +588,11 @@ def atlas_chat(body: dict, _admin: dict = Depends(_require_admin)):
     question = (body.get("question") or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="question required")
-    history = body.get("history") or []
-    return ab.chat(question, history)
+    history  = body.get("history") or []
+    # Route through orchestrate so Mother can act on blog/affiliate commands from the dashboard too.
+    # Use a stable "dashboard" identifier for the pending-confirmation state.
+    answer = ab.orchestrate(question, from_number="dashboard", history=history)
+    return {"answer": answer}
 
 @app.get("/api/atlas/situation")
 def atlas_situation(_admin: dict = Depends(_require_admin)):
@@ -3086,6 +3089,106 @@ def _trigger_blog_tool(_params: dict) -> dict:
     return {"status": "triggered"}
 
 
+def _write_blog_tool(params: dict) -> dict:
+    """Write a new blog with optional topic/keyword override, fire as background task."""
+    settings = db.get_settings()
+    topic   = (params.get("topic") or "").strip()
+    keyword = (params.get("keyword") or "").strip()
+    publish = bool(params.get("publish", False))
+
+    merged = {
+        "niche":    settings.get("niche", "Technology"),
+        "keywords": keyword or settings.get("topics", ""),
+        "author":   settings.get("author", "Lumynor Team"),
+        "category": settings.get("category", "Technology"),
+        "auto_publish": publish,
+        "nanobanana_key": settings.get("nanobanana_key", ""),
+        "nanobanana_url": settings.get("nanobanana_url", ""),
+        "image_source":   settings.get("image_source", "web"),
+        "unsplash_key":   settings.get("unsplash_key", ""),
+        "pexels_key":     settings.get("pexels_key", ""),
+    }
+    if topic:
+        merged["niche"] = topic
+
+    gemini_key = settings.get("llmApiKey") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+    if not gemini_key:
+        return {"error": "No LLM key configured"}
+
+    llm_cfg       = _build_llm_cfg(merged, gemini_key)
+    all_blogs_now = db.get_all_blogs()
+    pub_blogs     = [b for b in all_blogs_now if b.get("published")]
+    recent_titles = [b["title"] for b in all_blogs_now if b.get("title")][-20:]
+
+    import asyncio as _asyncio
+    try:
+        loop = _asyncio.get_event_loop()
+        loop.create_task(_auto_generate_bg(merged, gemini_key, llm_cfg, publish, settings, pub_blogs, recent_titles))
+    except RuntimeError:
+        pass
+    return {"status": "started", "topic": topic or merged["niche"], "publish": publish}
+
+
+def _find_blog(params: dict) -> dict | None:
+    blogs = db.get_all_blogs()
+    slug  = (params.get("blog_slug") or "").strip()
+    title = (params.get("title_contains") or "").strip().lower()
+    if slug:
+        match = next((b for b in blogs if b.get("slug") == slug), None)
+        if match:
+            return match
+    if title:
+        return next((b for b in blogs if title in (b.get("title") or "").lower()), None)
+    return None
+
+
+def _publish_blog_tool(params: dict) -> dict:
+    blog = _find_blog(params)
+    if not blog:
+        return {"error": "Blog not found — check the title or slug."}
+    db.patch_blog(blog["id"], {"published": True})
+    return {"status": "published", "title": blog.get("title"), "slug": blog.get("slug")}
+
+
+def _unpublish_blog_tool(params: dict) -> dict:
+    blog = _find_blog(params)
+    if not blog:
+        return {"error": "Blog not found — check the title or slug."}
+    db.patch_blog(blog["id"], {"published": False})
+    return {"status": "unpublished", "title": blog.get("title")}
+
+
+def _list_blogs_tool(_params: dict) -> dict:
+    blogs = db.get_all_blogs()
+    summary = [
+        {"title": b.get("title"), "slug": b.get("slug"), "published": b.get("published"), "seoScore": b.get("seoScore")}
+        for b in blogs[:15]
+    ]
+    return {"count": len(blogs), "blogs": summary}
+
+
+def _add_affiliate_tool(params: dict) -> dict:
+    keyword = (params.get("keyword") or "").strip()
+    url     = (params.get("url") or "").strip()
+    if not keyword or not url:
+        return {"error": "Both keyword and url are required."}
+    link = db.create_affiliate_link(keyword, url)
+    return {"status": "added", "keyword": keyword, "url": url, "id": link.get("id")}
+
+
+def _remove_affiliate_tool(params: dict) -> dict:
+    keyword = (params.get("keyword") or "").strip().lower()
+    if not keyword:
+        return {"error": "keyword is required."}
+    links   = db.get_affiliate_links()
+    matched = [l for l in links if keyword in l["keyword"].lower()]
+    if not matched:
+        return {"error": f"No affiliate link found matching '{keyword}'."}
+    for l in matched:
+        db.delete_affiliate_link(l["id"])
+    return {"status": "removed", "count": len(matched), "keywords": [l["keyword"] for l in matched]}
+
+
 ab.register_tools({
     "design_audit": {
         "label": "Design Audit",
@@ -3119,6 +3222,42 @@ ab.register_tools({
         "description": "Research, write, and PUBLISH a new blog post live on the website (runs within ~10s).",
         "fn": _trigger_blog_tool,
         "high_impact": True,
+    },
+    "write_blog": {
+        "label": "Write Blog Post",
+        "description": "Research and write a new blog post on a specific topic/keyword. Params: topic (required), keyword (optional), publish (true=live, false=draft). Default is draft.",
+        "fn": _write_blog_tool,
+        "high_impact": True,
+    },
+    "publish_blog": {
+        "label": "Publish Blog",
+        "description": "Make an existing blog post live on the website. Params: title_contains (partial title search) or blog_slug.",
+        "fn": _publish_blog_tool,
+        "high_impact": True,
+    },
+    "unpublish_blog": {
+        "label": "Unpublish Blog",
+        "description": "Take a blog post offline (back to draft). Params: title_contains or blog_slug.",
+        "fn": _unpublish_blog_tool,
+        "high_impact": True,
+    },
+    "list_blogs": {
+        "label": "List Blog Posts",
+        "description": "Show all blog posts with their titles, slugs, publish status, and SEO scores.",
+        "fn": _list_blogs_tool,
+        "high_impact": False,
+    },
+    "add_affiliate": {
+        "label": "Add Affiliate Link",
+        "description": "Add a keyword→URL affiliate link that auto-injects into blogs. Params: keyword, url.",
+        "fn": _add_affiliate_tool,
+        "high_impact": False,
+    },
+    "remove_affiliate": {
+        "label": "Remove Affiliate Link",
+        "description": "Remove an affiliate link by keyword. Params: keyword.",
+        "fn": _remove_affiliate_tool,
+        "high_impact": False,
     },
 })
 
