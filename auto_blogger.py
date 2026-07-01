@@ -2433,6 +2433,92 @@ def revise_blog_plagiarism(blog: dict, plag_report: dict, llm_cfg,
     }
 
 
+def _extract_claims_needing_sources(content: str, llm_cfg: dict) -> list:
+    """LLM reads the article and returns 3-5 web-search queries for claims needing citations."""
+    stripped = re.sub(r'<[^>]+>', ' ', content)
+    stripped = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', stripped)
+    preview  = re.sub(r'\s+', ' ', stripped).strip()[:4000]
+    prompt = f"""Read this article excerpt. Extract 3 to 5 specific factual claims or statistics that most need a credible citation.
+
+For each, write a short web search query (10 words or less) that would find an authoritative source.
+
+Return ONLY valid JSON — a list of search query strings, nothing else:
+["query 1", "query 2", "query 3"]
+
+ARTICLE EXCERPT:
+{preview}"""
+    try:
+        raw    = _llm(prompt, llm_cfg, json_mode=True, timeout=30, max_tokens=300)
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [str(q).strip() for q in parsed if str(q).strip()][:5]
+    except Exception as e:
+        print(f"[cred_fix] Claim extraction failed: {e}")
+    return []
+
+
+def _find_credible_sources_for_claims(claims: list) -> list:
+    """
+    Search each claim query; return only results whose domain is in _CREDIBLE_DOMAINS.
+    Result shape: [{"claim", "url", "title", "snippet"}, ...]
+    """
+    from urllib.parse import urlparse
+    found, seen_urls = [], set()
+    for claim in claims:
+        for r in _search_web(claim, num=8):
+            url = (r.get("url") or "").strip()
+            if not url or url in seen_urls:
+                continue
+            try:
+                domain = urlparse(url).netloc.lstrip("www.")
+            except Exception:
+                continue
+            if any(cd in domain for cd in _CREDIBLE_DOMAINS):
+                seen_urls.add(url)
+                found.append({
+                    "claim":   claim,
+                    "url":     url,
+                    "title":   r.get("title", ""),
+                    "snippet": (r.get("snippet") or "")[:200],
+                })
+    return found
+
+
+def _weave_sources_into_blog(content: str, fmt: str, sources: list, llm_cfg: dict) -> str | None:
+    """
+    Rewrite the article to naturally cite the provided real sources as inline links.
+    Returns revised content string, or None if the LLM call fails or returns garbage.
+    """
+    sources_block = "\n".join(
+        f"  {i+1}. Title: {s['title']}\n     URL: {s['url']}\n     Context: {s['snippet']}"
+        for i, s in enumerate(sources[:6])
+    )
+    prompt = f"""You are a credibility editor. Weave these real, verified sources into the article as natural inline citations.
+
+STRICT RULES:
+- Do NOT invent any new facts, statistics, or claims.
+- Do NOT change the article meaning, structure, or overall length.
+- Add each source as an inline link on a relevant sentence — e.g. "according to [Title](url)" or "as [Title](url) reported".
+- Use Markdown link syntax: [anchor text](url)
+- Each source should be used AT MOST once.
+- If a source does not naturally fit any sentence, skip it — do not force it.
+- Return ONLY the revised full {fmt} — no code fences, no JSON wrapper, no commentary before or after.
+
+REAL SOURCES TO WEAVE IN:
+{sources_block}
+
+ARTICLE {fmt.upper()} TO REVISE:
+{content[:12000]}"""
+    try:
+        revised = _llm(prompt, llm_cfg, json_mode=False, timeout=120, max_tokens=8000)
+        revised = re.sub(r'^```(?:html|markdown)?\s*', '', revised.strip(), flags=re.I)
+        revised = re.sub(r'\s*```$', '', revised.strip())
+        return revised if len(revised) > 500 else None
+    except Exception as e:
+        print(f"[cred_fix] Source weaving LLM failed: {e}")
+    return None
+
+
 def revise_blog_credibility(blog: dict, cred_report: dict, llm_cfg, max_loops: int = 3) -> dict:
     """
     Surgical credibility rewrite — loop up to max_loops times:
@@ -2462,8 +2548,23 @@ def revise_blog_credibility(blog: dict, cred_report: dict, llm_cfg, max_loops: i
         unfixable  = [hf for hf in hard_fails
                       if any(kw in hf.lower() for kw in _UNFIXABLE_FAIL_KEYWORDS)]
         if unfixable:
-            notes.append(f"  ✗ Source hard fail — cannot fix without real URLs: {unfixable}")
-            break
+            notes.append(f"  🔍 Source hard fail detected — running web search for real citations")
+            claims  = _extract_claims_needing_sources(current.get(_ck, ""), llm_cfg)
+            sources = _find_credible_sources_for_claims(claims) if claims else []
+            if not sources:
+                notes.append("  ✗ Web search returned no credible-domain results — cannot fix without real URLs. Reporting failure honestly.")
+                break
+            notes.append(f"  ✓ Found {len(sources)} credible source(s) from search — weaving into article")
+            revised = _weave_sources_into_blog(current.get(_ck, ""), _fmt, sources, llm_cfg)
+            if not revised:
+                notes.append("  ✗ Source weaving LLM call failed — reporting failure honestly.")
+                break
+            current[_ck] = revised
+            notes.append(f"  ✓ Sources injected — re-auditing")
+            cred_report = validate_credibility(current)
+            score_progression.append(cred_report.get("score", 0))
+            notes.append(f"  📊 Score after source injection: {cred_report.get('score', 0)}/100")
+            continue  # restart loop to handle any remaining fixable issues
         # Fixable hard fails (overconfident claims, repetition, unsupported stats) fall through
         # to the rewrite pass below — do NOT stop here.
 
