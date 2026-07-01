@@ -2544,6 +2544,74 @@ ARTICLE {_fmt.upper()}:
     }
 
 
+# ── AFFILIATE LINK INJECTION ───────────────────────────────────────────────────
+
+def inject_affiliate_links(html: str, affiliate_links: list, blog_id: str = "", blog_slug: str = "", max_per_keyword: int = 2) -> str:
+    """
+    Replace up to `max_per_keyword` occurrences of each active affiliate keyword
+    in the blog HTML with a tracked redirect link. Skips text inside existing
+    <a>, <h1-6>, <code>, <pre> tags to avoid double-linking and heading clutter.
+    Case-insensitive match; preserves original casing in the anchor text.
+    """
+    if not html or not affiliate_links:
+        return html
+
+    active = [l for l in affiliate_links if l.get("is_active", True)]
+    if not active:
+        return html
+
+    # Parse into segments: alternating safe (inside skip tags) and injectable text
+    _SKIP_TAG_RE = re.compile(
+        r'(<(?:a|h[1-6]|code|pre|script|style)[^>]*>.*?</(?:a|h[1-6]|code|pre|script|style)>)',
+        re.DOTALL | re.I,
+    )
+
+    parts = _SKIP_TAG_RE.split(html)
+    # parts[0], parts[2], parts[4]... are injectable; parts[1], parts[3]... are skipped
+
+    # Sort keywords longest-first to avoid partial matches (e.g. "AI agent" before "AI")
+    sorted_links = sorted(active, key=lambda l: len(l.get("keyword", "")), reverse=True)
+
+    counts: dict = {l["id"]: 0 for l in sorted_links}
+
+    result_parts = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            # Inside a skip tag — leave untouched
+            result_parts.append(part)
+            continue
+
+        for link in sorted_links:
+            lid    = link["id"]
+            kw     = link.get("keyword", "")
+            url    = link.get("url", "")
+            if not kw or not url or counts[lid] >= max_per_keyword:
+                continue
+
+            def _replacer(m, _lid=lid, _kw=kw, _url=url, _blog_id=blog_id, _blog_slug=blog_slug):
+                if counts[_lid] >= max_per_keyword:
+                    return m.group(0)
+                counts[_lid] += 1
+                href = f"/api/affiliate/click/{_lid}?blog_id={_blog_id}&blog_slug={_blog_slug}"
+                return f'<a href="{href}" target="_blank" rel="sponsored nofollow" class="affiliate-link">{m.group(0)}</a>'
+
+            part = re.sub(re.escape(kw), _replacer, part, flags=re.I)
+
+        result_parts.append(part)
+
+    return "".join(result_parts)
+
+
+def strip_affiliate_links(html: str) -> str:
+    """Remove all injected affiliate <a> tags, leaving the anchor text in place."""
+    return re.sub(
+        r'<a\s+[^>]*href="/api/affiliate/click/[^"]*"[^>]*>(.*?)</a>',
+        r'\1',
+        html,
+        flags=re.DOTALL | re.I,
+    )
+
+
 # ── HTML FORMATTER ─────────────────────────────────────────────────────────────
 
 def format_blog_html(blog: dict, section_imgs: list = None,

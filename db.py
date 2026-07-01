@@ -241,6 +241,85 @@ def delete_blog_comments(blog_id: str) -> None:
     sb.table("comments").delete().eq("blog_id", blog_id).execute()
 
 
+# ── Affiliate Links ───────────────────────────────────────────────────────────
+
+def get_affiliate_links() -> list:
+    sb = _sb()
+    if not sb:
+        return []
+    res = sb.table("affiliate_links").select("*").order("created_at", desc=False).execute()
+    return res.data or []
+
+
+def create_affiliate_link(keyword: str, url: str) -> dict:
+    sb = _sb()
+    if not sb:
+        raise RuntimeError("Supabase not configured")
+    row = {"id": str(uuid.uuid4()), "keyword": keyword.strip(), "url": url.strip(), "is_active": True}
+    sb.table("affiliate_links").insert(row).execute()
+    return row
+
+
+def update_affiliate_link(link_id: str, fields: dict) -> dict | None:
+    sb = _sb()
+    if not sb:
+        return None
+    allowed = {k: v for k, v in fields.items() if k in ("keyword", "url", "is_active")}
+    if not allowed:
+        return None
+    sb.table("affiliate_links").update(allowed).eq("id", link_id).execute()
+    res = sb.table("affiliate_links").select("*").eq("id", link_id).limit(1).execute()
+    return res.data[0] if res.data else None
+
+
+def delete_affiliate_link(link_id: str) -> bool:
+    sb = _sb()
+    if not sb:
+        return False
+    sb.table("affiliate_links").delete().eq("id", link_id).execute()
+    return True
+
+
+def log_affiliate_click(affiliate_id: str, blog_id: str, blog_slug: str) -> None:
+    sb = _sb()
+    if not sb:
+        return
+    sb.table("affiliate_clicks").insert({
+        "id": str(uuid.uuid4()),
+        "affiliate_id": affiliate_id,
+        "blog_id": blog_id or "",
+        "blog_slug": blog_slug or "",
+    }).execute()
+
+
+def get_affiliate_stats() -> list:
+    """Returns each affiliate link with its total click count and per-blog breakdown."""
+    sb = _sb()
+    if not sb:
+        return []
+    links = sb.table("affiliate_links").select("*").order("created_at").execute().data or []
+    clicks = sb.table("affiliate_clicks").select("affiliate_id, blog_id, blog_slug").execute().data or []
+
+    from collections import defaultdict
+    totals: dict = defaultdict(int)
+    per_blog: dict = defaultdict(lambda: defaultdict(int))
+    for c in clicks:
+        aid = c["affiliate_id"]
+        totals[aid] += 1
+        slug = c.get("blog_slug") or c.get("blog_id") or "unknown"
+        per_blog[aid][slug] += 1
+
+    result = []
+    for link in links:
+        lid = link["id"]
+        result.append({
+            **link,
+            "total_clicks": totals.get(lid, 0),
+            "clicks_by_blog": dict(per_blog.get(lid, {})),
+        })
+    return result
+
+
 # ── User Profiles ─────────────────────────────────────────────────────────────
 
 def get_user_profile(user_id: str) -> dict | None:

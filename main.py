@@ -10,7 +10,7 @@ from auth import (
     seed_users, seed_audit, authenticate_user, create_access_token,
     decode_token, append_audit_log, get_audit_logs, update_user_credentials
 )
-from fastapi.responses import FileResponse, Response, JSONResponse
+from fastapi.responses import FileResponse, Response, JSONResponse, RedirectResponse
 from agent_graph import company_app, set_broadcast_callback, set_raw_broadcast_callback
 from exporter import markdown_to_docx, markdown_to_pptx
 import db
@@ -1919,7 +1919,7 @@ from auto_blogger import (
     run_auto_blog_pipeline, research_trending_topics, _tavily_search,
     revise_blog_from_audit, validate_seo, _build_llm_cfg,
     validate_credibility, revise_blog_credibility, check_plagiarism, revise_blog_plagiarism,
-    format_blog_html,
+    format_blog_html, inject_affiliate_links, strip_affiliate_links,
 )
 
 @app.get("/api/system/test-images")
@@ -2614,6 +2614,80 @@ async def format_blog_html_endpoint(blog_id: str):
         db.patch_blog(blog_id, {"content_html": html, "content": html})
 
     return {"content_html": html, "formatted": bool(html)}
+
+
+# ── Affiliate Links ────────────────────────────────────────────────────────────
+
+class AffiliateLinkCreate(BaseModel):
+    keyword: str
+    url: str
+
+class AffiliateLinkUpdate(BaseModel):
+    keyword: str | None = None
+    url: str | None = None
+    is_active: bool | None = None
+
+@app.get("/api/affiliate")
+async def list_affiliate_links():
+    """List all affiliate links with click stats."""
+    return db.get_affiliate_stats()
+
+@app.post("/api/affiliate")
+async def create_affiliate_link(req: AffiliateLinkCreate):
+    if not req.keyword.strip() or not req.url.strip():
+        raise HTTPException(status_code=400, detail="keyword and url are required")
+    return db.create_affiliate_link(req.keyword, req.url)
+
+@app.patch("/api/affiliate/{link_id}")
+async def update_affiliate_link(link_id: str, req: AffiliateLinkUpdate):
+    fields = {k: v for k, v in req.dict().items() if v is not None}
+    updated = db.update_affiliate_link(link_id, fields)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Affiliate link not found")
+    return updated
+
+@app.delete("/api/affiliate/{link_id}")
+async def delete_affiliate_link(link_id: str):
+    db.delete_affiliate_link(link_id)
+    return {"status": "deleted"}
+
+@app.get("/api/affiliate/click/{link_id}")
+async def track_affiliate_click(link_id: str, blog_id: str = "", blog_slug: str = ""):
+    """Record click and redirect to the affiliate URL."""
+    links = db.get_affiliate_links()
+    link = next((l for l in links if l["id"] == link_id), None)
+    if not link:
+        raise HTTPException(status_code=404, detail="Link not found")
+    db.log_affiliate_click(link_id, blog_id, blog_slug)
+    return RedirectResponse(url=link["url"], status_code=302)
+
+@app.post("/api/blogs/{blog_id}/toggle-affiliates")
+async def toggle_blog_affiliates(blog_id: str):
+    """Enable or disable affiliate link injection on a specific blog.
+    When enabling: injects active affiliate links into the blog HTML.
+    When disabling: strips all affiliate links, restoring plain text."""
+    blog = db.get_blog(blog_id)
+    if not blog:
+        raise HTTPException(status_code=404, detail="Blog not found")
+
+    currently_on = bool(blog.get("affiliate_links_enabled"))
+    new_state = not currently_on
+    html = blog.get("content") or blog.get("content_html") or ""
+
+    if new_state:
+        affiliate_links = db.get_affiliate_links()
+        slug = blog.get("slug", "")
+        html = strip_affiliate_links(html)  # remove any stale injections first
+        html = inject_affiliate_links(html, affiliate_links, blog_id=blog_id, blog_slug=slug)
+    else:
+        html = strip_affiliate_links(html)
+
+    db.patch_blog(blog_id, {
+        "content": html,
+        "content_html": html,
+        "affiliate_links_enabled": new_state,
+    })
+    return {"affiliate_links_enabled": new_state, "blog_id": blog_id}
 
 
 @app.post("/api/blogs/{blog_id}/revise")
