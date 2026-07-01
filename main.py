@@ -2639,6 +2639,18 @@ async def revise_saved_blog(blog_id: str):
 
     revised = result["revised_blog"]
 
+    # Re-format Markdown → HTML so the published blog body is never blank after revision
+    if revised.get("content_markdown"):
+        try:
+            _pub_blogs_fmt = [b for b in db.get_published_blogs() if b.get("id") != blog_id]
+            revised = await loop.run_in_executor(
+                None, format_blog_html, revised, None, _pub_blogs_fmt
+            )
+        except Exception as _fe:
+            print(f"[revise] HTML formatting failed: {_fe}")
+            if not revised.get("content"):
+                revised["content"] = revised["content_markdown"]
+
     # Persist the revised blog back to Supabase
     cover = blog.get("coverImage", "")
     _rev_ck = ("content_markdown" if revised.get("content_markdown")
@@ -2646,13 +2658,18 @@ async def revise_saved_blog(blog_id: str):
                else "content")
     _content_patch: dict = {}
     if _rev_ck == "content_markdown":
+        # Save all three: Markdown source + rendered HTML (from format_blog_html above)
         _content_patch = {
             "content_markdown": revised.get("content_markdown", ""),
-            "content_html": "",
-            "content": "",
+            "content_html":     revised.get("content_html", ""),
+            "content":          revised.get("content", ""),
         }
     elif _rev_ck == "content_html":
-        _content_patch = {"content_html": revised.get("content_html", "")}
+        # Sync content_html → content so the frontend always reads the revised version
+        _content_patch = {
+            "content_html": revised.get("content_html", ""),
+            "content":      revised.get("content_html", ""),
+        }
     else:
         _content_patch = {"content": revised.get("content", blog.get("content", ""))}
     db.update_blog(blog["id"], {

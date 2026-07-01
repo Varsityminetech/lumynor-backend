@@ -1477,15 +1477,21 @@ def validate_seo(blog: dict) -> dict:
       Readability            5
     """
     title   = (blog.get("title")          or "").strip()
-    summary = (blog.get("meta_description") or blog.get("summary") or "").strip()
+    # Accept both snake_case (pipeline) and camelCase (Supabase stored) key variants
+    summary = (blog.get("meta_description") or blog.get("metaDescription")
+               or blog.get("summary") or "").strip()
     # Accept content_markdown (new pipeline), content_html (old pipeline), or content (stored blogs)
     content = (blog.get("content_markdown") or blog.get("content_html") or blog.get("content") or "").strip()
-    # Detect format: Markdown if it has ## headings and no HTML block tags
-    _md = bool(re.search(r'^##\s', content, re.M)) and not bool(re.search(r'<(h[1-6]|p|div)\b', content, re.I))
+    # Prefer key presence for format detection — avoids false-negative when Markdown contains HTML code examples
+    if "content_markdown" in blog:
+        _md = True
+    else:
+        _md = (bool(re.search(r'^##\s', content, re.M))
+               and not bool(re.search(r'<(h[1-6]|p|div)\b', content, re.I)))
     primary = (blog.get("primary_keyword") or blog.get("primaryKeyword") or "").strip()
     cover   = (blog.get("coverImage")      or blog.get("cover_image") or "").strip()
     references = blog.get("references") or []
-    research_brief = blog.get("research_brief") or {}
+    research_brief = blog.get("research_brief") or blog.get("researchBrief") or {}
 
     sec_raw = blog.get("secondary_keywords") or blog.get("secondaryKeywords") or ""
     secondary = ([k.strip() for k in sec_raw.split(",") if k.strip()]
@@ -2532,14 +2538,27 @@ def format_blog_html(blog: dict, section_imgs: list = None,
     )
 
     # ── 2. Branded callout divs ───────────────────────────────────────────────
-    # > [!TIP] and > [!WARNING] render as <blockquote><p>[!TIP]\ncontent</p></blockquote>
+    # python-markdown renders > [!TIP]\n> content as one of two forms:
+    #   single-para : <blockquote><p>[!TIP]\ncontent</p></blockquote>
+    #   multi-para  : <blockquote><p>[!TIP]</p><p>para1</p>...</blockquote>
+    # Handle multi-paragraph first so the single-paragraph pass only sees simple cases.
     html = re.sub(
-        r'<blockquote>\s*<p>\[!TIP\]\s*(.*?)</p>\s*</blockquote>',
+        r'<blockquote>\s*<p>\[!TIP\]</p>(.*?)</blockquote>',
+        lambda m: f'<div class="callout-tip">{m.group(1).strip()}</div>',
+        html, flags=re.DOTALL | re.I,
+    )
+    html = re.sub(
+        r'<blockquote>\s*<p>\[!TIP\]\s+(.*?)</p>\s*</blockquote>',
         lambda m: f'<div class="callout-tip"><p>{m.group(1).strip()}</p></div>',
         html, flags=re.DOTALL | re.I,
     )
     html = re.sub(
-        r'<blockquote>\s*<p>\[!WARNING\]\s*(.*?)</p>\s*</blockquote>',
+        r'<blockquote>\s*<p>\[!WARNING\]</p>(.*?)</blockquote>',
+        lambda m: f'<div class="callout-warning">{m.group(1).strip()}</div>',
+        html, flags=re.DOTALL | re.I,
+    )
+    html = re.sub(
+        r'<blockquote>\s*<p>\[!WARNING\]\s+(.*?)</p>\s*</blockquote>',
         lambda m: f'<div class="callout-warning"><p>{m.group(1).strip()}</p></div>',
         html, flags=re.DOTALL | re.I,
     )
