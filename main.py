@@ -2365,6 +2365,56 @@ async def trigger_blog_now():
     return {"status": "triggered", "message": "Blog generation will start within 10 seconds. Watch /api/blogs for the new post."}
 
 
+@app.get("/api/blogs/{blog_id}/audit")
+async def audit_blog(blog_id: str):
+    """Run SEO + credibility auditors on a saved blog and return both reports."""
+    blog = db.get_blog(blog_id)
+    if not blog:
+        raise HTTPException(status_code=404, detail="Blog not found")
+
+    blog_dict = {
+        "title":              blog.get("title", ""),
+        "meta_description":   blog.get("metaDescription") or blog.get("summary", ""),
+        "content_html":       blog.get("content", ""),
+        "primary_keyword":    blog.get("primaryKeyword", ""),
+        "secondary_keywords": blog.get("secondaryKeywords", ""),
+        "coverImage":         blog.get("coverImage", ""),
+        "references":         blog.get("references", []),
+        "research_brief":     {"_present": True} if blog.get("researchBrief") else {},
+    }
+
+    seo_report  = validate_seo(blog_dict)
+    cred_report = validate_credibility({"content_html": blog.get("content", ""), "title": blog.get("title", "")})
+
+    return {
+        "blog_id":    blog_id,
+        "title":      blog.get("title", ""),
+        "published":  blog.get("published", False),
+        "seo": {
+            "score":           seo_report["score"],
+            "grade":           seo_report["grade"],
+            "status":          seo_report["status"],
+            "word_count":      seo_report.get("word_count", 0),
+            "category_scores": seo_report.get("category_scores", {}),
+            "issues":          seo_report.get("issues", []),
+            "passed":          seo_report.get("passed", []),
+            "fixes":           seo_report.get("fixes", []),
+            "hard_fails":      seo_report.get("hard_fail_reasons", []),
+        },
+        "credibility": {
+            "score":           cred_report["score"],
+            "grade":           cred_report["grade"],
+            "status":          cred_report["status"],
+            "category_scores": cred_report.get("category_scores", {}),
+            "issues":          cred_report.get("issues", []),
+            "passed":          cred_report.get("passed", []),
+            "fixes":           cred_report.get("fixes", []),
+            "hard_fails":      cred_report.get("hard_fail_reasons", []),
+            "repeated_sentences": cred_report.get("repeated_sentences", []),
+        },
+    }
+
+
 @app.post("/api/blogs/{blog_id}/revise")
 async def revise_saved_blog(blog_id: str):
     """Run targeted content revision automation on a saved blog post.
