@@ -2078,7 +2078,12 @@ def validate_credibility(blog: dict) -> dict:
         passed.append(msg)
 
     # ── 1. Source trustworthiness (25 pts) ────────────────────────────────────
-    ext_links = re.findall(r'href=["\']https?://([^/"\']+)', content, re.I)
+    _md_cred = _ck == "content_markdown"
+    if _md_cred:
+        # Markdown links: [text](https://domain.com/...) — extract domain
+        ext_links = re.findall(r'\]\(https?://([^/")\s]+)', content)
+    else:
+        ext_links = re.findall(r'href=["\']https?://([^/"\']+)', content, re.I)
     credible_links = [d for d in ext_links if any(c in d for c in _CREDIBLE_DOMAINS)]
     non_credible   = [d for d in ext_links if not any(c in d for c in _CREDIBLE_DOMAINS)
                       and d and "lumynor" not in d]

@@ -2466,7 +2466,10 @@ async def revise_blog_credibility_endpoint(blog_id: str):
     if not blog:
         raise HTTPException(status_code=404, detail="Blog not found")
 
-    llm_cfg = _build_llm_cfg(db.get_settings())
+    _cred_settings = db.get_settings()
+    _cred_gemini   = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or
+                      _cred_settings.get("llmApiKey") or "")
+    llm_cfg = _build_llm_cfg(_cred_settings, _cred_gemini)
     loop    = asyncio.get_event_loop()
 
     cred_report = await loop.run_in_executor(None, validate_credibility, blog)
@@ -2516,8 +2519,11 @@ async def revise_blog_plagiarism_endpoint(blog_id: str):
     if not blog:
         raise HTTPException(status_code=404, detail="Blog not found")
 
-    tavily_key = os.getenv("TAVILY_API_KEY", "")
-    llm_cfg    = _build_llm_cfg(db.get_settings())
+    tavily_key     = os.getenv("TAVILY_API_KEY", "")
+    _plag_settings = db.get_settings()
+    _plag_gemini   = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or
+                      _plag_settings.get("llmApiKey") or "")
+    llm_cfg    = _build_llm_cfg(_plag_settings, _plag_gemini)
     loop       = asyncio.get_event_loop()
 
     _plag_content = blog.get("content_markdown", blog.get("content", ""))
