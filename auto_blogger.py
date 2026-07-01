@@ -2258,6 +2258,84 @@ def check_plagiarism(content: str, tavily_key: str = "") -> dict:
     }
 
 
+def revise_blog_plagiarism(blog: dict, plag_report: dict, llm_cfg,
+                           tavily_key: str = "", max_loops: int = 3) -> dict:
+    """
+    Surgical plagiarism rewrite — for each flagged sentence, ask the LLM to
+    rephrase it with completely original wording. Re-checks only the rewritten
+    sentences between loops so external API usage stays minimal.
+    Exits early when no flagged sentences remain or score reaches 90+.
+
+    Returns {"revised_blog", "new_plagiarism_score", "score_progression", "flagged", "notes"}
+    """
+    _ck        = "content_html" if "content_html" in blog else "content"
+    notes      = []
+    current    = dict(blog)
+    tavily_key = tavily_key or os.getenv("TAVILY_API_KEY", "")
+    score_progression = [plag_report.get("score", 100)]
+
+    for loop_num in range(1, max_loops + 1):
+        flagged = plag_report.get("flagged", [])
+        if not flagged:
+            notes.append(f"Loop {loop_num}: No flagged sentences — stopping early")
+            break
+
+        notes.append(f"\n── Plagiarism Loop {loop_num}/{max_loops} ({len(flagged)} flagged) ──")
+        content      = current.get(_ck, "")
+        fmt          = "HTML" if _ck == "content_html" else "text"
+
+        sentences_list = "\n".join(
+            f'{i + 1}. "{f["sentence"]}"  [found on: {f.get("source_title") or f.get("found_at","")}]'
+            for i, f in enumerate(flagged)
+        )
+
+        prompt = (
+            f"You are a copy editor rewriting plagiarised sentences to be fully original.\n"
+            f"For EACH numbered sentence below, write a completely fresh rephrasing that:\n"
+            f"  • conveys the exact same meaning\n"
+            f"  • uses entirely different words, structure, and sentence rhythm\n"
+            f"  • does NOT start the same way as the original\n"
+            f"Find each sentence verbatim in the article and replace it with your rewrite.\n"
+            f"Return ONLY the complete revised {fmt} — keep everything else identical.\n\n"
+            f"SENTENCES TO REWRITE:\n{sentences_list}\n\n"
+            f"ARTICLE {fmt.upper()}:\n{content[:12000]}"
+        )
+
+        try:
+            revised = _llm(prompt, llm_cfg, json_mode=False, timeout=120, max_tokens=8000)
+            revised = re.sub(r'^```html?\s*', '', revised.strip(), flags=re.I)
+            revised = re.sub(r'\s*```$', '', revised.strip())
+            if len(revised) > 500:
+                current[_ck] = revised
+                notes.append(f"  ✓ Rewrote {len(flagged)} flagged sentence(s)")
+            else:
+                notes.append("  ⚠ LLM returned suspiciously short content — keeping previous")
+                break
+        except Exception as exc:
+            notes.append(f"  ⚠ LLM revision failed: {str(exc)[:80]}")
+            break
+
+        # Re-check plagiarism on the updated content
+        plag_report = check_plagiarism(current.get(_ck, ""), tavily_key)
+        score_progression.append(plag_report["score"])
+        notes.append(
+            f"  📊 Plagiarism score after loop {loop_num}: "
+            f"{plag_report['score']}/100 ({plag_report['flagged_count']} still flagged)"
+        )
+
+        if plag_report["score"] >= 90:
+            notes.append("  ✅ 90+ reached — stopping early")
+            break
+
+    return {
+        "revised_blog":          current,
+        "new_plagiarism_score":  plag_report.get("score", score_progression[0]),
+        "score_progression":     score_progression,
+        "flagged":               plag_report.get("flagged", []),
+        "notes":                 notes,
+    }
+
+
 def revise_blog_credibility(blog: dict, cred_report: dict, llm_cfg, max_loops: int = 3) -> dict:
     """
     Surgical credibility rewrite — loop up to max_loops times:

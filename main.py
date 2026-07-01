@@ -1918,7 +1918,7 @@ async def auto_blogger_daemon():
 from auto_blogger import (
     run_auto_blog_pipeline, research_trending_topics, _tavily_search,
     revise_blog_from_audit, validate_seo, _build_llm_cfg,
-    validate_credibility, revise_blog_credibility, check_plagiarism,
+    validate_credibility, revise_blog_credibility, check_plagiarism, revise_blog_plagiarism,
 )
 
 @app.get("/api/system/test-images")
@@ -2082,14 +2082,38 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
     except Exception as e:
         print(f"[auto_generate] Credibility pass failed: {e}")
 
-    # ── Publish gate: SEO ≥ 90, credibility ≥ 75, real cover image ────────────
-    final_score   = blog_object.get("seoScore") or 0
-    cred_score    = blog_object.get("credibilityScore") or 0
-    seo_ok        = final_score >= min_score
-    cred_ok       = cred_score >= 75 or cred_score == 0  # 0 means audit didn't run — don't block
-    cover         = blog_object.get("coverImage") or ""
+    # ── Stage C: Plagiarism check + surgical rewrite — up to 3 loops ────────────
+    tavily_key = os.getenv("TAVILY_API_KEY", "")
+    try:
+        plag_audit = await loop.run_in_executor(
+            None, check_plagiarism, blog_object.get("content", ""), tavily_key
+        )
+        print(f"[auto_generate] Plagiarism initial score: {plag_audit['score']}/100 — {plag_audit['flagged_count']} flagged")
+        if plag_audit["score"] < 90 and plag_audit.get("flagged"):
+            plag_result = await loop.run_in_executor(
+                None, revise_blog_plagiarism,
+                blog_object, plag_audit, llm_cfg, tavily_key, 3,
+            )
+            blog_object = plag_result["revised_blog"]
+            if blog_object.get("content_html") and not blog_object.get("content"):
+                blog_object["content"] = blog_object["content_html"]
+            blog_object["plagiarismScore"] = plag_result["new_plagiarism_score"]
+            print(f"[auto_generate] Plagiarism after revision: {plag_result['new_plagiarism_score']}/100")
+        else:
+            blog_object["plagiarismScore"] = plag_audit["score"]
+    except Exception as e:
+        print(f"[auto_generate] Plagiarism pass failed: {e}")
+
+    # ── Publish gate: SEO ≥ 90, credibility ≥ 75, plagiarism ≥ 75, real cover image ──
+    final_score    = blog_object.get("seoScore") or 0
+    cred_score     = blog_object.get("credibilityScore") or 0
+    plag_score     = blog_object.get("plagiarismScore") or 100  # missing = never ran = assume clean
+    seo_ok         = final_score >= min_score
+    cred_ok        = cred_score >= 75 or cred_score == 0
+    plag_ok        = plag_score >= 75
+    cover          = blog_object.get("coverImage") or ""
     has_real_image = bool(cover and "placehold.co" not in cover)
-    publish = req.auto_publish and seo_ok and cred_ok and has_real_image
+    publish = req.auto_publish and seo_ok and cred_ok and plag_ok and has_real_image
 
     # Save to Supabase
     new_blog = {
@@ -2103,6 +2127,8 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
         new_blog["draftReason"] = f"SEO {final_score}/100 below publish threshold {min_score}"
     elif not cred_ok:
         new_blog["draftReason"] = f"Credibility {cred_score}/100 below minimum 75 — review sources and claims"
+    elif not plag_ok:
+        new_blog["draftReason"] = f"Plagiarism score {plag_score}/100 below minimum 75 — content too similar to external sources"
     elif not has_real_image:
         new_blog["draftReason"] = "No real cover image — add before publishing"
     db.insert_blog(new_blog)
@@ -2476,6 +2502,49 @@ async def revise_blog_credibility_endpoint(blog_id: str):
         "new_credibility_grade": result.get("new_credibility_grade", ""),
         "score_progression":     result.get("score_progression", []),
         "hard_fail_reasons":     result.get("hard_fail_reasons", []),
+    }
+
+
+@app.post("/api/blogs/{blog_id}/revise-plagiarism")
+async def revise_blog_plagiarism_endpoint(blog_id: str):
+    """Run up to 3 surgical plagiarism-rewrite loops on a saved blog post.
+    Flagged sentences are rephrased with original wording. Saves revised content + score."""
+    blog = db.get_blog(blog_id)
+    if not blog:
+        raise HTTPException(status_code=404, detail="Blog not found")
+
+    content    = blog.get("content", "")
+    tavily_key = os.getenv("TAVILY_API_KEY", "")
+    llm_cfg    = _build_llm_cfg(db.get_settings())
+    loop       = asyncio.get_event_loop()
+
+    plag_report = await loop.run_in_executor(None, check_plagiarism, content, tavily_key)
+    initial_score = plag_report["score"]
+
+    if initial_score >= 90:
+        db.patch_blog(blog_id, {"plagiarismScore": initial_score})
+        return {
+            "message":              "Already original — no rewrite needed",
+            "initial_score":        initial_score,
+            "new_plagiarism_score": initial_score,
+            "score_progression":    [initial_score],
+        }
+
+    result = await loop.run_in_executor(
+        None, revise_blog_plagiarism, blog, plag_report, llm_cfg, tavily_key, 3
+    )
+
+    revised_blog = result["revised_blog"]
+    new_score    = result["new_plagiarism_score"]
+    new_content  = revised_blog.get("content", content)
+
+    db.patch_blog(blog_id, {"content": new_content, "plagiarismScore": new_score})
+
+    return {
+        "initial_score":        initial_score,
+        "new_plagiarism_score": new_score,
+        "score_progression":    result.get("score_progression", []),
+        "flagged_remaining":    result.get("flagged", []),
     }
 
 
