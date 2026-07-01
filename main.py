@@ -1918,6 +1918,7 @@ async def auto_blogger_daemon():
 from auto_blogger import (
     run_auto_blog_pipeline, research_trending_topics, _tavily_search,
     revise_blog_from_audit, validate_seo, _build_llm_cfg,
+    validate_credibility, revise_blog_credibility,
 )
 
 @app.get("/api/system/test-images")
@@ -2022,10 +2023,9 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Auto-blog pipeline failed: {str(e)}")
 
-    # SEO gate: surgical revision if pipeline score < 90
+    # ── Stage A: SEO surgical revision — up to 3 loops ───────────────────────────
     min_score = int(os.getenv("BLOG_MIN_PUBLISH_SCORE", "90"))
     initial_score = blog_object.get("seoScore") or 0
-    revision_result = None
     if initial_score < min_score:
         try:
             initial_audit = validate_seo({
@@ -2042,26 +2042,54 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
             rb = {"core_angle": stored_rb.get("core_angle", ""),
                   "lumynor_perspective": stored_rb.get("lumynor_perspective", ""),
                   "main_facts": [], "key_statistics": [], "claims_to_avoid": [], "faqs": []} if stored_rb else {}
-            revision_result = await loop.run_in_executor(
+            seo_revision = await loop.run_in_executor(
                 None, revise_blog_from_audit,
                 blog_object, initial_audit, rb, llm_cfg,
-                os.getenv("TAVILY_API_KEY", ""), 2, _pub_blogs_ag,
+                os.getenv("TAVILY_API_KEY", ""), 3, _pub_blogs_ag,  # 3 loops
             )
-            blog_object = revision_result["revised_blog"]
-            # Ensure content key is correct after revision
+            blog_object = seo_revision["revised_blog"]
             if blog_object.get("content_html") and not blog_object.get("content"):
                 blog_object["content"] = blog_object["content_html"]
-            blog_object["seoScore"] = revision_result["new_seo_score"]
-            blog_object["seoGrade"] = revision_result["new_seo_grade"]
+            blog_object["seoScore"] = seo_revision["new_seo_score"]
+            blog_object["seoGrade"] = seo_revision["new_seo_grade"]
+            print(f"[auto_generate] SEO revision: {initial_score} → {blog_object['seoScore']}/100")
         except Exception as e:
-            print(f"[auto_generate] Post-pipeline revision failed: {e}")
+            print(f"[auto_generate] SEO revision failed: {e}")
 
-    # Publish gate: only auto-publish if score meets threshold and image is real
-    final_score = blog_object.get("seoScore") or 0
-    seo_ok = final_score >= min_score
-    cover = blog_object.get("coverImage") or ""
+    # ── Stage B: Credibility audit + surgical rewrite — up to 3 loops ─────────
+    try:
+        cred_audit = validate_credibility({
+            "content_html": blog_object.get("content", ""),
+            "title":        blog_object.get("title", ""),
+        })
+        print(f"[auto_generate] Credibility initial score: {cred_audit['score']}/100 — {cred_audit['status']}")
+        if cred_audit["score"] < 90 and not cred_audit.get("hard_fail_reasons"):
+            cred_result = await loop.run_in_executor(
+                None, revise_blog_credibility,
+                blog_object, cred_audit, llm_cfg, 3,  # 3 loops
+            )
+            blog_object = cred_result["revised_blog"]
+            if blog_object.get("content_html") and not blog_object.get("content"):
+                blog_object["content"] = blog_object["content_html"]
+            blog_object["credibilityScore"] = cred_result["new_credibility_score"]
+            blog_object["credibilityGrade"] = cred_result["new_credibility_grade"]
+            print(f"[auto_generate] Credibility after revision: {cred_result['new_credibility_score']}/100")
+        elif cred_audit.get("hard_fail_reasons"):
+            print(f"[auto_generate] Credibility hard fail — skipping rewrite: {cred_audit['hard_fail_reasons']}")
+            blog_object["credibilityScore"] = cred_audit["score"]
+        else:
+            blog_object["credibilityScore"] = cred_audit["score"]
+    except Exception as e:
+        print(f"[auto_generate] Credibility pass failed: {e}")
+
+    # ── Publish gate: SEO ≥ 90, credibility ≥ 75, real cover image ────────────
+    final_score   = blog_object.get("seoScore") or 0
+    cred_score    = blog_object.get("credibilityScore") or 0
+    seo_ok        = final_score >= min_score
+    cred_ok       = cred_score >= 75 or cred_score == 0  # 0 means audit didn't run — don't block
+    cover         = blog_object.get("coverImage") or ""
     has_real_image = bool(cover and "placehold.co" not in cover)
-    publish = req.auto_publish and seo_ok and has_real_image
+    publish = req.auto_publish and seo_ok and cred_ok and has_real_image
 
     # Save to Supabase
     new_blog = {
@@ -2072,7 +2100,9 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
         "published": publish,
     }
     if not seo_ok:
-        new_blog["draftReason"] = f"SEO {final_score} below publish threshold {min_score}"
+        new_blog["draftReason"] = f"SEO {final_score}/100 below publish threshold {min_score}"
+    elif not cred_ok:
+        new_blog["draftReason"] = f"Credibility {cred_score}/100 below minimum 75 — review sources and claims"
     elif not has_real_image:
         new_blog["draftReason"] = "No real cover image — add before publishing"
     db.insert_blog(new_blog)
@@ -2108,7 +2138,7 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
         "final_seo_score": final_score,
         "published": publish,
         "pipeline_log": blog_object.get("pipelineLog", []),
-        "revision_notes": revision_result.get("revision_notes", []) if revision_result else [],
+        "credibility_score": blog_object.get("credibilityScore", 0),
         "seo_report": {
             "score": final_score,
             "grade": new_blog.get("seoGrade"),

@@ -701,17 +701,25 @@ def deep_research_topic(topic: str, cluster_sources: list, llm_cfg, tavily_key: 
     for q in angles:
         if tavily_key:
             for r in _tavily_search(q, tavily_key, num=3, depth="advanced", days=30):
+                url  = r.get("url", "")
+                tier = _source_tier(url)
+                if tier == 0:
+                    print(f"[research] Skipping untrusted source: {url[:80]}")
+                    continue
                 body = r.get("content") or r.get("raw_content") or ""
                 if body:
-                    all_content.append(f"[{r.get('title','')}]({r.get('url','')})\n{body[:500]}")
-                if r.get("url") and r.get("title"):
-                    all_refs.append({"title": r["title"], "url": r["url"]})
+                    all_content.append(f"[{r.get('title','')}]({url})\n{body[:500]}")
+                if url and r.get("title"):
+                    all_refs.append({"title": r["title"], "url": url})
         else:
             for r in _search_web(q, 4):
+                url  = r.get("url", "")
+                if _source_tier(url) == 0:
+                    continue
                 if r.get("snippet"):
-                    all_content.append(f"[{r['title']}]({r['url']})\n{r['snippet']}")
-                if r.get("url") and r.get("title"):
-                    all_refs.append({"title": r["title"], "url": r["url"]})
+                    all_content.append(f"[{r['title']}]({url})\n{r['snippet']}")
+                if url and r.get("title"):
+                    all_refs.append({"title": r["title"], "url": url})
 
     # Deduplicate refs
     seen, unique_refs = set(), []
@@ -1088,57 +1096,90 @@ def write_roundup_blog(niche: str, month_year: str, llm_cfg, tavily_key: str = "
                 if r.get("title") and r.get("url"):
                     raw.append(r)
 
-    seen, unique = set(), []
+    # Deduplicate by URL; then require each story to be confirmed by 3+ independent sources.
+    # We cluster by normalised title similarity (first 6 significant words) so that the same
+    # story reported on multiple outlets counts as 3-source confirmed.
+    def _story_key(title: str) -> str:
+        words = re.sub(r'[^a-z0-9 ]', ' ', title.lower()).split()
+        significant = [w for w in words if len(w) > 3][:6]
+        return " ".join(significant)
+
+    # Group all raw results by story key (counts independent source URLs per story)
+    story_groups: dict = {}
     for h in raw:
         u = h.get("url", "")
-        if u and u not in seen:
-            seen.add(u)
-            unique.append(h)
-    top = unique[:12]
-    if not top:
-        raise RuntimeError("No headlines found — check Tavily key or network access")
+        t = h.get("title", "")
+        if not u or not t:
+            continue
+        key = _story_key(t)
+        if key not in story_groups:
+            story_groups[key] = {"headline": h, "urls": set(), "snippets": []}
+        story_groups[key]["urls"].add(u)
+        snippet = (h.get("content") or h.get("snippet") or "")[:200]
+        if snippet and snippet not in story_groups[key]["snippets"]:
+            story_groups[key]["snippets"].append(snippet)
+
+    # Keep only stories confirmed by 3+ independent sources
+    confirmed = [v for v in story_groups.values() if len(v["urls"]) >= 3]
+    print(f"[roundup] {len(story_groups)} unique stories found; {len(confirmed)} confirmed by 3+ sources")
+
+    # Fallback: if fewer than 6 confirmed stories, relax to 2+ sources
+    if len(confirmed) < 6:
+        confirmed = [v for v in story_groups.values() if len(v["urls"]) >= 2]
+        print(f"[roundup] Relaxed to 2+ source confirmation: {len(confirmed)} stories")
+
+    if not confirmed:
+        raise RuntimeError("No headlines found with sufficient source confirmation — check Tavily key or network access")
+
+    top = [v["headline"] for v in confirmed[:12]]
 
     refs = [{"title": h.get("title", ""), "url": h.get("url", "")} for h in top if h.get("url")]
     refs_json = json.dumps(refs[:10])
     slug_date = month_year.lower().replace(" ", "-")
-    primary_kw = f"AI news {month_year}"
+    # Primary keyword must be an exact substring of the title (no colon separating them)
+    primary_kw = f"Top 10 AI News {month_year}"
 
     headlines_block = ""
     for i, h in enumerate(top, 1):
-        snippet = (h.get("content") or h.get("snippet") or "")[:300]
+        # Show all confirmed source URLs for each story so the LLM can cite them
+        grp       = story_groups[_story_key(h.get("title", ""))]
+        src_urls  = " | ".join(list(grp["urls"])[:3])
+        snippet   = " ".join(grp["snippets"])[:350]
         headlines_block += (
             f"{i}. TITLE: {h.get('title', '')}\n"
-            f"   URL:   {h.get('url', '')}\n"
+            f"   CONFIRMED SOURCES ({len(grp['urls'])}): {src_urls}\n"
             f"   INFO:  {snippet}\n\n"
         )
 
     prompt = f"""You are a senior AI analyst at Lumynor Systems — a digital product studio building agentic AI and SaaS products.
 
-Write a comprehensive "Top 10 AI News Headlines" roundup blog post for {month_year}.
+Write a comprehensive "Top 10 AI News {month_year}" roundup blog post.
+Every story MUST be confirmed by multiple sources — cite the sources provided, do not fabricate URLs.
 Cover each story with real technical depth — what happened, technical implications for SaaS and AI product builders, and the Lumynor perspective.
 
-═══ NEWS STORIES TO COVER ══════════════════════════════════════════════════════
+═══ NEWS STORIES TO COVER (all confirmed by 2-3+ independent sources) ═════════
 {headlines_block}
 ════════════════════════════════════════════════════════════════════════════════
 
 STRUCTURE:
 - Intro paragraph (100-150 words): frame why this batch matters
-- For each story: <h2>N. Story Headline</h2> → 200-250 words of analysis → inline <a href="URL" target="_blank" rel="noopener noreferrer">source</a> → end paragraph with "What this means for builders: [sentence]."
+- For each story: <h2>N. Story Headline</h2> → 200-250 words of original analysis (synthesize from the sources, do NOT copy verbatim) → cite with inline <a href="SOURCE_URL" target="_blank" rel="noopener noreferrer">source name</a> → end with one sentence: "Builder impact: [concrete implication]."
 - <h2>Key Takeaways for AI Builders</h2> → 200-word conclusion with Lumynor angle and a call to action linking to <a href="/contact">talk to the Lumynor team</a>
 - 3-5 FAQ pairs about the news
 
 RULES:
-- 2500-3500 total words — every section needs real analysis not bullet summaries
+- 2500-3500 total words — every section needs real original analysis, not summaries or copy-paste
+- Each story analysis must synthesize from the confirmed sources — no verbatim copying
 - HTML only inside content_html — NO markdown
-- BANNED: "game-changer", "revolutionize", "leverage", "delve", "In today's world", "in conclusion", "it's worth noting"
+- BANNED: "game-changer", "revolutionize", "leverage", "delve", "In today's world", "in conclusion", "it's worth noting", "What this means for builders" (repeated phrase — vary the phrasing each time)
 - Tone: opinionated, technical, practitioner — not generic journalism
 
 Return ONLY valid JSON (no markdown wrapper):
 {{
-  "title": "Top 10 AI News: {month_year} — What Builders Actually Need to Know",
+  "title": "Top 10 AI News {month_year}: What Builders Actually Need to Know",
   "slug": "top-10-ai-news-{slug_date}",
   "summary": "A practitioner breakdown of the 10 biggest AI news stories in {month_year} — what they mean for SaaS and agentic product builders.",
-  "meta_description": "Top AI news {month_year}: 10 biggest stories analyzed for SaaS and AI product builders by Lumynor Systems.",
+  "meta_description": "Top 10 AI News {month_year}: 10 biggest stories analyzed for SaaS and AI product builders by Lumynor Systems.",
   "content_html": "<p>intro...</p><h2>1. First Headline</h2><p>analysis...</p>...",
   "primary_keyword": "{primary_kw}",
   "secondary_keywords": ["AI headlines {month_year}", "artificial intelligence news this week", "AI model releases {month_year}", "latest AI updates", "agentic AI news"],
@@ -1892,6 +1933,343 @@ def validate_seo(blog: dict) -> dict:
         "fixes": fixes,
         "recommended_fixes": fixes,
         "hard_fail_reasons": hard_fails,
+    }
+
+
+# ── CREDIBILITY AUDIT + SURGICAL REWRITE ─────────────────────────────────────
+#
+# Separate from SEO — credibility audits factual accuracy, source trustworthiness,
+# claim confidence language, originality, and repetition. Threshold: 90/100.
+# revise_blog_credibility() loops up to max_loops times, exiting early at 90+.
+
+_CREDIBLE_DOMAINS = (
+    # Official lab / company blogs
+    "openai.com", "anthropic.com", "deepmind.google", "blog.google", "ai.meta.com",
+    "mistral.ai", "huggingface.co", "nvidia.com", "blogs.microsoft.com",
+    "research.microsoft.com", "aws.amazon.com", "cloud.google.com", "azure.microsoft.com",
+    # Tier-1 tech journalism
+    "techcrunch.com", "venturebeat.com", "theverge.com", "wired.com",
+    "technologyreview.mit.edu", "arstechnica.com", "zdnet.com", "the-decoder.com",
+    "reuters.com", "bloomberg.com", "wsj.com", "ft.com", "apnews.com",
+    # Academic / research
+    "arxiv.org", "nature.com", "science.org", "ieee.org", "acm.org",
+    "mit.edu", "stanford.edu",
+    # Developer-community sources
+    "github.com", "stackoverflow.com", "cloudflare.com", "vercel.com",
+)
+
+_HEDGE_PHRASES = (
+    "according to", "reports suggest", "as reported by", "sources indicate",
+    "based on", "per ", "citing ", "the company said", "announced that",
+)
+
+_DEFINITIVE_RED_FLAGS = (
+    "100% accurate", "guaranteed", "definitely will", "certainly will",
+    "it is a fact that", "undeniably", "without question", "it is proven",
+    "studies show that ai will", "experts agree that ai will",
+)
+
+
+def _sentence_fingerprints(text: str) -> list:
+    """Return normalised sentence strings (lowercased, punctuation stripped) for dedup."""
+    raw = re.split(r'(?<=[.!?])\s+', re.sub(r'<[^>]+>', ' ', text))
+    return [re.sub(r'[^a-z0-9 ]', '', s.lower()).strip() for s in raw if len(s.strip()) > 40]
+
+
+def _find_repeated_sentences(content: str) -> list:
+    """Return list of sentences (cleaned) that appear more than once in the article."""
+    fps = _sentence_fingerprints(content)
+    seen, dupes = {}, []
+    for fp in fps:
+        if fp in seen:
+            if fp not in dupes:
+                dupes.append(fp)
+        else:
+            seen[fp] = 1
+    return dupes
+
+
+def validate_credibility(blog: dict) -> dict:
+    """
+    100-point credibility audit across 5 categories:
+      Source trustworthiness  25   Claim accuracy / hedging  25
+      Originality             20   Multi-source confirmation  20
+      Editorial standards     10
+
+    Returns the same shape as validate_seo (score, grade, status, issues, fixes,
+    hard_fail_reasons) so it can be fed into revise_blog_credibility().
+    """
+    _ck     = "content_html" if "content_html" in blog else "content"
+    content = (blog.get(_ck) or "").strip()
+    clean   = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', content)).strip()
+    clean_l = clean.lower()
+
+    cat = {
+        "source_trust":      25,
+        "claim_accuracy":    25,
+        "originality":       20,
+        "multi_source":      20,
+        "editorial":         10,
+    }
+    issues, passed, fixes, hard_fails = [], [], [], []
+
+    def lose(category, pts, issue, fix=""):
+        cat[category] = max(0, cat[category] - pts)
+        issues.append(issue)
+        if fix:
+            fixes.append(fix)
+
+    def ok(msg):
+        passed.append(msg)
+
+    # ── 1. Source trustworthiness (25 pts) ────────────────────────────────────
+    ext_links = re.findall(r'href=["\']https?://([^/"\']+)', content, re.I)
+    credible_links = [d for d in ext_links if any(c in d for c in _CREDIBLE_DOMAINS)]
+    non_credible   = [d for d in ext_links if not any(c in d for c in _CREDIBLE_DOMAINS)
+                      and d and "lumynor" not in d]
+
+    if len(credible_links) >= 3:
+        ok(f"Credible sources linked: {len(credible_links)}")
+    elif len(credible_links) >= 1:
+        lose("source_trust", 10, f"Only {len(credible_links)} credible source(s) — need 3+",
+             "Add citations from official announcements, major tech journals, or peer-reviewed papers")
+    else:
+        lose("source_trust", 20, "No links to credible sources — all claims are unsupported",
+             "Every claim must link to an official or tier-1 journalistic source")
+        hard_fails.append("No credible sources linked")
+
+    if non_credible:
+        lose("source_trust", min(5, len(non_credible) * 2),
+             f"Non-credible domain(s) linked: {', '.join(set(non_credible[:4]))}",
+             "Remove links to unknown/non-tier sources; replace with official or Tier-1 press links")
+    else:
+        ok("No non-credible domain links detected")
+
+    # ── 2. Claim accuracy / hedging (25 pts) ──────────────────────────────────
+    # Stats with no inline source attribution nearby
+    stat_hits = re.findall(r'\b\d+(?:\.\d+)?%|\$[\d\.]+[BMKbmk]?\b|\b\d{4}\s+(?:billion|million|thousand)\b', clean)
+    stat_count = len(stat_hits)
+    if stat_count == 0 or credible_links:
+        ok("Statistics appear source-backed or no floating stats")
+    elif stat_count <= 3:
+        lose("claim_accuracy", 8, f"{stat_count} statistic(s) with no inline source citation",
+             "Link every statistic to its primary source inline in the text")
+    else:
+        lose("claim_accuracy", 15, f"{stat_count} statistics with no credible inline citations — high fabrication risk",
+             "Back each stat with a source hyperlink; remove any that cannot be verified")
+        hard_fails.append("Multiple unsupported statistics — high fabrication risk")
+
+    red_flag_hits = [rf for rf in _DEFINITIVE_RED_FLAGS if rf in clean_l]
+    if not red_flag_hits:
+        ok("No overconfident / unverified definitive claims detected")
+    elif len(red_flag_hits) <= 2:
+        lose("claim_accuracy", 8, f"Overconfident claims: {red_flag_hits}",
+             "Replace with hedged language: 'according to X', 'research suggests', 'X reported that'")
+    else:
+        lose("claim_accuracy", 15, f"Multiple definitive unverifiable claims ({len(red_flag_hits)}): {red_flag_hits[:3]}",
+             "Rewrite all flagged claims with proper attribution or hedged language")
+        hard_fails.append("Multiple overconfident definitive claims without citations")
+
+    hedge_hits = sum(1 for hp in _HEDGE_PHRASES if hp in clean_l)
+    if hedge_hits >= 3:
+        ok(f"Appropriate hedging language used ({hedge_hits} instances)")
+    elif hedge_hits >= 1:
+        lose("claim_accuracy", 5, "Insufficient hedging language — article reads as asserting unconfirmed facts",
+             "Add attribution phrases: 'according to', 'as reported by', 'X stated that'")
+    else:
+        lose("claim_accuracy", 10, "No hedging language at all — every claim asserted as absolute fact",
+             "Use 'according to [source]', 'reports indicate', 'X announced that' throughout")
+
+    # ── 3. Originality / no repetition (20 pts) ───────────────────────────────
+    repeated = _find_repeated_sentences(content)
+    if not repeated:
+        ok("No repeated sentences detected — original synthesis throughout")
+    elif len(repeated) <= 2:
+        lose("originality", 8, f"{len(repeated)} sentence(s) repeated verbatim in the article",
+             "Rewrite the duplicate sentences — each idea should appear exactly once")
+    else:
+        lose("originality", 15, f"{len(repeated)} repeated sentences — article reads as templated / copy-pasted",
+             "Audit the full article for copy-paste paragraphs; every sentence must appear only once")
+        hard_fails.append("Excessive sentence repetition — likely verbatim copy from sources")
+
+    # Repeated structural phrases (e.g. roundup ending formulas)
+    structural_repeats = []
+    for phrase in ("what this means for builders", "builder impact:", "key takeaway:", "in summary,"):
+        count = clean_l.count(phrase)
+        if count > 3:
+            structural_repeats.append(f"'{phrase}' x{count}")
+    if structural_repeats:
+        lose("originality", 5, f"Repeated structural phrases: {structural_repeats}",
+             "Vary closing sentences per section — avoid templated endings")
+    else:
+        ok("No overused structural phrases detected")
+
+    # ── 4. Multi-source confirmation (20 pts) ─────────────────────────────────
+    unique_credible_domains = set(
+        d for d in credible_links if any(c in d for c in _CREDIBLE_DOMAINS)
+    )
+    if len(unique_credible_domains) >= 3:
+        ok(f"Claims backed by {len(unique_credible_domains)} distinct credible domains")
+    elif len(unique_credible_domains) == 2:
+        lose("multi_source", 8, "Only 2 distinct credible domains cited — need 3+ for multi-source confidence",
+             "Add citations from a third independent credible source to key claims")
+    elif len(unique_credible_domains) == 1:
+        lose("multi_source", 15, "Single-source article — all credible links from one domain",
+             "Cross-reference key claims with at least 2 more independent credible sources")
+    else:
+        lose("multi_source", 20, "Zero distinct credible domains — no multi-source verification",
+             "Research and cite 3+ independent credible sources for primary claims")
+        hard_fails.append("No multi-source verification — single-point-of-failure reporting")
+
+    # ── 5. Editorial standards (10 pts) ───────────────────────────────────────
+    # Check for fabrication signals: quotes with no attributed speaker, "experts say" without naming them
+    anon_expert = len(re.findall(r'"[^"]{20,}"(?!\s*(?:—|–|,)\s*\w)', content))
+    if anon_expert > 3:
+        lose("editorial", 5, f"{anon_expert} unattributed quote(s) — unclear who said this",
+             "Every quotation must name the speaker and source")
+    else:
+        ok("Quotes appear attributed or are not present")
+
+    vague_expert = len(re.findall(r'\bexperts?\s+(?:say|agree|believe|suggest|warn|predict)\b', clean_l))
+    if vague_expert > 2:
+        lose("editorial", 5, f"'experts say/agree/believe' used {vague_expert}x without naming them",
+             "Name the specific expert, institution, or link to the actual statement")
+    else:
+        ok("No anonymous 'experts say' generalizations detected")
+
+    # ── Final scoring ──────────────────────────────────────────────────────────
+    total = max(0, min(100, sum(cat.values())))
+    if hard_fails:
+        status = "Hard Fail — Do Not Publish"
+    elif total >= 90:
+        status = "Credible — Publish"
+    elif total >= 75:
+        status = "Minor credibility issues — review before publishing"
+    else:
+        status = "Credibility below standard — revise required"
+
+    grade = ("A" if total >= 90 else "B" if total >= 80 else
+             "C" if total >= 70 else "D" if total >= 60 else "F")
+
+    return {
+        "score": total,
+        "grade": grade,
+        "status": status,
+        "category_scores": cat,
+        "passed": passed,
+        "issues": issues,
+        "fixes": fixes,
+        "hard_fail_reasons": hard_fails,
+        "repeated_sentences": repeated,
+    }
+
+
+def revise_blog_credibility(blog: dict, cred_report: dict, llm_cfg, max_loops: int = 3) -> dict:
+    """
+    Surgical credibility rewrite — loop up to max_loops times:
+      1. If hard fail → return immediately (unfixable without fresh research)
+      2. Fix repeated sentences (LLM rewrites all dupes in one pass)
+      3. Fix unsupported stats — add hedge language
+      4. Fix unattributed quotes / 'experts say' → attributed or removed
+      5. Fix overconfident claims → hedged language
+      6. Re-audit; exit early if score >= 90
+    Returns {"revised_blog": dict, "new_credibility_score": int, "notes": list}
+    """
+    _ck    = "content_html" if "content_html" in blog else "content"
+    notes  = []
+    current = dict(blog)
+    score_progression = [cred_report.get("score", 0)]
+
+    for loop in range(1, max_loops + 1):
+        score_before = cred_report.get("score", 0)
+        notes.append(f"\n── Credibility Loop {loop}/{max_loops} (score: {score_before}/100) ──")
+
+        hard_fails = cred_report.get("hard_fail_reasons", [])
+        if hard_fails:
+            notes.append(f"  ✗ Hard fail — stopping: {hard_fails}")
+            break
+
+        issues_text = " | ".join(cred_report.get("issues", []))
+        repeated    = cred_report.get("repeated_sentences", [])
+        content     = current.get(_ck, "")
+
+        # Build a single LLM revision call that addresses all detected issues at once
+        fixes_needed = []
+        if repeated:
+            fixes_needed.append(
+                f"REPEATED SENTENCES: The following sentences appear more than once — "
+                f"rewrite all duplicate occurrences with fresh phrasing: "
+                + " | ".join(f'"{s[:80]}"' for s in repeated[:6])
+            )
+        if any("statistic" in i.lower() or "unsupported" in i.lower() for i in cred_report.get("issues", [])):
+            fixes_needed.append(
+                "UNSUPPORTED STATISTICS: Add 'according to [source]' or 'as reported by [publication]' "
+                "before each numeric statistic, or soften to 'estimates suggest roughly X'."
+            )
+        if any("overconfident" in i.lower() or "definitive" in i.lower() for i in cred_report.get("issues", [])):
+            fixes_needed.append(
+                "OVERCONFIDENT CLAIMS: Replace absolutist language ('definitely', 'certainly', "
+                "'100%', 'it is proven') with 'research suggests', 'evidence indicates', 'may', 'likely'."
+            )
+        if any("unattributed" in i.lower() or "'experts say'" in i.lower() for i in cred_report.get("issues", [])):
+            fixes_needed.append(
+                "UNATTRIBUTED QUOTES / 'EXPERTS SAY': Either name the expert + link the source, "
+                "or rephrase as 'industry observers note' without a fake quote."
+            )
+        if any("structural" in i.lower() for i in cred_report.get("issues", [])):
+            fixes_needed.append(
+                "REPEATED STRUCTURAL PHRASES: Vary section-closing sentences — "
+                "don't end every paragraph the same way."
+            )
+
+        if not fixes_needed:
+            notes.append("  No actionable fixes — stopping early")
+            break
+
+        prompt = f"""You are a credibility editor. Apply ONLY the listed surgical fixes to the article HTML.
+Do NOT change the meaning, add new facts, invent sources, or alter the overall structure.
+Return ONLY the revised full HTML (the content_html value) — no JSON wrapper, no markdown.
+
+FIXES TO APPLY:
+{chr(10).join(f"  {i+1}. {f}" for i, f in enumerate(fixes_needed))}
+
+ALL OTHER ISSUES (for awareness only): {issues_text[:300]}
+
+ARTICLE HTML:
+{content[:12000]}"""
+
+        try:
+            revised_html = _llm(prompt, llm_cfg, json_mode=False, timeout=120, max_tokens=8000)
+            # Strip any accidental markdown code fences
+            revised_html = re.sub(r'^```html?\s*', '', revised_html.strip(), flags=re.I)
+            revised_html = re.sub(r'\s*```$', '', revised_html.strip())
+            if len(revised_html) > 500:
+                current[_ck] = revised_html
+                notes.append(f"  ✓ Applied {len(fixes_needed)} fix category(ies)")
+            else:
+                notes.append("  ⚠ LLM returned suspiciously short content — keeping previous")
+        except Exception as e:
+            notes.append(f"  ⚠ LLM revision failed: {str(e)[:80]}")
+
+        # Re-audit
+        cred_report = validate_credibility(current)
+        score_after = cred_report.get("score", 0)
+        score_progression.append(score_after)
+        notes.append(f"  📊 Score after loop {loop}: {score_after}/100")
+
+        if score_after >= 90 and not cred_report.get("hard_fail_reasons"):
+            notes.append("  ✅ 90+ reached — stopping early")
+            break
+
+    final_score = cred_report.get("score", score_progression[0])
+    return {
+        "revised_blog":          current,
+        "new_credibility_score": final_score,
+        "new_credibility_grade": cred_report.get("grade", "F"),
+        "credibility_status":    cred_report.get("status", ""),
+        "score_progression":     score_progression,
+        "notes":                 notes,
+        "hard_fail_reasons":     cred_report.get("hard_fail_reasons", []),
     }
 
 
@@ -3026,6 +3404,27 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
                 )
             draft["content_html"] = schema_blocks + "\n" + ch_ld
 
+        # Repetition check — deduplicate repeated sentences before SEO validation
+        _dupes = _find_repeated_sentences(draft.get("content_html", ""))
+        if _dupes:
+            _ck = "content_html"
+            _rep_prompt = (
+                "You are a copy editor. The following article contains repeated sentences "
+                "(exact or near-exact duplicates). Rewrite ONLY the second and subsequent "
+                "occurrences of each repeated sentence with fresh phrasing that conveys the same idea. "
+                "Return ONLY the full revised HTML — no JSON, no markdown wrapper.\n\n"
+                f"REPEATED SENTENCES:\n" + "\n".join(f'- "{s[:100]}"' for s in _dupes[:8]) +
+                f"\n\nARTICLE HTML:\n{draft.get(_ck, '')[:12000]}"
+            )
+            try:
+                _dedup_html = _llm(_rep_prompt, gemini_key, json_mode=False, timeout=90, max_tokens=8000)
+                _dedup_html = re.sub(r'^```html?\s*', '', _dedup_html.strip(), flags=re.I)
+                _dedup_html = re.sub(r'\s*```$', '', _dedup_html.strip())
+                if len(_dedup_html) > 500:
+                    draft[_ck] = _dedup_html
+            except Exception as _de:
+                print(f"[repetition_fix] {_de}")
+
         # SEO validate + refine (target 90+)
         seo = validate_seo(draft)
         if seo["score"] < 90 and seo.get("issues"):
@@ -3049,7 +3448,7 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
     _min_quality = int(os.getenv("BLOG_MIN_QUALITY_SCORE", "90"))
     if seo_report.get("hard_fail_reasons"):
         log.append(f"🚫 Hard Fail: {' | '.join(seo_report['hard_fail_reasons'])}")
-    if blog_format != "roundup" and seo_report["score"] < _min_quality and seo_report.get("issues"):
+    if seo_report["score"] < _min_quality and seo_report.get("issues"):
         hints = " | ".join(i for i in seo_report["issues"])
         log.append(f"🔄 SEO {seo_report['score']}/100 below threshold {_min_quality} — rewriting with {len(seo_report['issues'])} targeted fixes...")
         try:
