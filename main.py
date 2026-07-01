@@ -2393,6 +2393,12 @@ async def audit_blog(blog_id: str):
         loop.run_in_executor(None, check_plagiarism, content, tavily_key),
     )
 
+    # Persist freshly computed scores so the blog manager table stays up to date
+    db.patch_blog(blog_id, {
+        "seoScore":        seo_report["score"],
+        "credibilityScore": cred_report["score"],
+    })
+
     return {
         "blog_id":    blog_id,
         "title":      blog.get("title", ""),
@@ -2426,6 +2432,50 @@ async def audit_blog(blog_id: str):
             "flagged_count": plag_report["flagged_count"],
             "flagged":      plag_report["flagged"],
         },
+    }
+
+
+@app.post("/api/blogs/{blog_id}/revise-credibility")
+async def revise_blog_credibility_endpoint(blog_id: str):
+    """Run up to 3 surgical credibility-rewrite loops on a saved blog post.
+    Saves the improved content + score back to the database."""
+    blog = db.get_blog(blog_id)
+    if not blog:
+        raise HTTPException(status_code=404, detail="Blog not found")
+
+    content    = blog.get("content", "")
+    llm_cfg    = _build_llm_cfg(db.get_settings())
+    loop       = asyncio.get_event_loop()
+
+    cred_report = await loop.run_in_executor(
+        None, validate_credibility, {"content_html": content, "title": blog.get("title", "")}
+    )
+    initial_score = cred_report["score"]
+
+    if initial_score >= 90 and not cred_report.get("hard_fail_reasons"):
+        return {
+            "message":             "Already credible — no rewrite needed",
+            "initial_score":       initial_score,
+            "new_credibility_score": initial_score,
+            "score_progression":   [initial_score],
+        }
+
+    result = await loop.run_in_executor(
+        None, revise_blog_credibility, blog, cred_report, llm_cfg, 3
+    )
+
+    revised_blog = result["revised_blog"]
+    new_score    = result["new_credibility_score"]
+    new_content  = revised_blog.get("content", content)
+
+    db.patch_blog(blog_id, {"content": new_content, "credibilityScore": new_score})
+
+    return {
+        "initial_score":         initial_score,
+        "new_credibility_score": new_score,
+        "new_credibility_grade": result.get("new_credibility_grade", ""),
+        "score_progression":     result.get("score_progression", []),
+        "hard_fail_reasons":     result.get("hard_fail_reasons", []),
     }
 
 
