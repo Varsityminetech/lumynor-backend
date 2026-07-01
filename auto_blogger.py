@@ -2226,8 +2226,14 @@ def check_plagiarism(content: str, tavily_key: str = "") -> dict:
       flagged      — list of {sentence, found_at, source_title}
       status       — "Original" / "Likely plagiarised" / "Review needed"
     """
-    # Work on clean text only — no HTML
-    clean = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', content)).strip()
+    # Work on clean text only — strip both HTML and Markdown markers
+    _s = re.sub(r'<[^>]+>', ' ', content)
+    _s = re.sub(r'^#{1,6}\s+', '', _s, flags=re.M)
+    _s = re.sub(r'\*{1,3}([^*\n]+)\*{1,3}', r'\1', _s)
+    _s = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', _s)
+    _s = re.sub(r'^>\s*\[![A-Z]+\]\s*', '', _s, flags=re.M)
+    _s = re.sub(r'^>\s*', '', _s, flags=re.M)
+    clean = re.sub(r'\s+', ' ', _s).strip()
 
     # Split into sentences on . ! ? boundaries
     raw_sentences = re.split(r'(?<=[.!?])\s+', clean)
@@ -2594,18 +2600,21 @@ def format_blog_html(blog: dict, section_imgs: list = None,
         html = html.rstrip() + "\n" + ref_html
 
     # ── 7. schema.org Article + FAQPage JSON-LD ──────────────────────────────
-    title_ld = (blog.get("title") or "").replace('"', '\\"')
-    desc_ld  = (blog.get("summary") or blog.get("meta_description") or "")[:160].replace('"', '\\"')
-    faq_ld   = "".join(
-        f'{{"@type":"Question","name":"{it.get("question","").replace(chr(34),chr(39))}",'
-        f'"acceptedAnswer":{{"@type":"Answer","text":"{it.get("answer","").replace(chr(34),chr(39))[:300]}"}}}}'
-        + ("," if i < len(faq_items) - 1 else "")
-        for i, it in enumerate(faq_items[:8])
-    )
+    import json as _json_ld
+    title_ld = _json_ld.dumps(blog.get("title") or "")
+    desc_ld  = _json_ld.dumps((blog.get("summary") or blog.get("meta_description") or "")[:160])
+    faq_ld_parts = []
+    for it in faq_items[:8]:
+        q = _json_ld.dumps(it.get("question") or "")
+        a = _json_ld.dumps((it.get("answer") or "")[:300])
+        faq_ld_parts.append(
+            f'{{"@type":"Question","name":{q},"acceptedAnswer":{{"@type":"Answer","text":{a}}}}}'
+        )
+    faq_ld = ",".join(faq_ld_parts)
     schema = (
         f'<script type="application/ld+json">'
         f'{{"@context":"https://schema.org","@type":"Article",'
-        f'"headline":"{title_ld}","description":"{desc_ld}",'
+        f'"headline":{title_ld},"description":{desc_ld},'
         f'"author":{{"@type":"Organization","name":"Lumynor Systems"}},'
         f'"publisher":{{"@type":"Organization","name":"Lumynor Systems","url":"https://lumynor.com"}}}}'
         f'</script>'
@@ -2898,7 +2907,9 @@ def revise_blog_from_audit(
     tavily_key = tavily_key or os.getenv("TAVILY_API_KEY", "")
     notes      = []
     loop_diffs = []
-    _ck        = "content_html" if "content_html" in blog else "content"
+    _ck  = ("content_markdown" if "content_markdown" in blog
+            else "content_html" if "content_html" in blog else "content")
+    _md  = _ck == "content_markdown"
     current    = dict(blog)
     if research_brief and not current.get("research_brief"):
         current["research_brief"] = {"_present": True}
@@ -2968,12 +2979,17 @@ def revise_blog_from_audit(
                 sources_added_count   = len(added)
                 raw = current.get(_ck, "")
                 if "References" not in raw:
-                    ref_html = "<h2>References &amp; Sources</h2><ol>"
-                    for r in (existing + added)[:6]:
-                        ref_html += (f'<li><a href="{r["url"]}" target="_blank"'
-                                     f' rel="noopener noreferrer">{r["title"]}</a></li>')
-                    ref_html += "</ol>"
-                    current[_ck] = raw.rstrip() + "\n" + ref_html
+                    if _md:
+                        ref_block = "\n\n## References & Sources\n\n"
+                        for r in (existing + added)[:6]:
+                            ref_block += f'- [{r["title"]}]({r["url"]})\n'
+                    else:
+                        ref_block = "<h2>References &amp; Sources</h2><ol>"
+                        for r in (existing + added)[:6]:
+                            ref_block += (f'<li><a href="{r["url"]}" target="_blank"'
+                                          f' rel="noopener noreferrer">{r["title"]}</a></li>')
+                        ref_block += "</ol>"
+                    current[_ck] = raw.rstrip() + "\n" + ref_block
                 notes.append(f"  ✓ {len(added)} trusted source(s) added")
                 actions_taken.append(f"Added {len(added)} sources via Tavily")
 
@@ -2983,10 +2999,17 @@ def revise_blog_from_audit(
                 _stat_pats = (r'\b\d+(?:\.\d+)?%', r'\$[\d\.]+[BMKbmk]?\b',
                               r'\b\d+x\b', r'\b\d{1,3}(?:,\d{3})+\b')
                 raw_html = current.get(_ck, "")
-                stat_paras = [
-                    m.group(0) for m in re.finditer(r'<p[^>]*>.*?</p>', raw_html, re.DOTALL | re.I)
-                    if any(re.search(p, re.sub(r'<[^>]+>', ' ', m.group(0))) for p in _stat_pats)
-                ][:5]
+                if _md:
+                    stat_paras = [
+                        blk for blk in raw_html.split("\n\n")
+                        if blk.strip() and not blk.strip().startswith("#")
+                        and any(re.search(p, blk) for p in _stat_pats)
+                    ][:5]
+                else:
+                    stat_paras = [
+                        m.group(0) for m in re.finditer(r'<p[^>]*>.*?</p>', raw_html, re.DOTALL | re.I)
+                        if any(re.search(p, re.sub(r'<[^>]+>', ' ', m.group(0))) for p in _stat_pats)
+                    ][:5]
                 if stat_paras:
                     src_ctx = "; ".join(f"{r['title']} ({r['url']})" for r in added[:3])
                     cite_prompt = (
@@ -3050,14 +3073,18 @@ def revise_blog_from_audit(
         if buckets.get("expand_content"):
             wc = audit.get("word_count", 0)
             raw_content = current.get(_ck, "")
-            orig_wc = len(re.sub(r'<[^>]+>', ' ', raw_content).split())
+            _fmt_label = "Markdown" if _md else "HTML"
+            _h2_label  = "## headings" if _md else "H2 sections"
+            orig_wc = len(re.sub(r'[#*_`>\[\]()]', ' ',
+                                 re.sub(r'<[^>]+>', ' ', raw_content)).split())
             expand_prompt = f"""You are expanding a short SEO blog for Lumynor Systems.
 
-Add content to every existing H2 section until each is 200-350 words.
+Add content to every existing {_h2_label} until each is 200-350 words.
 Do NOT delete or shorten any existing content.
 Do NOT invent statistics or company claims.
 Use ONLY facts from the research brief below.
 Keep tone: human, business-focused, developer-friendly.
+{"Return valid Markdown — use ## for H2, ### for H3, > [!TIP] for callouts, [text](url) for links. NO HTML tags." if _md else "Return valid HTML."}
 
 BLOG TITLE: {current.get("title", "")}
 PRIMARY KEYWORD: {primary_kw}
@@ -3066,12 +3093,12 @@ CURRENT WORD COUNT: {wc} (target: 1500+)
 Research Brief:
 {brief_summary or "(no brief — expand using only facts already in the article)"}
 
-Full Blog HTML:
+Full Blog {_fmt_label}:
 {raw_content[:30000]}{"...[truncated — preserve ALL sections including those not shown]" if len(raw_content) > 30000 else ""}
 
 Return ONLY this JSON:
 {{
-  "revised_content": "COMPLETE expanded HTML with all original sections + new content added",
+  "revised_content": "COMPLETE expanded {_fmt_label} with all original sections + new content added",
   "word_count_estimate": 0,
   "sections_expanded": ["section name 1", "section name 2"]
 }}"""
@@ -3079,7 +3106,8 @@ Return ONLY this JSON:
                 result  = _llm(expand_prompt, llm_cfg, json_mode=True, timeout=280, max_tokens=32768)
                 rev     = _parse_json_lenient(result)
                 new_html = (rev.get("revised_content") or "").strip()
-                new_wc   = len(re.sub(r'<[^>]+>', ' ', new_html).split())
+                new_wc   = len(re.sub(r'[#*_`>\[\]()]', ' ',
+                                      re.sub(r'<[^>]+>', ' ', new_html)).split())
                 if new_html and new_wc >= orig_wc * 0.85:
                     current[_ck]        = new_html
                     content_was_changed  = True
@@ -3099,34 +3127,65 @@ Return ONLY this JSON:
         # ── 3b. Surgical intro rewrite ────────────────────────────────────────
         if buckets.get("rewrite_intro"):
             html = current.get(_ck, "")
-            m = re.search(r'(<p[^>]*>)(.*?)(</p>)', html, re.DOTALL | re.I)
-            if m:
-                orig_para = m.group(0)
-                intro_prompt = (
-                    "Rewrite this blog intro paragraph for a B2B SaaS/AI tech blog.\n\n"
-                    "Rules:\n"
-                    "- Do NOT open with: 'In today's', 'The world of', 'With the rise of', "
-                    "'Artificial intelligence is transforming', or any generic preamble.\n"
-                    "- Open with a specific data point, contrarian claim, or concrete scenario "
-                    "a SaaS founder or developer would immediately recognise.\n"
-                    "- Under 100 words. No fluff.\n\n"
-                    f"Primary keyword to include: {primary_kw}\n\n"
-                    f"Paragraph to rewrite:\n{orig_para}\n\n"
-                    'Return ONLY JSON: {"revised": "<p>revised paragraph</p>"}'
-                )
-                try:
-                    r        = _parse_json_lenient(_llm(intro_prompt, llm_cfg,
-                                                        json_mode=True, timeout=60, max_tokens=512))
-                    new_para = (r.get("revised") or "").strip()
-                    if new_para and "<p" in new_para:
-                        current[_ck]        = html.replace(orig_para, new_para, 1)
-                        content_was_changed  = True
-                        notes.append("  ✓ Intro rewritten (surgical)")
-                        actions_taken.append("Intro rewritten")
-                    else:
-                        notes.append("  ⚠ Intro fix returned malformed output, skipped")
-                except Exception as e:
-                    notes.append(f"  ✗ Intro fix failed: {str(e)[:60]}")
+            if _md:
+                # For Markdown: find first prose paragraph (non-heading, non-empty block)
+                _blocks   = [b.strip() for b in html.split("\n\n") if b.strip()]
+                orig_para = next((b for b in _blocks if not b.startswith("#")), None)
+                if orig_para:
+                    intro_prompt = (
+                        "Rewrite this blog intro paragraph for a B2B SaaS/AI tech blog.\n\n"
+                        "Rules:\n"
+                        "- Do NOT open with: 'In today's', 'The world of', 'With the rise of', "
+                        "'Artificial intelligence is transforming', or any generic preamble.\n"
+                        "- Open with a specific data point, contrarian claim, or concrete scenario "
+                        "a SaaS founder or developer would immediately recognise.\n"
+                        "- Under 100 words. No fluff. Return plain text — no HTML tags.\n\n"
+                        f"Primary keyword to include: {primary_kw}\n\n"
+                        f"Paragraph to rewrite:\n{orig_para}\n\n"
+                        'Return ONLY JSON: {"revised": "revised paragraph text"}'
+                    )
+                    try:
+                        r        = _parse_json_lenient(_llm(intro_prompt, llm_cfg,
+                                                            json_mode=True, timeout=60, max_tokens=512))
+                        new_para = re.sub(r'<[^>]+>', '', (r.get("revised") or "")).strip()
+                        if new_para and new_para != orig_para:
+                            current[_ck]        = html.replace(orig_para, new_para, 1)
+                            content_was_changed  = True
+                            notes.append("  ✓ Intro rewritten (surgical, Markdown)")
+                            actions_taken.append("Intro rewritten")
+                        else:
+                            notes.append("  ⚠ Intro fix returned same/empty, skipped")
+                    except Exception as e:
+                        notes.append(f"  ✗ Intro fix failed: {str(e)[:60]}")
+            else:
+                m = re.search(r'(<p[^>]*>)(.*?)(</p>)', html, re.DOTALL | re.I)
+                if m:
+                    orig_para = m.group(0)
+                    intro_prompt = (
+                        "Rewrite this blog intro paragraph for a B2B SaaS/AI tech blog.\n\n"
+                        "Rules:\n"
+                        "- Do NOT open with: 'In today's', 'The world of', 'With the rise of', "
+                        "'Artificial intelligence is transforming', or any generic preamble.\n"
+                        "- Open with a specific data point, contrarian claim, or concrete scenario "
+                        "a SaaS founder or developer would immediately recognise.\n"
+                        "- Under 100 words. No fluff.\n\n"
+                        f"Primary keyword to include: {primary_kw}\n\n"
+                        f"Paragraph to rewrite:\n{orig_para}\n\n"
+                        'Return ONLY JSON: {"revised": "<p>revised paragraph</p>"}'
+                    )
+                    try:
+                        r        = _parse_json_lenient(_llm(intro_prompt, llm_cfg,
+                                                            json_mode=True, timeout=60, max_tokens=512))
+                        new_para = (r.get("revised") or "").strip()
+                        if new_para and "<p" in new_para:
+                            current[_ck]        = html.replace(orig_para, new_para, 1)
+                            content_was_changed  = True
+                            notes.append("  ✓ Intro rewritten (surgical)")
+                            actions_taken.append("Intro rewritten")
+                        else:
+                            notes.append("  ⚠ Intro fix returned malformed output, skipped")
+                    except Exception as e:
+                        notes.append(f"  ✗ Intro fix failed: {str(e)[:60]}")
 
         # ── 3c. Surgical humanize fix ─────────────────────────────────────────
         # Two layers:
@@ -3176,16 +3235,24 @@ Return ONLY this JSON:
 
             # Layer 2: LLM rewrite for robotic transition paragraphs
             html = current.get(_ck, "")
-            para_iter = re.finditer(r'<p[^>]*>.*?</p>', html, re.DOTALL | re.I)
-            bad_paras = [m.group(0) for m in para_iter
-                         if any(t in m.group(0) for t in _BANNED_TRANS)][:8]
+            if _md:
+                bad_paras = [
+                    b.strip() for b in html.split("\n\n")
+                    if b.strip() and not b.strip().startswith("#")
+                    and any(t in b for t in _BANNED_TRANS)
+                ][:8]
+            else:
+                para_iter = re.finditer(r'<p[^>]*>.*?</p>', html, re.DOTALL | re.I)
+                bad_paras = [m.group(0) for m in para_iter
+                             if any(t in m.group(0) for t in _BANNED_TRANS)][:8]
             if bad_paras:
                 humanize_prompt = (
                     "Rewrite each paragraph below to remove robotic AI transitions.\n"
                     "Rules: Remove 'Furthermore,', 'Moreover,', 'Additionally,', "
                     "'It is important to note', 'Consequently,', 'In conclusion,', etc. "
                     "Start sentences with the subject. Keep all facts unchanged. "
-                    "Sound like a developer explaining to a peer.\n\n"
+                    f"Sound like a developer explaining to a peer. "
+                    f"{'Return plain text paragraphs — no HTML tags.' if _md else 'Preserve HTML tags exactly.'}\n\n"
                     "Paragraphs:\n" +
                     "\n---\n".join(f"PARA_{i}:\n{p}" for i, p in enumerate(bad_paras)) +
                     '\n\nReturn ONLY JSON: {"revisions": '
@@ -3199,9 +3266,12 @@ Return ONLY this JSON:
                     for pair in r.get("revisions", []):
                         orig = (pair.get("original") or "").strip()
                         repl = (pair.get("revised") or "").strip()
-                        # Word-count guard: reject if rewrite shrinks paragraph >25%
-                        orig_wc = len(re.sub(r'<[^>]+>', ' ', orig).split())
-                        repl_wc = len(re.sub(r'<[^>]+>', ' ', repl).split())
+                        if _md:
+                            repl = re.sub(r'<[^>]+>', '', repl).strip()
+                        orig_wc = len(re.sub(r'[#*_`>\[\]()]', ' ',
+                                             re.sub(r'<[^>]+>', ' ', orig)).split())
+                        repl_wc = len(re.sub(r'[#*_`>\[\]()]', ' ',
+                                             re.sub(r'<[^>]+>', ' ', repl)).split())
                         if orig and repl and orig in html and repl_wc >= orig_wc * 0.75:
                             html   = html.replace(orig, repl, 1)
                             fixed += 1
@@ -3219,63 +3289,101 @@ Return ONLY this JSON:
         # Only runs when expand_content is NOT active (expansion already adds keyword naturally).
         if buckets.get("fix_keywords") and not buckets.get("expand_content") and primary_kw:
             html      = current.get(_ck, "")
-            html_head = html[:600]  # first ~100 words
+            html_head = html[:600]
             if primary_kw.lower() not in html_head.lower():
-                # Find the first <p> or <h1>/<h2> to inject keyword into
-                m = re.search(r'(?:<h[12][^>]*>.*?</h[12]>|<p[^>]*>.*?</p>)',
-                              html, re.DOTALL | re.I)
-                if m:
-                    target = m.group(0)
-                    kw_prompt = (
-                        f"Naturally add the keyword '{primary_kw}' to this HTML element. "
-                        "Only add it if it reads naturally — do NOT force it. "
-                        "Do NOT change any other content.\n\n"
-                        f"Element:\n{target}\n\n"
-                        'Return ONLY JSON: {"revised": "<element with keyword added>"}'
-                    )
-                    try:
-                        r       = _parse_json_lenient(_llm(kw_prompt, llm_cfg,
-                                                           json_mode=True, timeout=60, max_tokens=512))
-                        new_el  = (r.get("revised") or "").strip()
-                        if new_el and primary_kw.lower() in new_el.lower() and new_el != target:
-                            current[_ck]        = html.replace(target, new_el, 1)
-                            content_was_changed  = True
-                            notes.append(f"  ✓ Keyword '{primary_kw}' injected surgically")
-                            actions_taken.append(f"Keyword injected into first element")
-                        else:
-                            notes.append(f"  ⚠ Keyword injection: model didn't add '{primary_kw}', skipped")
-                    except Exception as e:
-                        notes.append(f"  ✗ Keyword fix failed: {str(e)[:60]}")
+                if _md:
+                    # For Markdown: find first heading or first prose line
+                    _m = re.search(r'^(#{1,2} .+)$', html, re.M)
+                    if not _m:
+                        _m = re.search(r'^([A-Za-z].+)$', html, re.M)
+                    target = _m.group(0) if _m else None
+                    if target:
+                        kw_prompt = (
+                            f"Naturally add the keyword '{primary_kw}' to this Markdown text. "
+                            "Only add if it reads naturally — do NOT force it. "
+                            "Do NOT use HTML tags. Return only the revised line.\n\n"
+                            f"Line:\n{target}\n\n"
+                            'Return ONLY JSON: {"revised": "revised line text"}'
+                        )
+                        try:
+                            r      = _parse_json_lenient(_llm(kw_prompt, llm_cfg,
+                                                              json_mode=True, timeout=60, max_tokens=256))
+                            new_el = re.sub(r'<[^>]+>', '', (r.get("revised") or "")).strip()
+                            if new_el and primary_kw.lower() in new_el.lower() and new_el != target:
+                                current[_ck]        = html.replace(target, new_el, 1)
+                                content_was_changed  = True
+                                notes.append(f"  ✓ Keyword '{primary_kw}' injected surgically (Markdown)")
+                                actions_taken.append("Keyword injected into first element")
+                            else:
+                                notes.append(f"  ⚠ Keyword injection: model didn't add '{primary_kw}', skipped")
+                        except Exception as e:
+                            notes.append(f"  ✗ Keyword fix failed: {str(e)[:60]}")
+                else:
+                    m = re.search(r'(?:<h[12][^>]*>.*?</h[12]>|<p[^>]*>.*?</p>)',
+                                  html, re.DOTALL | re.I)
+                    if m:
+                        target = m.group(0)
+                        kw_prompt = (
+                            f"Naturally add the keyword '{primary_kw}' to this HTML element. "
+                            "Only add it if it reads naturally — do NOT force it. "
+                            "Do NOT change any other content.\n\n"
+                            f"Element:\n{target}\n\n"
+                            'Return ONLY JSON: {"revised": "<element with keyword added>"}'
+                        )
+                        try:
+                            r       = _parse_json_lenient(_llm(kw_prompt, llm_cfg,
+                                                               json_mode=True, timeout=60, max_tokens=512))
+                            new_el  = (r.get("revised") or "").strip()
+                            if new_el and primary_kw.lower() in new_el.lower() and new_el != target:
+                                current[_ck]        = html.replace(target, new_el, 1)
+                                content_was_changed  = True
+                                notes.append(f"  ✓ Keyword '{primary_kw}' injected surgically")
+                                actions_taken.append("Keyword injected into first element")
+                            else:
+                                notes.append(f"  ⚠ Keyword injection: model didn't add '{primary_kw}', skipped")
+                        except Exception as e:
+                            notes.append(f"  ✗ Keyword fix failed: {str(e)[:60]}")
 
         # ── 5. Programmatic internal link injection ───────────────────────────
         if buckets.get("add_internal_links"):
             raw = current.get(_ck, "")
-            int_count = len(re.findall(
-                r'href=["\'](?:https?://(?:www\.)?lumynor\.com|/)[^"\']*["\']', raw, re.I))
-            if int_count < 3 and "</p>" in raw:
-                # Build dynamic links: prefer topically related published blogs,
-                # fall back to the three hardcoded evergreen pages.
+            if _md:
+                int_count = len(re.findall(
+                    r'\]\((?:https?://(?:www\.)?lumynor\.com|/)[^)]*\)', raw, re.I))
+                has_content = bool(re.search(r'^[A-Za-z]', raw, re.M))
+            else:
+                int_count = len(re.findall(
+                    r'href=["\'](?:https?://(?:www\.)?lumynor\.com|/)[^"\']*["\']', raw, re.I))
+                has_content = "</p>" in raw
+            if int_count < 3 and has_content:
                 related = _find_related_blog_links(current, published_blogs or [], n=2) if published_blogs else []
-                if related:
-                    rel_links = " | ".join(
-                        f'<a href="{r["url"]}">{r["anchor"]}</a>' for r in related
-                    )
-                    block = (
-                        f'<p>Want to go deeper? {rel_links} — '
-                        f'or <a href="/contact">talk to the Lumynor team</a> about '
-                        f'building your own agentic product.</p>'
-                    )
+                if _md:
+                    if related:
+                        rel_links = " | ".join(f'[{r["anchor"]}]({r["url"]})' for r in related)
+                        block = (f'\nWant to go deeper? {rel_links} — or '
+                                 f'[talk to the Lumynor team](/contact) about building your own agentic product.\n')
+                    else:
+                        block = ('\nLooking to put these ideas into practice? Explore how '
+                                 '[Agent Forge](/products/agent-forge) helps SaaS teams ship agentic products faster, '
+                                 'or [talk to our team](/contact). More on the [Lumynor AI & SaaS blog](/blog).\n')
+                    current[_ck] = raw.rstrip() + "\n" + block
+                    links_added  = True
                 else:
-                    block = (
-                        '<p>Looking to put these ideas into practice? Explore how '
-                        '<a href="/products/agent-forge">Agent Forge</a> helps SaaS teams '
-                        'ship agentic products faster, or <a href="/contact">talk to our team</a>. '
-                        'More on the <a href="/blog">Lumynor AI &amp; SaaS blog</a>.</p>'
-                    )
-                lp = raw.rfind("</p>")
-                if lp > 0:
-                    current[_ck] = raw[:lp + 4] + "\n" + block + raw[lp + 4:]
-                    links_added = True
+                    if related:
+                        rel_links = " | ".join(f'<a href="{r["url"]}">{r["anchor"]}</a>' for r in related)
+                        block = (f'<p>Want to go deeper? {rel_links} — '
+                                 f'or <a href="/contact">talk to the Lumynor team</a> about '
+                                 f'building your own agentic product.</p>')
+                    else:
+                        block = ('<p>Looking to put these ideas into practice? Explore how '
+                                 '<a href="/products/agent-forge">Agent Forge</a> helps SaaS teams '
+                                 'ship agentic products faster, or <a href="/contact">talk to our team</a>. '
+                                 'More on the <a href="/blog">Lumynor AI &amp; SaaS blog</a>.</p>')
+                    lp = raw.rfind("</p>")
+                    if lp > 0:
+                        current[_ck] = raw[:lp + 4] + "\n" + block + raw[lp + 4:]
+                        links_added  = True
+                if links_added:
                     rel_note = f" (linked to: {', '.join(r['anchor'][:30] for r in related)})" if related else ""
                     notes.append(f"  ✓ Internal links injected ({int_count} → 3+){rel_note}")
                     actions_taken.append("Internal links injected")
@@ -3285,7 +3393,12 @@ Return ONLY this JSON:
         # ── 6. FAQ injection ──────────────────────────────────────────────────
         if buckets.get("add_faq"):
             raw = current.get(_ck, "")
-            if not re.search(r'<h[23][^>]*>[^<]*(FAQ|Frequently Asked)', raw, re.I):
+            _already_has_faq = (
+                bool(re.search(r'^##+ .*(?:FAQ|Frequently Asked)', raw, re.I | re.M))
+                if _md else
+                bool(re.search(r'<h[23][^>]*>[^<]*(FAQ|Frequently Asked)', raw, re.I))
+            )
+            if not _already_has_faq:
                 faq_items = (research_brief or {}).get("faqs", [])
                 if not faq_items:
                     faq_prompt = (
@@ -3303,12 +3416,20 @@ Return ONLY this JSON:
                     except Exception:
                         faq_items = []
                 if faq_items:
-                    faq_html = "<h2>Frequently Asked Questions</h2>"
-                    for it in faq_items[:5]:
-                        q, a = (it.get("question") or "").strip(), (it.get("answer") or "").strip()
-                        if q and a:
-                            faq_html += f"<h3>{q}</h3><p>{a}</p>"
-                    current[_ck] = raw.rstrip() + "\n" + faq_html
+                    if _md:
+                        faq_block = "\n\n## Frequently Asked Questions\n\n"
+                        for it in faq_items[:5]:
+                            q, a = (it.get("question") or "").strip(), (it.get("answer") or "").strip()
+                            if q and a:
+                                faq_block += f"### {q}\n\n{a}\n\n"
+                        current[_ck] = raw.rstrip() + "\n" + faq_block
+                    else:
+                        faq_html = "<h2>Frequently Asked Questions</h2>"
+                        for it in faq_items[:5]:
+                            q, a = (it.get("question") or "").strip(), (it.get("answer") or "").strip()
+                            if q and a:
+                                faq_html += f"<h3>{q}</h3><p>{a}</p>"
+                        current[_ck] = raw.rstrip() + "\n" + faq_html
                     faq_added = True
                     notes.append(f"  ✓ FAQ added ({len(faq_items)} Q&As)")
                     actions_taken.append(f"FAQ added ({len(faq_items)} Q&As)")
@@ -3316,31 +3437,59 @@ Return ONLY this JSON:
         # ── 6b. Conclusion section injection ──────────────────────────────────
         if buckets.get("add_conclusion"):
             raw = current.get(_ck, "")
-            if not re.search(r'<h[23][^>]*>[^<]*(conclusion|key takeaway|summary|wrap)', raw, re.I):
-                concl_prompt = (
-                    f'Write a "Key Takeaways" conclusion section for a blog titled '
-                    f'"{current.get("title", "")}" about '
-                    f'"{primary_kw}".\n'
-                    "Include: 3-4 bullet takeaways and a 1-sentence CTA pointing to Lumynor Systems.\n"
-                    "No invented stats. Factual, human tone.\n"
-                    'JSON only: {"conclusion_html": "<h2>Key Takeaways</h2><ul><li>...</li></ul><p>CTA</p>"}'
-                )
-                try:
-                    r = _parse_json_lenient(_llm(concl_prompt, llm_cfg, json_mode=True,
-                                                 timeout=60, max_tokens=1024))
-                    concl_html = (r.get("conclusion_html") or "").strip()
-                    if concl_html and "<h2" in concl_html:
-                        # Insert before FAQ if present, otherwise append
-                        faq_pos = raw.find("<h2>Frequently Asked")
-                        if faq_pos > 0:
-                            current[_ck] = raw[:faq_pos] + concl_html + "\n" + raw[faq_pos:]
-                        else:
-                            current[_ck] = raw.rstrip() + "\n" + concl_html
-                        content_was_changed = True
-                        notes.append("  ✓ Conclusion / Key Takeaways section added")
-                        actions_taken.append("Conclusion section added")
-                except Exception as e:
-                    notes.append(f"  ✗ Conclusion injection failed: {str(e)[:60]}")
+            _has_conclusion = (
+                bool(re.search(r'^##+ .*(?:conclusion|key takeaway|summary|wrap)', raw, re.I | re.M))
+                if _md else
+                bool(re.search(r'<h[23][^>]*>[^<]*(conclusion|key takeaway|summary|wrap)', raw, re.I))
+            )
+            if not _has_conclusion:
+                if _md:
+                    concl_prompt = (
+                        f'Write a "Key Takeaways" conclusion section for a blog titled '
+                        f'"{current.get("title", "")}" about "{primary_kw}".\n'
+                        "Include: 3-4 bullet takeaways and a 1-sentence CTA pointing to Lumynor Systems.\n"
+                        "No invented stats. Factual, human tone. Return valid Markdown — NO HTML tags.\n"
+                        'JSON only: {"conclusion_md": "## Key Takeaways\\n\\n- point 1\\n- point 2\\n\\nCTA sentence."}'
+                    )
+                    try:
+                        r = _parse_json_lenient(_llm(concl_prompt, llm_cfg, json_mode=True,
+                                                     timeout=60, max_tokens=1024))
+                        concl_md = (r.get("conclusion_md") or "").strip()
+                        if concl_md and "##" in concl_md:
+                            faq_match = re.search(r'^##+ .*(?:FAQ|Frequently Asked)', raw, re.I | re.M)
+                            if faq_match:
+                                current[_ck] = raw[:faq_match.start()] + concl_md + "\n\n" + raw[faq_match.start():]
+                            else:
+                                current[_ck] = raw.rstrip() + "\n\n" + concl_md
+                            content_was_changed = True
+                            notes.append("  ✓ Conclusion / Key Takeaways section added (Markdown)")
+                            actions_taken.append("Conclusion section added")
+                    except Exception as e:
+                        notes.append(f"  ✗ Conclusion injection failed: {str(e)[:60]}")
+                else:
+                    concl_prompt = (
+                        f'Write a "Key Takeaways" conclusion section for a blog titled '
+                        f'"{current.get("title", "")}" about '
+                        f'"{primary_kw}".\n'
+                        "Include: 3-4 bullet takeaways and a 1-sentence CTA pointing to Lumynor Systems.\n"
+                        "No invented stats. Factual, human tone.\n"
+                        'JSON only: {"conclusion_html": "<h2>Key Takeaways</h2><ul><li>...</li></ul><p>CTA</p>"}'
+                    )
+                    try:
+                        r = _parse_json_lenient(_llm(concl_prompt, llm_cfg, json_mode=True,
+                                                     timeout=60, max_tokens=1024))
+                        concl_html = (r.get("conclusion_html") or "").strip()
+                        if concl_html and "<h2" in concl_html:
+                            faq_pos = raw.find("<h2>Frequently Asked")
+                            if faq_pos > 0:
+                                current[_ck] = raw[:faq_pos] + concl_html + "\n" + raw[faq_pos:]
+                            else:
+                                current[_ck] = raw.rstrip() + "\n" + concl_html
+                            content_was_changed = True
+                            notes.append("  ✓ Conclusion / Key Takeaways section added")
+                            actions_taken.append("Conclusion section added")
+                    except Exception as e:
+                        notes.append(f"  ✗ Conclusion injection failed: {str(e)[:60]}")
 
         # ── 6c. Secondary keyword injection ───────────────────────────────────
         if buckets.get("fix_secondary_kw"):
@@ -3391,17 +3540,7 @@ Return ONLY this JSON:
                 notes.append(f"  ✗ Title/meta fix failed: {str(e)[:60]}")
 
         # ── 8. Re-audit + structured diff ────────────────────────────────────
-        audit_input = {
-            "title":              current.get("title", ""),
-            "meta_description":   current.get("meta_description") or current.get("summary", ""),
-            "content_html":       current.get(_ck, ""),
-            "primary_keyword":    current.get("primary_keyword") or current.get("primaryKeyword", ""),
-            "secondary_keywords": current.get("secondary_keywords") or current.get("secondaryKeywords", ""),
-            "coverImage":         current.get("coverImage", ""),
-            "references":         current.get("references", []),
-            "research_brief":     {"_present": True} if research_brief else {},
-        }
-        audit       = validate_seo(audit_input)
+        audit = validate_seo(current)
         score_after = audit["score"]
         score_progression.append(score_after)
 
@@ -3453,6 +3592,10 @@ Return ONLY this JSON:
     final_blog = dict(current)
     if _ck == "content_html":
         final_blog["content"] = final_blog.get("content_html", "")
+    elif _ck == "content_markdown":
+        # Revision changed content_markdown → any previously formatted HTML is stale
+        final_blog["content_html"] = ""
+        final_blog["content"]      = ""
 
     return {
         "revised_blog":           final_blog,
@@ -3622,7 +3765,8 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
                     quality_hints=_wc_hint,
                     research_brief=research_brief,
                 )
-                _wc = len(re.sub('<[^>]+>', '', _draft.get("content_html", "")).split())
+                _raw = _draft.get("content_markdown") or _draft.get("content_html", "")
+                _wc = len(re.sub(r'[#*_`>\[\]()]', ' ', re.sub(r'<[^>]+>', ' ', _raw)).split())
                 blog_content = _draft
                 if _wc >= _min_words or _attempt == 3:
                     log.append(f"📝 Blog written: {_wc} words" + (f" (attempt {_attempt})" if _attempt > 1 else ""))

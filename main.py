@@ -2102,6 +2102,8 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
         print(f"[auto_generate] HTML formatting complete — content length: {len(blog_object.get('content', ''))}")
     except Exception as e:
         print(f"[auto_generate] HTML formatting failed: {e}")
+        if blog_object.get("content_markdown") and not blog_object.get("content"):
+            blog_object["content"] = blog_object["content_markdown"]
 
     # ── Publish gate: SEO ≥ 90, credibility ≥ 75, plagiarism ≥ 75, real cover image ──
     final_score    = blog_object.get("seoScore") or 0
@@ -2322,6 +2324,8 @@ async def generate_and_post_auto_blog_v2(settings: dict):
             )
         except Exception as _fe:
             print(f"[auto_blogger] HTML formatting failed: {_fe}")
+            if blog_object.get("content_markdown") and not blog_object.get("content"):
+                blog_object["content"] = blog_object["content_markdown"]
 
         seo_ok = score >= min_score
 
@@ -2477,9 +2481,18 @@ async def revise_blog_credibility_endpoint(blog_id: str):
 
     revised_blog = result["revised_blog"]
     new_score    = result["new_credibility_score"]
-    _ck = "content_markdown" if revised_blog.get("content_markdown") else "content"
-    patch = {_ck: revised_blog.get(_ck, ""), "credibilityScore": new_score}
-    db.patch_blog(blog_id, patch)
+    _rck = ("content_markdown" if revised_blog.get("content_markdown")
+            else "content_html" if revised_blog.get("content_html")
+            else "content")
+    new_content = revised_blog.get(_rck, "")
+    if new_content:
+        patch = {_rck: new_content, "credibilityScore": new_score}
+        if _rck == "content_markdown":
+            patch["content_html"] = ""
+            patch["content"] = ""
+        db.patch_blog(blog_id, patch)
+    else:
+        db.patch_blog(blog_id, {"credibilityScore": new_score})
 
     return {
         "initial_score":         initial_score,
@@ -2521,9 +2534,18 @@ async def revise_blog_plagiarism_endpoint(blog_id: str):
 
     revised_blog = result["revised_blog"]
     new_score    = result["new_plagiarism_score"]
-    _ck = "content_markdown" if revised_blog.get("content_markdown") else "content"
-    patch = {_ck: revised_blog.get(_ck, ""), "plagiarismScore": new_score}
-    db.patch_blog(blog_id, patch)
+    _rck = ("content_markdown" if revised_blog.get("content_markdown")
+            else "content_html" if revised_blog.get("content_html")
+            else "content")
+    new_content = revised_blog.get(_rck, "")
+    if new_content:
+        patch = {_rck: new_content, "plagiarismScore": new_score}
+        if _rck == "content_markdown":
+            patch["content_html"] = ""
+            patch["content"] = ""
+        db.patch_blog(blog_id, patch)
+    else:
+        db.patch_blog(blog_id, {"plagiarismScore": new_score})
 
     return {
         "initial_score":        initial_score,
@@ -2588,16 +2610,7 @@ async def revise_saved_blog(blog_id: str):
                             detail="No LLM key configured. Set GEMINI_API_KEY or OLLAMA_API_KEY.")
 
     # Run initial audit on the stored blog
-    initial_audit = validate_seo({
-        "title":              blog.get("title", ""),
-        "meta_description":   blog.get("metaDescription") or blog.get("summary", ""),
-        "content_html":       blog.get("content", ""),
-        "primary_keyword":    blog.get("primaryKeyword", ""),
-        "secondary_keywords": blog.get("secondaryKeywords", ""),
-        "coverImage":         blog.get("coverImage", ""),
-        "references":         blog.get("references", []),
-        "research_brief":     {"_present": True} if blog.get("researchBrief") else {},
-    })
+    initial_audit = validate_seo(blog)
 
     # Reconstruct a compact research brief from what was stored with the blog
     stored_rb = blog.get("researchBrief") or {}
@@ -2628,11 +2641,24 @@ async def revise_saved_blog(blog_id: str):
 
     # Persist the revised blog back to Supabase
     cover = blog.get("coverImage", "")
+    _rev_ck = ("content_markdown" if revised.get("content_markdown")
+               else "content_html" if revised.get("content_html")
+               else "content")
+    _content_patch: dict = {}
+    if _rev_ck == "content_markdown":
+        _content_patch = {
+            "content_markdown": revised.get("content_markdown", ""),
+            "content_html": "",
+            "content": "",
+        }
+    elif _rev_ck == "content_html":
+        _content_patch = {"content_html": revised.get("content_html", "")}
+    else:
+        _content_patch = {"content": revised.get("content", blog.get("content", ""))}
     db.update_blog(blog["id"], {
         **blog,
         "title":           revised.get("title", blog["title"]),
         "slug":            revised.get("slug", blog.get("slug", "")),
-        "content":         revised.get("content", blog.get("content", "")),
         "summary":         revised.get("summary", blog.get("summary", "")),
         "metaDescription": revised.get("meta_description", blog.get("metaDescription", "")),
         "references":      revised.get("references", blog.get("references", [])),
@@ -2644,6 +2670,7 @@ async def revise_saved_blog(blog_id: str):
         ),
         "revised_at":      datetime.utcnow().isoformat(),
         "revision_log":    result["revision_notes"],
+        **_content_patch,
     })
 
     return {
