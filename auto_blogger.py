@@ -2451,16 +2451,23 @@ def revise_blog_credibility(blog: dict, cred_report: dict, llm_cfg, max_loops: i
     current = dict(blog)
     score_progression = [cred_report.get("score", 0)]
 
+    # Hard fails that require real URL insertion — the LLM cannot fix these without fabricating sources.
+    _UNFIXABLE_FAIL_KEYWORDS = ("no credible sources", "no multi-source", "sources missing")
+
     for loop in range(1, max_loops + 1):
         score_before = cred_report.get("score", 0)
         notes.append(f"\n── Credibility Loop {loop}/{max_loops} (score: {score_before}/100) ──")
 
         hard_fails = cred_report.get("hard_fail_reasons", [])
-        if hard_fails:
-            notes.append(f"  ✗ Hard fail — stopping: {hard_fails}")
+        unfixable  = [hf for hf in hard_fails
+                      if any(kw in hf.lower() for kw in _UNFIXABLE_FAIL_KEYWORDS)]
+        if unfixable:
+            notes.append(f"  ✗ Source hard fail — cannot fix without real URLs: {unfixable}")
             break
+        # Fixable hard fails (overconfident claims, repetition, unsupported stats) fall through
+        # to the rewrite pass below — do NOT stop here.
 
-        issues_text = " | ".join(cred_report.get("issues", []))
+        issues_text = " | ".join(cred_report.get("issues", []) + hard_fails)
         repeated    = cred_report.get("repeated_sentences", [])
         content     = current.get(_ck, "")
 
@@ -2472,22 +2479,25 @@ def revise_blog_credibility(blog: dict, cred_report: dict, llm_cfg, max_loops: i
                 f"rewrite all duplicate occurrences with fresh phrasing: "
                 + " | ".join(f'"{s[:80]}"' for s in repeated[:6])
             )
-        if any("statistic" in i.lower() or "unsupported" in i.lower() for i in cred_report.get("issues", [])):
+        if any("statistic" in i.lower() or "unsupported" in i.lower()
+               for i in cred_report.get("issues", []) + hard_fails):
             fixes_needed.append(
                 "UNSUPPORTED STATISTICS: Add 'according to [source]' or 'as reported by [publication]' "
                 "before each numeric statistic, or soften to 'estimates suggest roughly X'."
             )
-        if any("overconfident" in i.lower() or "definitive" in i.lower() for i in cred_report.get("issues", [])):
+        if any("overconfident" in i.lower() or "definitive" in i.lower()
+               for i in cred_report.get("issues", []) + hard_fails):
             fixes_needed.append(
                 "OVERCONFIDENT CLAIMS: Replace absolutist language ('definitely', 'certainly', "
                 "'100%', 'it is proven') with 'research suggests', 'evidence indicates', 'may', 'likely'."
             )
-        if any("unattributed" in i.lower() or "'experts say'" in i.lower() for i in cred_report.get("issues", [])):
+        if any("unattributed" in i.lower() or "experts say" in i.lower()
+               for i in cred_report.get("issues", []) + hard_fails):
             fixes_needed.append(
                 "UNATTRIBUTED QUOTES / 'EXPERTS SAY': Either name the expert + link the source, "
                 "or rephrase as 'industry observers note' without a fake quote."
             )
-        if any("structural" in i.lower() for i in cred_report.get("issues", [])):
+        if any("structural" in i.lower() for i in cred_report.get("issues", []) + hard_fails):
             fixes_needed.append(
                 "REPEATED STRUCTURAL PHRASES: Vary section-closing sentences — "
                 "don't end every paragraph the same way."
