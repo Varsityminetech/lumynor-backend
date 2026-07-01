@@ -2494,10 +2494,25 @@ async def revise_blog_credibility_endpoint(blog_id: str):
             else "content")
     new_content = revised_blog.get(_rck, "")
     if new_content:
-        patch = {_rck: new_content, "credibilityScore": new_score}
         if _rck == "content_markdown":
-            patch["content_html"] = ""
-            patch["content"] = ""
+            # Re-render Markdown → HTML so the published body is never blank
+            try:
+                _pub_blogs_cred = [b for b in db.get_published_blogs() if b.get("id") != blog_id]
+                revised_blog = await loop.run_in_executor(
+                    None, format_blog_html, revised_blog, None, _pub_blogs_cred
+                )
+            except Exception as _fe:
+                print(f"[revise-credibility] HTML formatting failed: {_fe}")
+                if not revised_blog.get("content"):
+                    revised_blog["content"] = revised_blog["content_markdown"]
+            patch = {
+                "content_markdown": revised_blog.get("content_markdown", ""),
+                "content_html":     revised_blog.get("content_html", ""),
+                "content":          revised_blog.get("content", ""),
+                "credibilityScore": new_score,
+            }
+        else:
+            patch = {_rck: new_content, "credibilityScore": new_score}
         db.patch_blog(blog_id, patch)
     else:
         db.patch_blog(blog_id, {"credibilityScore": new_score})
@@ -2550,10 +2565,25 @@ async def revise_blog_plagiarism_endpoint(blog_id: str):
             else "content")
     new_content = revised_blog.get(_rck, "")
     if new_content:
-        patch = {_rck: new_content, "plagiarismScore": new_score}
         if _rck == "content_markdown":
-            patch["content_html"] = ""
-            patch["content"] = ""
+            # Re-render Markdown → HTML so the published body is never blank
+            try:
+                _pub_blogs_plag = [b for b in db.get_published_blogs() if b.get("id") != blog_id]
+                revised_blog = await loop.run_in_executor(
+                    None, format_blog_html, revised_blog, None, _pub_blogs_plag
+                )
+            except Exception as _fe:
+                print(f"[revise-plagiarism] HTML formatting failed: {_fe}")
+                if not revised_blog.get("content"):
+                    revised_blog["content"] = revised_blog["content_markdown"]
+            patch = {
+                "content_markdown": revised_blog.get("content_markdown", ""),
+                "content_html":     revised_blog.get("content_html", ""),
+                "content":          revised_blog.get("content", ""),
+                "plagiarismScore":  new_score,
+            }
+        else:
+            patch = {_rck: new_content, "plagiarismScore": new_score}
         db.patch_blog(blog_id, patch)
     else:
         db.patch_blog(blog_id, {"plagiarismScore": new_score})
