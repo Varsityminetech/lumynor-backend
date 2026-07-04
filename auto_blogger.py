@@ -2255,6 +2255,24 @@ def validate_credibility(blog: dict) -> dict:
     }
 
 
+def _consecutive_word_overlap(sentence: str, snippet: str) -> int:
+    """Longest run of consecutive sentence words found verbatim in the snippet.
+    Verbatim copies share long runs; paraphrases share topic words but not order,
+    so this stays low for genuine rewrites (unlike bag-of-words overlap)."""
+    def norm(t):
+        return re.sub(r'[^a-z0-9 ]', '', t.lower()).split()
+    s_words  = norm(sentence)
+    snip_str = " " + " ".join(norm(snippet)) + " "
+    best = 0
+    for i in range(len(s_words)):
+        for j in range(i + best + 1, len(s_words) + 1):
+            if f" {' '.join(s_words[i:j])} " in snip_str:
+                best = max(best, j - i)
+            else:
+                break
+    return best
+
+
 def check_plagiarism(content: str, tavily_key: str = "") -> dict:
     """
     Sample distinctive sentences from the visible blog text and search for them
@@ -2319,19 +2337,18 @@ def check_plagiarism(content: str, tavily_key: str = "") -> dict:
             # Skip our own site and empty hits
             if "lumynor" in url:
                 continue
-            # Check if the result content actually contains the sentence verbatim
+            # Check if the result content actually contains the sentence verbatim.
+            # Consecutive-word runs, NOT bag-of-words: paraphrases keep the same
+            # topic words (so set-overlap stays high forever and rewrites can never
+            # pass), but only verbatim copies share 6+ words in a row.
             snippet = (r.get("content") or r.get("snippet") or "").lower()
-            # Require at least 60% of the sentence words to appear in the snippet
-            # (exact match is unreliable due to encoding; word-overlap is more robust)
-            sentence_words = set(re.sub(r'[^a-z0-9 ]', '', sentence.lower()).split())
-            snippet_words  = set(re.sub(r'[^a-z0-9 ]', '', snippet).split())
-            significant    = {w for w in sentence_words if len(w) > 4}
-            if significant and len(significant & snippet_words) / len(significant) >= 0.6:
+            run = _consecutive_word_overlap(sentence, snippet)
+            if run >= 6:
                 flagged.append({
                     "sentence":     sentence[:120],
                     "found_at":     r.get("url", ""),
                     "source_title": title[:80],
-                    "overlap_pct":  round(len(significant & snippet_words) / len(significant) * 100),
+                    "matched_run":  run,
                 })
                 break  # One confirmed hit per sentence is enough
 

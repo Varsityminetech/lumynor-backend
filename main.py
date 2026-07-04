@@ -2544,7 +2544,8 @@ async def revise_blog_plagiarism_endpoint(blog_id: str):
     llm_cfg    = _build_llm_cfg(_plag_settings, _plag_gemini)
     loop       = asyncio.get_event_loop()
 
-    _plag_content = blog.get("content_markdown", blog.get("content", ""))
+    _plag_content = (blog.get("content_markdown") or blog.get("content_html")
+                     or blog.get("content") or "")
     plag_report = await loop.run_in_executor(None, check_plagiarism, _plag_content, tavily_key)
     initial_score = plag_report["score"]
 
