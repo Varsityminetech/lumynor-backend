@@ -51,16 +51,23 @@ def _get(url: str, timeout: int = 10) -> int:
         return 0
 
 
-def _google_token() -> str | None:
-    """Generate a short-lived OAuth2 token from the service account credentials."""
+def _google_token() -> tuple:
+    """Generate a short-lived OAuth2 token from the service account credentials.
+    Returns (token, error_message) — error_message is None on success. The specific
+    failure reason (bad JSON, malformed PEM key, OAuth rejection body, etc.) is
+    returned instead of swallowed, so it's visible in the indexer status UI instead
+    of only in Railway logs."""
     if not GOOGLE_CREDS:
-        return None
+        return None, "GOOGLE_CREDENTIALS_JSON not set"
     try:
-        import base64, hmac, hashlib, time
+        import base64, time
         creds = json.loads(GOOGLE_CREDS)
         private_key_pem = creds["private_key"]
         client_email    = creds["client_email"]
+    except Exception as e:
+        return None, f"Invalid GOOGLE_CREDENTIALS_JSON: {e}"
 
+    try:
         now = int(time.time())
         header  = base64.urlsafe_b64encode(json.dumps({"alg":"RS256","typ":"JWT"}).encode()).rstrip(b"=").decode()
         payload = base64.urlsafe_b64encode(json.dumps({
@@ -84,21 +91,28 @@ def _google_token() -> str | None:
         ).rstrip(b"=").decode()
 
         jwt_token = f"{header}.{payload}.{signature}"
+    except Exception as e:
+        return None, f"Could not sign JWT (check private_key format): {e}"
 
-        # Exchange JWT for access token
-        data = urllib.parse.urlencode({
-            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-            "assertion":  jwt_token,
-        }).encode()
-        req = urllib.request.Request(
-            "https://oauth2.googleapis.com/token", data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST"
-        )
+    # Exchange JWT for access token
+    data = urllib.parse.urlencode({
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "assertion":  jwt_token,
+    }).encode()
+    req = urllib.request.Request(
+        "https://oauth2.googleapis.com/token", data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST"
+    )
+    try:
         with urllib.request.urlopen(req, timeout=15) as r:
-            return json.loads(r.read())["access_token"]
+            return json.loads(r.read())["access_token"], None
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:300]
+        print(f"[indexer] Google OAuth token exchange failed: {e.code} {body}")
+        return None, f"OAuth token exchange failed ({e.code}): {body}"
     except Exception as e:
         print(f"[indexer] Google token error: {e}")
-        return None
+        return None, str(e)[:300]
 
 
 # ── Platform submissions ───────────────────────────────────────────────────────
@@ -121,9 +135,9 @@ def submit_google(url: str) -> dict:
     """Submit a URL to Google's Indexing API."""
     if not GOOGLE_CREDS:
         return {"status": "skipped", "reason": "GOOGLE_CREDENTIALS_JSON not set"}
-    token = _google_token()
+    token, token_err = _google_token()
     if not token:
-        return {"status": "error", "reason": "Could not obtain Google access token"}
+        return {"status": "error", "reason": token_err or "Could not obtain Google access token"}
     data = json.dumps({"url": url, "type": "URL_UPDATED"}).encode()
     req  = urllib.request.Request(
         "https://indexing.googleapis.com/v3/urlNotifications:publish",
@@ -135,9 +149,14 @@ def submit_google(url: str) -> dict:
         with urllib.request.urlopen(req, timeout=15) as r:
             return {"status": "ok", "http": r.status}
     except urllib.error.HTTPError as e:
-        return {"status": "error", "http": e.code}
+        # Google's error body names the real cause (e.g. "does not have permission" when
+        # the service account isn't added as an Owner in Search Console) — surface it
+        # instead of just the numeric code.
+        body = e.read().decode(errors="replace")[:300]
+        print(f"[indexer] Google Indexing API rejected {url}: {e.code} {body}")
+        return {"status": "error", "http": e.code, "reason": body}
     except Exception as e:
-        return {"status": "error", "reason": str(e)}
+        return {"status": "error", "reason": str(e)[:300]}
 
 
 def ping_sitemaps() -> dict:
@@ -151,11 +170,12 @@ def ping_sitemaps() -> dict:
 
 
 def ping_pingler(url: str, title: str = "") -> dict:
-    """Submit to Pingler — reaches 50+ blog directories."""
-    encoded_url   = urllib.parse.quote(url, safe="")
-    encoded_title = urllib.parse.quote(title or url, safe="")
-    code = _get(f"https://pingler.com/ping/api/?url={encoded_url}&title={encoded_title}&mem=1")
-    return {"status": "ok" if code in (200, 201) else "error", "http": code}
+    """Pingler discontinued its free public ping API — pingler.com/ping/api/ and even
+    pingler.com/api.html (their own linked docs page) now return 404. Confirmed by
+    direct test; their site has moved to a paid membership model with no documented
+    public endpoint. Rather than attempt a call that fails 100% of the time and shows
+    a misleading permanent "error", report honestly that this platform is disabled."""
+    return {"status": "skipped", "reason": "Pingler discontinued its free public ping API"}
 
 
 def ping_pingomatic(url: str, title: str = "") -> dict:
