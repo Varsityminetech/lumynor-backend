@@ -618,6 +618,11 @@ def lumy_history(limit: int = 50, _admin: dict = Depends(_require_admin)):
     """Persistent Lumy conversation history across WhatsApp + dashboard."""
     return db.get_lumy_history(limit=limit)
 
+@app.get("/api/lumy/reminders")
+def lumy_reminders(_admin: dict = Depends(_require_admin)):
+    """Pending reminders, soonest first."""
+    return db.get_pending_lumy_reminders()
+
 @app.get("/api/atlas/settings")
 def atlas_settings_get(_admin: dict = Depends(_require_admin)):
     stored = db.get_settings("atlas")
@@ -2897,6 +2902,7 @@ async def startup_event():
     asyncio.create_task(weekly_intel_daemon())
     asyncio.create_task(digest_daemon())
     asyncio.create_task(atlas_proactive_daemon())
+    asyncio.create_task(lumy_reminder_daemon())
 
 
 async def digest_daemon():
@@ -3227,6 +3233,71 @@ def _remove_affiliate_tool(params: dict) -> dict:
     return {"status": "removed", "count": len(matched), "keywords": [l["keyword"] for l in matched]}
 
 
+def _ist(dt_iso: str) -> str:
+    """Format a stored UTC ISO timestamp as a readable IST string."""
+    try:
+        dt = datetime.fromisoformat(dt_iso.replace("Z", "+00:00"))
+        ist = dt + timedelta(hours=5, minutes=30)
+        return ist.strftime("%a %d %b, %I:%M %p IST")
+    except Exception:
+        return dt_iso
+
+
+def _set_reminder_tool(params: dict) -> dict:
+    text   = (params.get("text") or "").strip()
+    due_at = (params.get("due_at") or "").strip()
+    if not text or not due_at:
+        return {"error": "Both text and due_at are required."}
+    try:
+        due = datetime.fromisoformat(due_at.replace("Z", "+00:00"))
+    except Exception:
+        return {"error": f"Could not parse time '{due_at}'."}
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=timezone.utc)
+    if due < datetime.now(timezone.utc):
+        return {"error": "That time is already in the past, jaan — give me a future time."}
+    row = db.create_lumy_reminder(text, due.isoformat())
+    return {"status": "set", "title": f"{text} — {_ist(row['due_at'])}"}
+
+
+def _list_reminders_tool(_params: dict) -> dict:
+    pending = db.get_pending_lumy_reminders()
+    if not pending:
+        return {"status": "empty", "title": "koi pending reminder nahi hai"}
+    lines = [f"{i+1}. {r['text']} — {_ist(r['due_at'])}" for i, r in enumerate(pending[:10])]
+    return {"status": "listed", "count": len(pending), "title": "; ".join(lines)}
+
+
+def _cancel_reminder_tool(params: dict) -> dict:
+    phrase = (params.get("text_contains") or "").strip()
+    if not phrase:
+        return {"error": "Tell me which reminder to cancel (a phrase from it)."}
+    cancelled = db.cancel_lumy_reminders_matching(phrase)
+    if not cancelled:
+        return {"error": f"No pending reminder matching '{phrase}'."}
+    return {"status": "cancelled", "count": len(cancelled),
+            "title": "; ".join(r["text"] for r in cancelled)}
+
+
+async def lumy_reminder_daemon():
+    """Deliver due reminders to WhatsApp. Checks every 60s; unsent+overdue rows are
+    picked up on the next tick after any restart, so nothing is silently lost."""
+    import asyncio as _aio
+    await _aio.sleep(60)
+    while True:
+        try:
+            for r in db.get_due_lumy_reminders():
+                result = ab.send_atlas_message(f"⏰ Reminder, jaan: {r['text']}\n— Lumy ❤️")
+                if result.get("ok"):
+                    db.mark_lumy_reminder_sent(r["id"])
+                    print(f"[reminders] delivered: {r['text'][:60]}")
+                else:
+                    print(f"[reminders] send failed (will retry next tick): {result.get('error')}")
+        except Exception as e:
+            print(f"[reminders] daemon error: {e}")
+        await _aio.sleep(60)
+
+
 ab.register_tools({
     "design_audit": {
         "label": "Design Audit",
@@ -3295,6 +3366,24 @@ ab.register_tools({
         "label": "Remove Affiliate Link",
         "description": "Remove an affiliate link by keyword. Params: keyword.",
         "fn": _remove_affiliate_tool,
+        "high_impact": False,
+    },
+    "set_reminder": {
+        "label": "Set Reminder",
+        "description": "Set a reminder that Lumy delivers to WhatsApp at the given time. Params: text, due_at (ISO 8601 UTC).",
+        "fn": _set_reminder_tool,
+        "high_impact": False,
+    },
+    "list_reminders": {
+        "label": "List Reminders",
+        "description": "Show all pending reminders with their delivery times.",
+        "fn": _list_reminders_tool,
+        "high_impact": False,
+    },
+    "cancel_reminder": {
+        "label": "Cancel Reminder",
+        "description": "Cancel a pending reminder. Params: text_contains (a phrase from the reminder).",
+        "fn": _cancel_reminder_tool,
         "high_impact": False,
     },
 })

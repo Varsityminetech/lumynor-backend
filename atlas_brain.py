@@ -563,8 +563,13 @@ def _classify_intent(question: str) -> dict:
         return {"tool": None, "params": {}}
 
     tools_desc = "\n".join(f"- {name}: {spec['label']} — {spec['description']}" for name, spec in _TOOLS.items())
+    _now_utc = datetime.now(timezone.utc)
+    _now_ist = _now_utc + timedelta(hours=5, minutes=30)
     prompt = f"""The founder just sent this message to Lumy, the Lumynor Systems AI.
 Decide if they're asking her to RUN one of these backend actions, or just chatting/asking a question.
+
+CURRENT TIME: {_now_utc.strftime('%Y-%m-%d %H:%M')} UTC = {_now_ist.strftime('%Y-%m-%d %H:%M')} IST ({_now_ist.strftime('%A')})
+The founder is in India (IST, UTC+5:30). Times he mentions are IST unless stated otherwise.
 
 AVAILABLE ACTIONS:
 {tools_desc}
@@ -582,6 +587,9 @@ Param extraction rules:
 - add_affiliate: extract keyword and URL → {{"keyword": "...", "url": "..."}}
 - remove_affiliate: extract keyword → {{"keyword": "..."}}
 - list_blogs: no params needed → {{}}
+- set_reminder: extract what + when → {{"text": "what to remind", "due_at": "ISO 8601 UTC datetime e.g. 2026-07-03T11:30:00+00:00"}}. Convert the IST time he means to UTC (IST minus 5:30). "tomorrow" = next calendar day IST. If he gives no time of day, use 09:00 IST.
+- list_reminders: no params → {{}}
+- cancel_reminder: extract which one → {{"text_contains": "phrase from the reminder"}}
 Be conservative — only pick a tool if the founder clearly wants an action run, not just discussed."""
 
     try:

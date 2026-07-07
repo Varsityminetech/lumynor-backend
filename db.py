@@ -369,6 +369,57 @@ def get_lumy_notes(limit: int = 10) -> list:
     return res.data or []
 
 
+# ── Lumy Reminders ────────────────────────────────────────────────────────────
+
+def create_lumy_reminder(text: str, due_at: str) -> dict:
+    sb = _sb()
+    if not sb:
+        raise RuntimeError("Supabase not configured")
+    row = {"id": str(uuid.uuid4()), "text": (text or "").strip()[:500], "due_at": due_at, "sent": False}
+    sb.table("lumy_reminders").insert(row).execute()
+    return row
+
+
+def get_due_lumy_reminders() -> list:
+    """Unsent reminders whose due time has passed (daemon catch-up is inherent)."""
+    sb = _sb()
+    if not sb:
+        return []
+    now = datetime.utcnow().isoformat() + "+00:00"
+    res = (sb.table("lumy_reminders").select("*")
+             .eq("sent", False).lte("due_at", now)
+             .order("due_at").limit(20).execute())
+    return res.data or []
+
+
+def get_pending_lumy_reminders() -> list:
+    sb = _sb()
+    if not sb:
+        return []
+    res = (sb.table("lumy_reminders").select("*")
+             .eq("sent", False).order("due_at").limit(50).execute())
+    return res.data or []
+
+
+def mark_lumy_reminder_sent(reminder_id: str) -> None:
+    sb = _sb()
+    if not sb:
+        return
+    sb.table("lumy_reminders").update({"sent": True}).eq("id", reminder_id).execute()
+
+
+def cancel_lumy_reminders_matching(text_contains: str) -> list:
+    """Delete pending reminders whose text contains the given phrase; returns what was cancelled."""
+    matched = [r for r in get_pending_lumy_reminders()
+               if (text_contains or "").lower() in (r.get("text") or "").lower()]
+    sb = _sb()
+    if not sb:
+        return []
+    for r in matched:
+        sb.table("lumy_reminders").delete().eq("id", r["id"]).execute()
+    return matched
+
+
 # ── User Profiles ─────────────────────────────────────────────────────────────
 
 def get_user_profile(user_id: str) -> dict | None:
