@@ -615,6 +615,9 @@ def atlas_settings_get(_admin: dict = Depends(_require_admin)):
         "proactive_enabled":    stored.get("proactive_enabled", True),
         "proactive_hour_utc":   stored.get("proactive_hour_utc", 14),
         "proactive_minute":     stored.get("proactive_minute", 30),
+        "last_proactive_at":    stored.get("last_proactive_at", ""),
+        "last_proactive_ok":    stored.get("last_proactive_ok"),
+        "last_proactive_error": stored.get("last_proactive_error", ""),
     }
 
 @app.post("/api/atlas/settings")
@@ -686,6 +689,9 @@ def get_digest_settings(_admin: dict = Depends(_require_admin)):
         "digestTo":         stored.get("digestTo", ""),
         "send_hour_utc":    stored.get("send_hour_utc", 2),
         "send_minute":      stored.get("send_minute", 30),
+        "last_digest_at":    stored.get("last_digest_at", ""),
+        "last_digest_ok":    stored.get("last_digest_ok"),
+        "last_digest_error": stored.get("last_digest_error", ""),
     }
 
 
@@ -2908,7 +2914,17 @@ async def digest_daemon():
                 print(f"[digest] Auto-sending morning digest for {today} (curr={curr}, sched={sched})")
                 from digest import send_digest
                 result = send_digest()
-                last_sent_date = today
+                ok = bool(result.get("ok"))
+                db.save_settings({**stored,
+                    "last_digest_at":    now.isoformat(),
+                    "last_digest_ok":    ok,
+                    "last_digest_error": "" if ok else str(result.get("error", "Unknown error"))[:300],
+                }, "digest")
+                # Only mark the day as handled on success — a failed send (e.g. Twilio
+                # WhatsApp session window expired) should retry on the next tick within
+                # this 15-min catch-up window instead of being silently skipped for the day.
+                if ok:
+                    last_sent_date = today
                 print(f"[digest] Result: {result}")
         except Exception as e:
             print(f"[digest] daemon error: {e}")
@@ -2938,7 +2954,17 @@ async def atlas_proactive_daemon():
             if enabled and sched <= curr < sched + 15 and last_sent_date != today and to_number:
                 print(f"[atlas] Sending evening proactive message for {today} (curr={curr}, sched={sched})")
                 result = ab.run_proactive_check()
-                last_sent_date = today
+                ok = bool(result.get("ok"))
+                db.save_settings({**stored,
+                    "last_proactive_at":    now.isoformat(),
+                    "last_proactive_ok":    ok,
+                    "last_proactive_error": "" if ok else str(result.get("error", "Unknown error"))[:300],
+                }, "atlas")
+                # Only mark the day as handled on success — a failed send (e.g. Twilio
+                # WhatsApp session window expired, sandbox not joined) should retry on
+                # the next tick within this 15-min window instead of going silent for the day.
+                if ok:
+                    last_sent_date = today
                 print(f"[atlas] Result: {result.get('ok')} | type={result.get('situation', {}).get('msg_type')}")
         except Exception as e:
             print(f"[atlas] daemon error: {e}")
