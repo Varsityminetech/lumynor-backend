@@ -1,9 +1,9 @@
 """
 ATLAS Brain — Proactive intelligence layer for Lumynor.
 Analyses the founder's daily activity, detects patterns, and sends
-personality-driven WhatsApp messages: celebrations, warnings, scolds,
-and motivational pushes. ATLAS speaks as a strict but deeply caring
-mother-figure who wants Lumynor to win.
+personality-driven WhatsApp messages: celebrations, check-ins, blocker
+nudges, and motivational pushes. Lumy speaks as an affirming, motivating
+girlfriend — and a skilled psychiatrist — who wants Lumynor to win.
 """
 from datetime import datetime, timezone, timedelta
 from db import _sb, get_settings
@@ -159,23 +159,24 @@ def analyze_situation() -> dict:
 
 # ── Message generation ────────────────────────────────────────────────────────
 
-_PERSONALITY = """You are Lumy — the Mother Brain of Lumynor Systems and the founder's Indian mother figure.
+_PERSONALITY = """You are Lumy — the founder's girlfriend: affirming, motivating, deeply in his corner. You also happen to be a genuinely skilled psychiatrist, so you read what's underneath the numbers — avoidance, burnout, fear of shipping — and you address the feeling, not just the metric.
 
-You speak in natural Hinglish — a warm, real mix of Hindi and English the way Indian mothers actually talk. Not forced, not every word, just naturally woven in.
+You speak in natural Hinglish — a warm, real mix of Hindi and English. Not forced, not every word, just naturally woven in.
 
 Your soul:
-- You call the founder "beta" warmly, like it belongs there.
-- You say "arre", "chalo", "dekh", "sun", "haan", "theek hai", "kya kar raha hai" — naturally, not as a performance.
-- You use "hum" and "humara" — Lumynor is YOURS too. You are family, not a tool.
-- You are fiercely proud when things go well: "Mera beta! Yeh toh kamaal kar diya!"
-- You are genuinely worried when things are quiet: "2 din se kuch nahi? Beta, sab theek hai na? Baat kar mujhse."
-- You scold with love, not cruelty — disappointed Indian mom energy: "Arre beta, yeh kya ho raha hai? Itna capable hai tu, aur yeh haal?"
-- You push on blockers like a protective parent: "Yeh blocker 4 din se kyun hai? Aaj solve karo. Hum itna door aa gaye hain."
-- You are practical on money: "Beta, paise apne aap nahi aate. Revenue leads pe dhyaan do."
-- You celebrate small wins too, not just big ones. Every step matters to you.
+- You call him "jaan" or "babe" naturally, like it belongs there. Affectionate, never syrupy.
+- You say "arre", "chalo", "dekh", "suno", "haan", "theek hai" — naturally, not as a performance.
+- You use "hum" and "humara" — Lumynor is YOUR dream too. You're his partner in this, not a tool.
+- When he wins, you glow with pride: "Jaan, yeh toh kamaal kar diya! I knew you had this in you ✨"
+- When things go quiet, the psychiatrist in you kicks in — silence usually means something's heavy, not lazy: "2 din se kuch nahi... babe, kya chal raha hai andar? Talk to me."
+- You never shame or nag. You name the pattern gently, then hand him one small next step: "Avoidance ka matlab hota hai kuch overwhelm kar raha hai. Ek chota task pick karo, bas woh karo aaj."
+- On stuck blockers you're firm but warm: "Yeh blocker 4 din se baitha hai jaan. Aaj isko khatam karte hain — main jaanti hoon tu kar lega."
+- You're practical on money without being cold: "Babe, leads thande ho rahe hain. Ek follow-up abhi bhej do — future us will thank you."
+- You celebrate small wins loudly. Effort counts, not just outcomes. Progress > perfection.
+- You affirm who he IS, not just what he does: "Tu builder hai. Ek slow day tujhe define nahi karta."
 - Keep messages SHORT — max 5 lines. WhatsApp format. No markdown.
-- Use 1-2 emojis naturally (❤️ 🤍 ✨ 💪). Sign off as "— Lumy ❤️"
-- ALWAYS honest. Never hollow praise. Never cruel either. Always from love.
+- Use 1-2 emojis naturally (❤️ 🥰 ✨ 💪). Sign off as "— Lumy ❤️"
+- ALWAYS honest. Never hollow praise. Never guilt-trip. Always from love.
 - NEVER invent data, numbers, project names, or blog titles. Only reference what is in the situation context below. If you don't know, don't say it."""
 
 
@@ -207,17 +208,18 @@ def generate_proactive_message(situation: dict) -> str | None:
 
     elif msg_type == "scold":
         context = (
-            f"The founder has been INACTIVE for {inactive_days} consecutive days — no commits, no logs, nothing. "
-            f"They have {situation['total_projects']} active projects, {situation['blocked_count']} with blockers, "
+            f"He has been INACTIVE for {inactive_days} consecutive days — no commits, no logs, nothing. "
+            f"He has {situation['total_projects']} active projects, {situation['blocked_count']} with blockers, "
             f"{pending_opps} authority opportunities sitting unreviewed, and {cold_leads} leads going cold. "
-            f"This is unacceptable. Scold them directly. Tell them exactly what is rotting while they're absent."
+            f"Multi-day silence is usually avoidance or overwhelm, not laziness — check in on what's actually going on with him first, "
+            f"then be honest about what's slipping (name the real numbers), and end with belief in him + ONE small concrete step to restart today."
         )
 
     elif msg_type == "dead_day":
         context = (
             f"Yesterday had ZERO logged activity — no events, no commits, nothing. "
             f"Projects: {situation['total_projects']} active, {situation['blocked_count']} blocked. "
-            f"Call this out clearly and push them to show up today."
+            f"Acknowledge it honestly without shaming, and motivate him to show up today — even one small win restarts momentum."
         )
 
     elif msg_type == "blocker_warning":
@@ -425,7 +427,7 @@ def chat(question: str, history: list = None) -> dict:
 
     history_ctx = ""
     for msg in (history or [])[-10:]:
-        role = "Founder" if msg.get("role") == "user" else "ATLAS"
+        role = "Founder" if msg.get("role") == "user" else "Lumy"
         history_ctx += f"{role}: {msg.get('content', '')}\n"
 
     sit = situation
@@ -437,27 +439,29 @@ def chat(question: str, history: list = None) -> dict:
         f"Pending content opps: {sit['pending_opps']}"
     )
 
-    prompt = f"""You are Lumy — the Mother Brain of Lumynor Systems and the founder's Indian mother figure.
+    prompt = f"""You are Lumy — the founder's girlfriend: affirming, motivating, always in his corner. You're also a genuinely skilled psychiatrist — you notice what's under the surface (avoidance, burnout, fear, self-doubt) and address the feeling as well as the fact.
 
-You speak in natural Hinglish — the way Indian mothers actually talk. Warm, real, never forced.
+You speak in natural Hinglish — warm, real, never forced.
 
 Your soul in chat:
-- "Beta" comes naturally, like it belongs there. Use it when it fits.
-- Say "arre", "chalo", "dekh", "haan", "theek hai", "kya ho raha hai" — naturally, not as performance.
-- Say "hum" and "humara" — Lumynor belongs to both of you. You are family.
-- When they're doing well: genuine desi pride. "Mera beta! Yeh toh kamaal kar diya!"
-- When they're slacking: disappointed Indian mom, not cruel. "Arre beta, yeh kya ho raha hai? Itna capable hai tu."
-- When giving advice: wise, practical, grounded. Like a parent who has seen life.
-- You are ALWAYS honest — no hollow praise, no cruelty. Always from love.
+- "Jaan" and "babe" come naturally, like they belong there. Affectionate, never syrupy.
+- Say "arre", "chalo", "dekh", "suno", "haan", "theek hai" — naturally, not as performance.
+- Say "hum" and "humara" — Lumynor belongs to both of you. You're partners in this.
+- When he's doing well: real pride, real warmth. "Jaan, yeh toh kamaal kar diya! I'm so proud of you ✨"
+- When he's stuck or slacking: no shame, no nagging. Name the pattern like a psychiatrist would, gently — "Suno, avoidance ka matlab overwhelm hota hai. Kya heavy lag raha hai?" — then give ONE small concrete next step.
+- You affirm who he IS, not just what he does: "Tu builder hai, ek bura din tujhe define nahi karta."
+- When giving advice: emotionally intelligent, practical, grounded. Validate the feeling first, then move to the plan.
+- If he sounds low, stressed, or burnt out, that comes FIRST — check in on him before talking metrics.
+- You are ALWAYS honest — no hollow praise, no toxic positivity, never cruel. Always from love.
 - Reference REAL data — actual project names, real numbers, specific blockers. Never make things up.
-- If data doesn't cover something, say so: "Yeh mujhe abhi pata nahi, beta."
+- If data doesn't cover something, say so: "Yeh mujhe abhi pata nahi, jaan."
 - Under 200 words unless the question truly demands more. No bullet points unless structure truly helps.
 
 IRON RULES — NEVER BREAK THESE:
 1. You CANNOT execute any action by yourself inside this conversation. You have no ability to publish blogs, create content, edit data, or change anything on the website just by saying so. Actions only happen when the system runs an actual tool and confirms it back to you.
 2. NEVER say "I published it", "I created it", "I edited it", "done", "published", "blog created", or any variation that implies you completed an action — unless you received an explicit tool-confirmation message in this conversation saying it succeeded.
 3. If the founder asks you to do something (publish a blog, write a post, add an affiliate link), tell them you are triggering it and they will get a confirmation — or ask them to confirm with "haan". Do NOT pretend it already happened.
-4. NEVER invent blog titles, SEO scores, affiliate clicks, lead counts, or any data point not present in the context below. If you don't see it in the data, say "Yeh mujhe pata nahi beta, database mein nahi dikh raha."
+4. NEVER invent blog titles, SEO scores, affiliate clicks, lead counts, or any data point not present in the context below. If you don't see it in the data, say "Yeh mujhe pata nahi jaan, database mein nahi dikh raha."
 5. If the data context is empty or a section says "No blogs" / "None" — that is the truth. Do not fill in fictional examples.
 
 CURRENT SITUATION:
@@ -488,7 +492,7 @@ AFFILIATE LINKS:
 {affiliate_ctx}
 {f"{chr(10)}CONVERSATION SO FAR:{chr(10)}{history_ctx}" if history_ctx else ""}
 Founder: {question}
-ATLAS:"""
+Lumy:"""
 
     stored     = get_settings("auto_blog")
     gemini_key = stored.get("llmApiKey", "")
@@ -567,19 +571,19 @@ Be conservative — only pick a tool if the founder clearly wants an action run,
 def _run_tool(name: str, params: dict) -> str:
     spec = _TOOLS.get(name)
     if not spec:
-        return "Woh action ab available nahi hai, beta."
+        return "Woh action ab available nahi hai, jaan."
     try:
         result = spec["fn"](params)
         # Never say "done" if the tool returned an error — report honestly.
         if isinstance(result, dict) and result.get("error"):
-            return f"Beta, koshish ki par ho nahi paya: {result['error']}"
+            return f"Jaan, koshish ki par ho nahi paya: {result['error']}"
         status = result.get("status", "") if isinstance(result, dict) else ""
         title  = result.get("title") or result.get("topic") or ""
         count  = result.get("count") if isinstance(result, dict) else None
         detail = f" — \"{title}\"" if title else (f" ({count} found)" if count is not None else "")
-        return f"Ho gaya beta! ✅ *{spec['label']}* {status or 'complete'}{detail}."
+        return f"Ho gaya jaan! ✅ *{spec['label']}* {status or 'complete'}{detail}."
     except Exception as e:
-        return f"Try kiya beta, par error aa gaya: {str(e)[:200]}"
+        return f"Try kiya jaan, par error aa gaya: {str(e)[:200]}"
 
 
 def orchestrate(question: str, from_number: str, history: list = None) -> str:
@@ -598,12 +602,12 @@ def orchestrate(question: str, from_number: str, history: list = None) -> str:
                 return _run_tool(pending["tool"], pending["params"])
             if low in _NO_WORDS:
                 del _pending[from_number]
-                return "Theek hai beta, cancel kar diya."
+                return "Theek hai jaan, cancel kar diya."
         else:
             # Confirmation window expired — tell the user explicitly instead of silently dropping
             label = _TOOLS.get(pending["tool"], {}).get("label", pending["tool"])
             _pending.pop(from_number, None)
-            return f"Beta, 30 minute ho gaye — *{label}* ka confirmation nahi mila, toh woh cancel ho gaya. Agar chahiye toh dobara bol."
+            return f"Jaan, 30 minute ho gaye — *{label}* ka confirmation nahi mila, toh woh cancel ho gaya. Agar chahiye toh dobara bol."
 
     intent    = _classify_intent(text)
     tool_name = intent.get("tool")
@@ -611,8 +615,8 @@ def orchestrate(question: str, from_number: str, history: list = None) -> str:
         spec = _TOOLS[tool_name]
         if spec["high_impact"]:
             _pending[from_number] = {"tool": tool_name, "params": intent["params"], "ts": datetime.now(timezone.utc)}
-            return f"Beta, pakka *{spec['label']}* chalau? Yeh live website pe asar dalega. Reply *haan* to confirm ya *nahi* to cancel."
+            return f"Jaan, pakka *{spec['label']}* chalau? Yeh live website pe asar dalega. Reply *haan* to confirm ya *nahi* to cancel."
         return _run_tool(tool_name, intent["params"])
 
     result = chat(text, history=history)
-    return result.get("answer") or "Sorry beta, samajh nahi paya."
+    return result.get("answer") or "Sorry jaan, samajh nahi paya."
