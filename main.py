@@ -2417,7 +2417,8 @@ async def audit_blog(blog_id: str):
 
     tavily_key   = os.getenv("TAVILY_API_KEY", "")
     loop         = asyncio.get_event_loop()
-    _audit_content = blog.get("content_markdown", blog.get("content", ""))
+    _audit_content = (blog.get("content_markdown") or blog.get("content_html")
+                      or blog.get("content") or "")
 
     seo_report, cred_report, plag_report = await asyncio.gather(
         loop.run_in_executor(None, validate_seo, blog),

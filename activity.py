@@ -159,7 +159,7 @@ _REPO_MAP: dict[str, str] = {
     "lumynor-website":    "lumynor_website",
 
     # ── Lumynor Backend ─────────────────────────────────────
-    "lumynor-backend":    "other",
+    "lumynor-backend":    "lumynor_backend",
 
 
     # ── CODEX — update value to the right project slug if needed ──
@@ -187,7 +187,7 @@ def _detect_project(repo_name: str) -> str:
     if "district21" in name or "district21" in raw.lower():
         return "district21"
     if "backend" in name and "lumynor" in name:
-        return "other"
+        return "lumynor_backend"
     if "website" in name or ("lumynor" in name and "backend" not in name):
         return "lumynor_website"
     return "other"

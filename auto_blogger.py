@@ -1003,6 +1003,10 @@ def write_longform_blog(topic: str, angle: str, keywords: dict, research: dict,
         links_block = '[Agent Forge](/products/agent-forge), [talk to our team](/contact), [more insights](/blog)'
         refs = research.get("references", [])
 
+    # Research turns up refs from any domain; the writer only sees the top 6, so credible
+    # sources (the ones that actually count toward the credibility auditor's source_trust /
+    # multi_source scores) must not get crowded out by higher-ranked but non-credible hits.
+    refs = sorted(refs, key=lambda r: not any(d in (r.get("url") or "").lower() for d in _CREDIBLE_DOMAINS))
     refs_text = "\n".join(f"- [{r['title']}]({r['url']})" for r in refs[:6])
 
     prompt = f"""You are a senior writer at Lumynor Systems — a digital product studio building agentic AI and SaaS platforms.
@@ -1053,6 +1057,7 @@ EXTERNAL REFERENCES TO CITE:
 8. Every ## section must have real depth — 200-350 words, specific data, at least one example
 9. Use > [!TIP] for key takeaways and tips, > [!WARNING] for pitfalls or warnings
 10. Write about what builders and developers ACTUALLY need to know — not surface-level content
+{"11. MANDATORY — cite AT LEAST 3 of the EXTERNAL REFERENCES above as inline Markdown links [source name](url) on the sentences they support. This is not optional: an article with zero citations fails credibility review outright. Spread them across different sections — don't cluster them all in one paragraph." if refs_text else ""}
 
 ═══ SEO RULES ════════════════════════════════════════════════════════════════
 1. Primary keyword "{primary_kw}" MUST appear in: title, first 100 words, ≥2 ## headings, meta description
@@ -1496,6 +1501,35 @@ def generate_blog_images(
 
 # ── STAGE 6: SEO VALIDATION ────────────────────────────────────────────────────
 
+_CODE_FENCE_RE = re.compile(r'```.*?```', re.S)
+
+
+def _select_content(blog: dict) -> tuple:
+    """Pick the blog's content string and which key it came from, falling back through
+    content_markdown -> content_html -> content by non-empty VALUE, never by key presence.
+    A blog can have a present-but-empty content_markdown key after certain revision paths
+    (e.g. a failed re-render) — picking by presence alone silently audits blank content."""
+    for key in ("content_markdown", "content_html", "content"):
+        val = (blog.get(key) or "").strip()
+        if val:
+            return val, key
+    return "", "content"
+
+
+def _prose_only(text: str) -> str:
+    """Strip fenced code blocks, HTML tags, and Markdown syntax markers so text-quality
+    heuristics (stat/quote/hedge/repetition detectors) never misread a code example's
+    braces, quotes, and numbers as prose claims or unattributed quotations."""
+    s = _CODE_FENCE_RE.sub(' ', text)
+    s = re.sub(r'<[^>]+>', ' ', s)
+    s = re.sub(r'^#{1,6}\s+', '', s, flags=re.M)
+    s = re.sub(r'\*{1,3}([^*\n]+)\*{1,3}', r'\1', s)
+    s = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', s)
+    s = re.sub(r'^>\s*\[![A-Z]+\]\s*', '', s, flags=re.M)
+    s = re.sub(r'^>\s*', '', s, flags=re.M)
+    return re.sub(r'\s+', ' ', s).strip()
+
+
 def validate_seo(blog: dict) -> dict:
     """
     100-point SEO audit across 10 weighted categories (matches the guide checklist).
@@ -1510,14 +1544,8 @@ def validate_seo(blog: dict) -> dict:
     # Accept both snake_case (pipeline) and camelCase (Supabase stored) key variants
     summary = (blog.get("meta_description") or blog.get("metaDescription")
                or blog.get("summary") or "").strip()
-    # Accept content_markdown (new pipeline), content_html (old pipeline), or content (stored blogs)
-    content = (blog.get("content_markdown") or blog.get("content_html") or blog.get("content") or "").strip()
-    # Prefer key presence for format detection — avoids false-negative when Markdown contains HTML code examples
-    if "content_markdown" in blog:
-        _md = True
-    else:
-        _md = (bool(re.search(r'^##\s', content, re.M))
-               and not bool(re.search(r'<(h[1-6]|p|div)\b', content, re.I)))
+    content, _ck = _select_content(blog)
+    _md = (_ck == "content_markdown")
     primary = (blog.get("primary_keyword") or blog.get("primaryKeyword") or "").strip()
     cover   = (blog.get("coverImage")      or blog.get("cover_image") or "").strip()
     references = blog.get("references") or []
@@ -1528,14 +1556,7 @@ def validate_seo(blog: dict) -> dict:
                  if isinstance(sec_raw, str)
                  else [str(k).strip() for k in (sec_raw or []) if str(k).strip()])
 
-    # Clean text — strip both HTML tags and Markdown markers so all text checks are format-agnostic
-    _stripped = re.sub(r'<[^>]*>', ' ', content)
-    _stripped = re.sub(r'^#{1,6}\s+', '', _stripped, flags=re.M)
-    _stripped = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', _stripped)
-    _stripped = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', _stripped)
-    _stripped = re.sub(r'^>\s*\[![A-Z]+\]\s*', '', _stripped, flags=re.M)
-    _stripped = re.sub(r'^>\s*', '', _stripped, flags=re.M)
-    clean = re.sub(r'\s+', ' ', _stripped).strip()
+    clean = _prose_only(content)
     words = clean.split()
     word_count = len(words)
     clean_lower = clean.lower()
@@ -2042,13 +2063,7 @@ _DEFINITIVE_RED_FLAGS = (
 
 def _sentence_fingerprints(text: str) -> list:
     """Return normalised sentence strings (lowercased, punctuation stripped) for dedup."""
-    # Strip both HTML tags and Markdown syntax markers
-    stripped = re.sub(r'<[^>]+>', ' ', text)
-    stripped = re.sub(r'^#{1,6}\s+', '', stripped, flags=re.M)  # ## headings
-    stripped = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', stripped)  # **bold** / *italic*
-    stripped = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', stripped)   # [text](url)
-    stripped = re.sub(r'^>\s*\[![A-Z]+\]\s*', '', stripped, flags=re.M)  # > [!TIP]
-    stripped = re.sub(r'^>\s*', '', stripped, flags=re.M)           # > blockquote
+    stripped = _prose_only(text)
     raw = re.split(r'(?<=[.!?])\s+', stripped)
     return [re.sub(r'[^a-z0-9 ]', '', s.lower()).strip() for s in raw if len(s.strip()) > 40]
 
@@ -2076,17 +2091,8 @@ def validate_credibility(blog: dict) -> dict:
     Returns the same shape as validate_seo (score, grade, status, issues, fixes,
     hard_fail_reasons) so it can be fed into revise_blog_credibility().
     """
-    _ck     = ("content_markdown" if "content_markdown" in blog
-               else "content_html" if "content_html" in blog else "content")
-    content = (blog.get(_ck) or "").strip()
-    # Strip both HTML tags and Markdown syntax markers for all text-level checks
-    _s = re.sub(r'<[^>]+>', ' ', content)
-    _s = re.sub(r'^#{1,6}\s+', '', _s, flags=re.M)
-    _s = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', _s)
-    _s = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', _s)
-    _s = re.sub(r'^>\s*\[![A-Z]+\]\s*', '', _s, flags=re.M)
-    _s = re.sub(r'^>\s*', '', _s, flags=re.M)
-    clean   = re.sub(r'\s+', ' ', _s).strip()
+    content, _ck = _select_content(blog)
+    clean   = _prose_only(content)
     clean_l = clean.lower()
 
     cat = {
@@ -2285,14 +2291,10 @@ def check_plagiarism(content: str, tavily_key: str = "") -> dict:
       flagged      — list of {sentence, found_at, source_title}
       status       — "Original" / "Likely plagiarised" / "Review needed"
     """
-    # Work on clean text only — strip both HTML and Markdown markers
-    _s = re.sub(r'<[^>]+>', ' ', content)
-    _s = re.sub(r'^#{1,6}\s+', '', _s, flags=re.M)
-    _s = re.sub(r'\*{1,3}([^*\n]+)\*{1,3}', r'\1', _s)
-    _s = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', _s)
-    _s = re.sub(r'^>\s*\[![A-Z]+\]\s*', '', _s, flags=re.M)
-    _s = re.sub(r'^>\s*', '', _s, flags=re.M)
-    clean = re.sub(r'\s+', ' ', _s).strip()
+    # Work on clean text only — code examples are common phrasing shared across every repo/doc
+    # that uses the same API, so sampling a code fragment as a "distinctive sentence" and
+    # searching for it verbatim produces meaningless plagiarism hits.
+    clean = _prose_only(content)
 
     # Split into sentences on . ! ? boundaries
     raw_sentences = re.split(r'(?<=[.!?])\s+', clean)
@@ -2381,8 +2383,7 @@ def revise_blog_plagiarism(blog: dict, plag_report: dict, llm_cfg,
 
     Returns {"revised_blog", "new_plagiarism_score", "score_progression", "flagged", "notes"}
     """
-    _ck        = ("content_markdown" if "content_markdown" in blog
-                  else "content_html" if "content_html" in blog else "content")
+    _, _ck     = _select_content(blog)
     notes      = []
     current    = dict(blog)
     tavily_key = tavily_key or os.getenv("TAVILY_API_KEY", "")
@@ -2452,9 +2453,7 @@ def revise_blog_plagiarism(blog: dict, plag_report: dict, llm_cfg,
 
 def _extract_claims_needing_sources(content: str, llm_cfg: dict) -> list:
     """LLM reads the article and returns 3-5 web-search queries for claims needing citations."""
-    stripped = re.sub(r'<[^>]+>', ' ', content)
-    stripped = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', stripped)
-    preview  = re.sub(r'\s+', ' ', stripped).strip()[:4000]
+    preview = _prose_only(content)[:4000]
     prompt = f"""Read this article excerpt. Extract 3 to 5 specific factual claims or statistics that most need a credible citation.
 
 For each, write a short web search query (10 words or less) that would find an authoritative source.
@@ -2547,8 +2546,7 @@ def revise_blog_credibility(blog: dict, cred_report: dict, llm_cfg, max_loops: i
       6. Re-audit; exit early if score >= 90
     Returns {"revised_blog": dict, "new_credibility_score": int, "notes": list}
     """
-    _ck    = ("content_markdown" if "content_markdown" in blog
-              else "content_html" if "content_html" in blog else "content")
+    _, _ck = _select_content(blog)
     _fmt   = "Markdown" if _ck == "content_markdown" else "HTML"
     notes  = []
     current = dict(blog)
@@ -2893,10 +2891,8 @@ def refine_blog_seo(blog: dict, seo_report: dict, gemini_key: str) -> dict:
     Works with both 'content_html' (pipeline drafts) and 'content' (stored blogs).
     """
     primary_kw = (blog.get("primary_keyword") or blog.get("primaryKeyword") or "").strip()
-    _ck = ("content_markdown" if "content_markdown" in blog
-           else "content_html" if "content_html" in blog else "content")
+    content, _ck = _select_content(blog)
     _fmt = "Markdown" if _ck == "content_markdown" else "HTML"
-    content = blog.get(_ck, "")
     issues_text = " | ".join(seo_report.get("issues", []))
 
     # 1) Fix title + meta description via a short LLM call
@@ -3157,8 +3153,7 @@ def revise_blog_from_audit(
     tavily_key = tavily_key or os.getenv("TAVILY_API_KEY", "")
     notes      = []
     loop_diffs = []
-    _ck  = ("content_markdown" if "content_markdown" in blog
-            else "content_html" if "content_html" in blog else "content")
+    _, _ck = _select_content(blog)
     _md  = _ck == "content_markdown"
     current    = dict(blog)
     if research_brief and not current.get("research_brief"):
