@@ -154,13 +154,10 @@ _REPO_MAP: dict[str, str] = {
     "linkforge":          "linkforge",
     "link-forge":         "linkforge",
 
-    # ── Lumynor Website ─────────────────────────────────────
+    # ── Lumynor Website (frontend + backend tracked as one project) ─────────
     "lumynor_website":    "lumynor_website",  # underscored variant
     "lumynor-website":    "lumynor_website",
-
-    # ── Lumynor Backend ─────────────────────────────────────
-    "lumynor-backend":    "lumynor_backend",
-
+    "lumynor-backend":    "lumynor_website",
 
     # ── CODEX — update value to the right project slug if needed ──
     "CODEX":              "other",
@@ -186,9 +183,7 @@ def _detect_project(repo_name: str) -> str:
     # district21 must be checked before generic "district" to avoid false positives
     if "district21" in name or "district21" in raw.lower():
         return "district21"
-    if "backend" in name and "lumynor" in name:
-        return "lumynor_backend"
-    if "website" in name or ("lumynor" in name and "backend" not in name):
+    if "website" in name or "lumynor" in name:
         return "lumynor_website"
     return "other"
 
