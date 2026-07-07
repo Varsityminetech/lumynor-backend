@@ -608,6 +608,16 @@ def atlas_proactive_preview(_admin: dict = Depends(_require_admin)):
 def atlas_proactive_send(_admin: dict = Depends(_require_admin)):
     return ab.run_proactive_check()
 
+@app.get("/api/lumy/notes")
+def lumy_notes(limit: int = 20, _admin: dict = Depends(_require_admin)):
+    """Lumy's private session notes — her longitudinal wellbeing journal."""
+    return db.get_lumy_notes(limit=limit)
+
+@app.get("/api/lumy/history")
+def lumy_history(limit: int = 50, _admin: dict = Depends(_require_admin)):
+    """Persistent Lumy conversation history across WhatsApp + dashboard."""
+    return db.get_lumy_history(limit=limit)
+
 @app.get("/api/atlas/settings")
 def atlas_settings_get(_admin: dict = Depends(_require_admin)):
     stored = db.get_settings("atlas")

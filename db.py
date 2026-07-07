@@ -320,6 +320,55 @@ def get_affiliate_stats() -> list:
     return result
 
 
+# ── Lumy Memory (conversations + session notes) ──────────────────────────────
+
+def save_lumy_message(source: str, role: str, content: str) -> None:
+    sb = _sb()
+    if not sb:
+        return
+    sb.table("lumy_conversations").insert({
+        "id": str(uuid.uuid4()),
+        "source": source or "whatsapp",
+        "role": role,
+        "content": (content or "")[:8000],
+    }).execute()
+
+
+def get_lumy_history(limit: int = 16) -> list:
+    """Most recent conversation messages across all channels, oldest first."""
+    sb = _sb()
+    if not sb:
+        return []
+    res = (sb.table("lumy_conversations").select("role, content, created_at")
+             .order("created_at", desc=True)
+             .limit(limit).execute())
+    return list(reversed(res.data or []))
+
+
+def save_lumy_note(mood: str, themes: list, observations: str, risk_level: str = "none") -> None:
+    sb = _sb()
+    if not sb:
+        return
+    sb.table("lumy_notes").insert({
+        "id": str(uuid.uuid4()),
+        "mood": (mood or "")[:60],
+        "themes": themes or [],
+        "observations": (observations or "")[:2000],
+        "risk_level": risk_level if risk_level in ("none", "mild", "moderate", "high") else "none",
+    }).execute()
+
+
+def get_lumy_notes(limit: int = 10) -> list:
+    """Most recent session notes, newest first."""
+    sb = _sb()
+    if not sb:
+        return []
+    res = (sb.table("lumy_notes").select("*")
+             .order("created_at", desc=True)
+             .limit(limit).execute())
+    return res.data or []
+
+
 # ── User Profiles ─────────────────────────────────────────────────────────────
 
 def get_user_profile(user_id: str) -> dict | None:

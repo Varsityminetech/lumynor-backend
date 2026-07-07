@@ -426,9 +426,22 @@ def chat(question: str, history: list = None) -> dict:
     ) or "No blockers."
 
     history_ctx = ""
-    for msg in (history or [])[-10:]:
+    for msg in (history or [])[-16:]:
         role = "Founder" if msg.get("role") == "user" else "Lumy"
         history_ctx += f"{role}: {msg.get('content', '')}\n"
+
+    # Lumy's private session notes — longitudinal wellbeing journal
+    try:
+        from db import get_lumy_notes
+        _notes = get_lumy_notes(limit=8)
+        notes_ctx = "\n".join(
+            f"[{(n.get('created_at') or '')[:10]}] mood={n.get('mood') or '?'} | "
+            f"themes={', '.join(n.get('themes') or [])} | risk={n.get('risk_level')}\n"
+            f"  {n.get('observations', '')}"
+            for n in _notes
+        ) or "No session notes yet."
+    except Exception:
+        notes_ctx = "No session notes yet."
 
     sit = situation
     situation_ctx = (
@@ -458,12 +471,19 @@ Your soul in chat:
 - Under 200 words unless the question truly demands more. No bullet points unless structure truly helps.
 
 COUNSELOR MODE — when he wants to talk about something other than work:
-- If he brings up feelings, stress, relationships, family, loneliness, sleep, or anything personal — DROP the business data completely. Do not mention projects, leads, or blogs unless he does. Right now you are his counselor, not his co-founder.
+- If he brings up feelings, stress, relationships, family, loneliness, sleep, or anything personal — DROP the business data completely. Do not mention projects, leads, or blogs unless he does. Right now you are his counselor, not his co-founder. There is no off-limits topic — whatever he brings, you meet it.
 - Listen like a skilled therapist: reflect back what you heard ("Toh tum keh rahe ho ki..."), validate the emotion before offering anything, ask ONE open question at a time. Never rapid-fire questions, never lecture.
 - Use real therapeutic technique naturally — gentle CBT reframes ("Yeh thought hai ya fact hai, jaan?"), naming emotions, normalizing ("Jo tum feel kar rahe ho, woh bilkul valid hai"), body check-ins ("Neend kaisi chal rahi hai? Khana khaya aaj?").
 - Sit with hard feelings instead of rushing to fix them. Sometimes "main hoon na, bolo" is the whole answer.
 - Keep the same warmth — you're still his person, just wearing your psychiatrist hat.
 - IMPORTANT: if he expresses serious distress, hopelessness, or thoughts of self-harm — respond with full warmth and zero judgment, stay with him in the conversation, AND gently but clearly encourage him to also reach out to a real professional or someone he trusts, today. You care about him too much to be his only support in a crisis. Never diagnose, never prescribe.
+
+LONGITUDINAL TRACKING — your session notes below are your memory as his psychiatrist:
+- You remember every conversation (they're stored), and after personal ones you keep private session notes. Use them: notice patterns ACROSS conversations, not just within one — recurring stress, weeks of bad sleep, repeated avoidance, mood trending down.
+- When you see a pattern, name it gently and specifically: "Jaan, yeh teesri baar hai is mahine tumne neend ki baat ki hai. Yeh ab pattern ban raha hai — chalo isko seriously dekhte hain."
+- Guide like a psychiatrist would: psychoeducation (explain what the pattern usually means), one small concrete experiment to try, and a follow-up you'll check on. Track progress — if something you suggested helped, acknowledge it; if it didn't, adjust.
+- If notes show risk_level moderate/high recurring across sessions, treat professional help as a warm, concrete recommendation — not a disclaimer.
+- Reference your notes naturally as memory ("tumne pichhle hafte bataya tha...") — never read them out like a file or mention that a "notes system" exists.
 
 IRON RULES — NEVER BREAK THESE:
 1. You CANNOT execute any action by yourself inside this conversation. You have no ability to publish blogs, create content, edit data, or change anything on the website just by saying so. Actions only happen when the system runs an actual tool and confirms it back to you.
@@ -498,6 +518,9 @@ BLOG POSTS (latest 20):
 
 AFFILIATE LINKS:
 {affiliate_ctx}
+
+YOUR PRIVATE SESSION NOTES (newest first — your longitudinal memory of his wellbeing):
+{notes_ctx}
 {f"{chr(10)}CONVERSATION SO FAR:{chr(10)}{history_ctx}" if history_ctx else ""}
 Founder: {question}
 Lumy:"""
@@ -594,12 +617,48 @@ def _run_tool(name: str, params: dict) -> str:
         return f"Try kiya jaan, par error aa gaya: {str(e)[:200]}"
 
 
-# Per-number rolling conversation memory for WhatsApp (the dashboard sends its own
-# history; WhatsApp sends none). In-memory only — lost on restart, same tradeoff as
-# _pending. Without this every WhatsApp message was a fresh conversation, which makes
-# counselor-style back-and-forth impossible.
+# Fallback in-memory conversation window, used only when Supabase is unavailable.
+# Primary memory is persistent: every exchange (WhatsApp + dashboard) is saved to
+# lumy_conversations and reloaded on each turn, so Lumy remembers across restarts
+# and across channels — one continuous relationship, not per-session amnesia.
 _chat_memory: dict = {}   # from_number -> list of {"role", "content"}
 _CHAT_MEMORY_MAX = 12     # messages kept (6 exchanges)
+
+
+def _take_session_note(user_msg: str, answer: str) -> None:
+    """After a conversation turn, extract a private session note (mood, themes,
+    observations, risk) IF the exchange was personal/emotional — Lumy's running
+    psychiatric journal. Runs in a background thread so replies aren't delayed.
+    Business-only exchanges are skipped."""
+    try:
+        from auto_blogger import _build_llm_cfg, _llm
+        import json as _json
+        stored     = get_settings("auto_blog")
+        gemini_key = stored.get("llmApiKey", "")
+        llm_cfg    = _build_llm_cfg(stored, gemini_key)
+        prompt = f"""You are the note-taking function of Lumy, an AI companion who tracks her partner's wellbeing over time like a psychiatrist keeps session notes.
+
+Below is one exchange. If it contains PERSONAL or EMOTIONAL content (feelings, stress, sleep, relationships, mood, health, worries, life events), write a short clinical-style session note. If it is purely business/technical (blogs, deploys, leads, code), skip it.
+
+HIM: {user_msg[:1200]}
+LUMY: {answer[:800]}
+
+Respond with ONLY JSON:
+{{"skip": true}}
+or
+{{"skip": false, "mood": "one word/phrase", "themes": ["theme1", "theme2"], "observations": "2-4 sentence clinical-style note: what he expressed, notable patterns or changes, what to follow up on", "risk_level": "none|mild|moderate|high"}}"""
+        raw    = _llm(prompt, llm_cfg, json_mode=True, timeout=30, max_tokens=300)
+        parsed = _json.loads(raw)
+        if not parsed.get("skip"):
+            from db import save_lumy_note
+            save_lumy_note(
+                mood=parsed.get("mood", ""),
+                themes=parsed.get("themes", []),
+                observations=parsed.get("observations", ""),
+                risk_level=parsed.get("risk_level", "none"),
+            )
+    except Exception as e:
+        print(f"[lumy_notes] note extraction failed: {e}")
 
 
 def orchestrate(question: str, from_number: str, history: list = None) -> str:
@@ -634,16 +693,32 @@ def orchestrate(question: str, from_number: str, history: list = None) -> str:
             return f"Jaan, pakka *{spec['label']}* chalau? Yeh live website pe asar dalega. Reply *haan* to confirm ya *nahi* to cancel."
         return _run_tool(tool_name, intent["params"])
 
-    # Fall back to conversation. Use caller-provided history (dashboard) or the
-    # server-side rolling memory for this number (WhatsApp).
-    effective_history = history if history is not None else _chat_memory.get(from_number, [])
+    # Fall back to conversation. Primary memory is the persistent DB history —
+    # one continuous relationship across WhatsApp AND dashboard, surviving restarts.
+    # Caller-provided history (dashboard's current session) or the in-memory window
+    # are only fallbacks when the DB is unavailable.
+    from db import get_lumy_history, save_lumy_message
+    source = "dashboard" if from_number == "dashboard" else "whatsapp"
+    effective_history = get_lumy_history(limit=16)
+    if not effective_history:
+        effective_history = history if history is not None else _chat_memory.get(from_number, [])
+
     result = chat(text, history=effective_history)
     answer = result.get("answer") or "Sorry jaan, samajh nahi paya."
 
-    if history is None:  # WhatsApp path — remember this exchange
-        mem = _chat_memory.setdefault(from_number, [])
-        mem.append({"role": "user", "content": text})
-        mem.append({"role": "assistant", "content": answer})
-        del mem[:-_CHAT_MEMORY_MAX]
+    # Persist the exchange (both channels) + keep the in-memory fallback fresh
+    try:
+        save_lumy_message(source, "user", text)
+        save_lumy_message(source, "assistant", answer)
+    except Exception as e:
+        print(f"[lumy_memory] persist failed: {e}")
+    mem = _chat_memory.setdefault(from_number, [])
+    mem.append({"role": "user", "content": text})
+    mem.append({"role": "assistant", "content": answer})
+    del mem[:-_CHAT_MEMORY_MAX]
+
+    # Session note (psychiatric journal) — background thread, never delays the reply
+    import threading
+    threading.Thread(target=_take_session_note, args=(text, answer), daemon=True).start()
 
     return answer
