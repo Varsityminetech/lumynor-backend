@@ -845,6 +845,14 @@ async def whatsapp_webhook(request: Request):
 
 
 async def _handle_whatsapp_message(body: str, from_number: str):
+    # Every inbound message resets Twilio's 24h free-form-reply session window —
+    # record it so the keepalive daemon can warn before it closes.
+    try:
+        sess = db.get_settings("whatsapp_session")
+        db.save_settings({**sess, "last_inbound_at": datetime.utcnow().isoformat()}, "whatsapp_session")
+    except Exception as e:
+        print(f"[whatsapp_session] could not record inbound timestamp: {e}")
+
     try:
         answer = ab.orchestrate(body, from_number)
     except Exception as e:
@@ -2903,6 +2911,7 @@ async def startup_event():
     asyncio.create_task(digest_daemon())
     asyncio.create_task(atlas_proactive_daemon())
     asyncio.create_task(lumy_reminder_daemon())
+    asyncio.create_task(whatsapp_session_keepalive_daemon())
 
 
 async def digest_daemon():
@@ -3296,6 +3305,41 @@ async def lumy_reminder_daemon():
         except Exception as e:
             print(f"[reminders] daemon error: {e}")
         await _aio.sleep(60)
+
+
+async def whatsapp_session_keepalive_daemon():
+    """Twilio's WhatsApp free-form session closes 24h after the founder's last
+    inbound message — after that, Lumy can't send anything until he texts her
+    again. This warns him 2h before that window closes, once per window, so he
+    can send the sandbox join code and keep the line open. Checks every 10 min —
+    a 2h warning doesn't need 60s precision."""
+    import asyncio as _aio
+    await _aio.sleep(90)
+    while True:
+        try:
+            sess = db.get_settings("whatsapp_session")
+            last_inbound_raw = sess.get("last_inbound_at")
+            if last_inbound_raw:
+                last_inbound  = datetime.fromisoformat(last_inbound_raw)
+                window_close  = last_inbound + timedelta(hours=24)
+                remind_at     = window_close - timedelta(hours=2)
+                now           = datetime.utcnow()
+                already_sent  = sess.get("last_keepalive_reminder_for") == last_inbound_raw
+                if remind_at <= now < window_close and not already_sent:
+                    join_code = sess.get("sandbox_join_code", "gulf-obtain")
+                    text = (
+                        f"⏰ Jaan, humari WhatsApp session 2 ghante mein band ho jayegi. "
+                        f"Send *join {join_code}* abhi is chat mein, warna main tumhe reply nahi kar paungi.\n— Lumy ❤️"
+                    )
+                    result = ab.send_atlas_message(text)
+                    if result.get("ok"):
+                        db.save_settings({**sess, "last_keepalive_reminder_for": last_inbound_raw}, "whatsapp_session")
+                        print("[whatsapp_session] keepalive reminder sent")
+                    else:
+                        print(f"[whatsapp_session] keepalive send failed (will retry next tick): {result.get('error')}")
+        except Exception as e:
+            print(f"[whatsapp_session] daemon error: {e}")
+        await _aio.sleep(600)
 
 
 ab.register_tools({
