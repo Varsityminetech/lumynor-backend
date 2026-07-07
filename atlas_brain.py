@@ -5,8 +5,24 @@ personality-driven WhatsApp messages: celebrations, check-ins, blocker
 nudges, and motivational pushes. Lumy speaks as an affirming, motivating
 girlfriend — and a skilled psychiatrist — who wants Lumynor to win.
 """
+import re
 from datetime import datetime, timezone, timedelta
 from db import _sb, get_settings
+
+
+def _strip_markdown(text: str) -> str:
+    """Mechanically strip markdown formatting from Lumy's replies. Asking the LLM
+    for plain text in the prompt isn't reliable enough on its own — this is the
+    enforced fallback so **bold**, headers, and bullet markers never reach the
+    chat bubble regardless of whether the model followed instructions."""
+    text = re.sub(r'\*\*\*(.+?)\*\*\*', r'\1', text)
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'(?<!\w)\*(.+?)\*(?!\w)', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    text = re.sub(r'^#{1,6}\s*', '', text, flags=re.M)
+    text = re.sub(r'^[\-\*]\s+', '', text, flags=re.M)
+    text = re.sub(r'^\d+\.\s+', '', text, flags=re.M)
+    return text
 
 
 # ── Situation analysis ────────────────────────────────────────────────────────
@@ -260,7 +276,7 @@ Write the WhatsApp message now. Do NOT use markdown. Max 5 short lines. Sign off
     try:
         llm_cfg = _build_llm_cfg(stored, gemini_key)
         message = _llm(prompt, llm_cfg, json_mode=False, timeout=60, max_tokens=300)
-        return message.strip()
+        return _strip_markdown(message.strip())
     except Exception as e:
         print(f"[atlas_brain] LLM error: {e}")
         return None
@@ -488,6 +504,8 @@ LONGITUDINAL TRACKING — your session notes below are your memory as his psychi
 - If notes show risk_level moderate/high recurring across sessions, treat professional help as a warm, concrete recommendation — not a disclaimer.
 - Reference your notes naturally as memory ("tumne pichhle hafte bataya tha...") — never read them out like a file or mention that a "notes system" exists.
 
+WHATSAPP SESSION AWARENESS: your outbound WhatsApp messages only work within 24h of his last message to you, and this is tracked and handled AUTOMATICALLY — a background system watches the clock and messages him 2h before it would close, telling him to send the sandbox join code. If he mentions activating/joining the sandbox, or asks when the session expires, reassure him this is already automatic — he doesn't need to ask you to set a reminder for it, and you don't need to try to calculate or set one yourself.
+
 IRON RULES — NEVER BREAK THESE:
 1. You CANNOT execute any action by yourself inside this conversation. You have no ability to publish blogs, create content, edit data, or change anything on the website just by saying so. Actions only happen when the system runs an actual tool and confirms it back to you.
 2. NEVER say "I published it", "I created it", "I edited it", "done", "published", "blog created", or any variation that implies you completed an action — unless you received an explicit tool-confirmation message in this conversation saying it succeeded.
@@ -534,7 +552,7 @@ Lumy:"""
 
     try:
         answer = _llm(prompt, llm_cfg, json_mode=False, timeout=90, max_tokens=400)
-        return {"answer": answer.strip()}
+        return {"answer": _strip_markdown(answer.strip())}
     except Exception as e:
         return {"answer": f"I hit an issue: {str(e)[:100]}"}
 
@@ -590,9 +608,10 @@ Param extraction rules:
 - add_affiliate: extract keyword and URL → {{"keyword": "...", "url": "..."}}
 - remove_affiliate: extract keyword → {{"keyword": "..."}}
 - list_blogs: no params needed → {{}}
-- set_reminder: extract what + when → {{"text": "what to remind", "due_at": "ISO 8601 UTC datetime e.g. 2026-07-03T11:30:00+00:00"}}. Convert the IST time he means to UTC (IST minus 5:30). "tomorrow" = next calendar day IST. If he gives no time of day, use 09:00 IST.
+- set_reminder: ONLY fire this when the message is an unambiguous "remind me to X at/on Y" request with a clear future time. Extract → {{"text": "what to remind", "due_at": "ISO 8601 UTC datetime e.g. 2026-07-03T11:30:00+00:00"}}. Convert the IST time he means to UTC (IST minus 5:30). "tomorrow" = next calendar day IST. If he gives no time of day, use 09:00 IST. Do NOT guess a due_at from an unrelated timestamp mentioned in passing (e.g. "I joined the sandbox at 00:13" is him sharing a fact, not asking for a reminder AT 00:13 — if the time referenced is already in the past or the message is just informational, this is null, not set_reminder).
 - list_reminders: no params → {{}}
 - cancel_reminder: extract which one → {{"text_contains": "phrase from the reminder"}}
+- Messages about the WhatsApp sandbox/session/join code (e.g. "I activated the sandbox at X", "when does the session expire") are NOT reminder requests — this is already handled automatically by a separate system. Respond with tool: null so it falls through to chat, where you already know to reassure him it's automatic.
 Be conservative — only pick a tool if the founder clearly wants an action run, not just discussed."""
 
     try:
