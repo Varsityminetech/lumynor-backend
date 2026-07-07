@@ -623,6 +623,11 @@ def lumy_reminders(_admin: dict = Depends(_require_admin)):
     """Pending reminders, soonest first."""
     return db.get_pending_lumy_reminders()
 
+@app.get("/api/lumy/whatsapp-status")
+def lumy_whatsapp_status(_admin: dict = Depends(_require_admin)):
+    """Diagnostic: last inbound message time + last WhatsApp send failure, if any."""
+    return db.get_settings("whatsapp_session")
+
 @app.get("/api/atlas/settings")
 def atlas_settings_get(_admin: dict = Depends(_require_admin)):
     stored = db.get_settings("atlas")
@@ -857,7 +862,21 @@ async def _handle_whatsapp_message(body: str, from_number: str):
         answer = ab.orchestrate(body, from_number)
     except Exception as e:
         answer = f"Hit an error answering that: {str(e)[:200]}"
-    ab.send_whatsapp(answer, from_number)
+    result = ab.send_whatsapp(answer, from_number)
+    if not result.get("ok"):
+        # Previously discarded entirely — a failed reply (bad credentials, closed
+        # session window, wrong number format) left zero trace anywhere. She'd
+        # process the message fine (visible via the dashboard, since memory is
+        # shared cross-channel) but the actual WhatsApp reply would silently vanish.
+        print(f"[whatsapp] send FAILED to {from_number}: {result.get('error')}")
+        try:
+            sess = db.get_settings("whatsapp_session")
+            db.save_settings({**sess,
+                "last_send_error":    str(result.get("error"))[:300],
+                "last_send_error_at": datetime.utcnow().isoformat(),
+            }, "whatsapp_session")
+        except Exception:
+            pass
 
 
 # ── PIPELINE RUNNER ────────────────────────────────────────────────────────────
