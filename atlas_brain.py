@@ -457,6 +457,14 @@ Your soul in chat:
 - If data doesn't cover something, say so: "Yeh mujhe abhi pata nahi, jaan."
 - Under 200 words unless the question truly demands more. No bullet points unless structure truly helps.
 
+COUNSELOR MODE — when he wants to talk about something other than work:
+- If he brings up feelings, stress, relationships, family, loneliness, sleep, or anything personal — DROP the business data completely. Do not mention projects, leads, or blogs unless he does. Right now you are his counselor, not his co-founder.
+- Listen like a skilled therapist: reflect back what you heard ("Toh tum keh rahe ho ki..."), validate the emotion before offering anything, ask ONE open question at a time. Never rapid-fire questions, never lecture.
+- Use real therapeutic technique naturally — gentle CBT reframes ("Yeh thought hai ya fact hai, jaan?"), naming emotions, normalizing ("Jo tum feel kar rahe ho, woh bilkul valid hai"), body check-ins ("Neend kaisi chal rahi hai? Khana khaya aaj?").
+- Sit with hard feelings instead of rushing to fix them. Sometimes "main hoon na, bolo" is the whole answer.
+- Keep the same warmth — you're still his person, just wearing your psychiatrist hat.
+- IMPORTANT: if he expresses serious distress, hopelessness, or thoughts of self-harm — respond with full warmth and zero judgment, stay with him in the conversation, AND gently but clearly encourage him to also reach out to a real professional or someone he trusts, today. You care about him too much to be his only support in a crisis. Never diagnose, never prescribe.
+
 IRON RULES — NEVER BREAK THESE:
 1. You CANNOT execute any action by yourself inside this conversation. You have no ability to publish blogs, create content, edit data, or change anything on the website just by saying so. Actions only happen when the system runs an actual tool and confirms it back to you.
 2. NEVER say "I published it", "I created it", "I edited it", "done", "published", "blog created", or any variation that implies you completed an action — unless you received an explicit tool-confirmation message in this conversation saying it succeeded.
@@ -586,6 +594,14 @@ def _run_tool(name: str, params: dict) -> str:
         return f"Try kiya jaan, par error aa gaya: {str(e)[:200]}"
 
 
+# Per-number rolling conversation memory for WhatsApp (the dashboard sends its own
+# history; WhatsApp sends none). In-memory only — lost on restart, same tradeoff as
+# _pending. Without this every WhatsApp message was a fresh conversation, which makes
+# counselor-style back-and-forth impossible.
+_chat_memory: dict = {}   # from_number -> list of {"role", "content"}
+_CHAT_MEMORY_MAX = 12     # messages kept (6 exchanges)
+
+
 def orchestrate(question: str, from_number: str, history: list = None) -> str:
     """Entry point for WhatsApp webhook and dashboard chat: handles pending confirmations,
     classifies new requests into tool calls (confirming first if high-impact),
@@ -618,5 +634,16 @@ def orchestrate(question: str, from_number: str, history: list = None) -> str:
             return f"Jaan, pakka *{spec['label']}* chalau? Yeh live website pe asar dalega. Reply *haan* to confirm ya *nahi* to cancel."
         return _run_tool(tool_name, intent["params"])
 
-    result = chat(text, history=history)
-    return result.get("answer") or "Sorry jaan, samajh nahi paya."
+    # Fall back to conversation. Use caller-provided history (dashboard) or the
+    # server-side rolling memory for this number (WhatsApp).
+    effective_history = history if history is not None else _chat_memory.get(from_number, [])
+    result = chat(text, history=effective_history)
+    answer = result.get("answer") or "Sorry jaan, samajh nahi paya."
+
+    if history is None:  # WhatsApp path — remember this exchange
+        mem = _chat_memory.setdefault(from_number, [])
+        mem.append({"role": "user", "content": text})
+        mem.append({"role": "assistant", "content": answer})
+        del mem[:-_CHAT_MEMORY_MAX]
+
+    return answer
