@@ -215,6 +215,37 @@ def _require_admin(auth_user: dict = Depends(_get_supabase_user)) -> dict:
     return {**auth_user, "role": "admin"}
 
 
+# ── PUBLIC SITE SETTINGS ───────────────────────────────────────────────────────
+# WhatsApp number, chatbot persona, contact email — every visitor's browser needs
+# to read these to render the live values. Previously these lived ONLY in the
+# founder's own browser localStorage (SettingsContext.jsx), which never syncs to
+# any other visitor — so a real visitor always saw the hardcoded placeholder
+# defaults, no matter what the founder set in the admin panel.
+
+_SITE_SETTINGS_DEFAULTS = {
+    "whatsappNumber": "919999999999",
+    "whatsappText":   "Hi Lumynor, I want to discuss a project inquiry.",
+    "contactEmail":   "hello@lumynor.com",
+    "chatbotName":    "Maya",
+    "chatbotWelcome": "Hi, I'm Maya from Lumynor. Tell me what you want to build.",
+    "foundingTeam":   "Mustafa and Danish",
+}
+
+@app.get("/api/site-settings")
+def get_site_settings():
+    """Public — no auth. Every visitor fetches this on page load."""
+    stored = db.get_settings("site_content")
+    return {**_SITE_SETTINGS_DEFAULTS, **stored}
+
+@app.post("/api/site-settings")
+def save_site_settings(body: dict, _admin: dict = Depends(_require_admin)):
+    updates = {k: v for k, v in body.items() if k in _SITE_SETTINGS_DEFAULTS}
+    existing = db.get_settings("site_content")
+    merged = {**existing, **updates}
+    db.save_settings(merged, "site_content")
+    return {**_SITE_SETTINGS_DEFAULTS, **merged}
+
+
 # ── USER / ROLE ENDPOINTS ─────────────────────────────────────────────────────
 
 @app.post("/api/auth/sync-profile")
