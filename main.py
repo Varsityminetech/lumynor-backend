@@ -200,9 +200,9 @@ def login(req: LoginRequest, _rl=Depends(rate_limit(10, 900, "login"))):
     return {"access_token": token, "token_type": "bearer",
             "user": {"email": user["email"], "name": user["name"], "role": user["role"]}}
 
-@app.get("/audit/logs")
-def audit_logs(_admin: dict = Depends(_require_admin)):
-    return get_audit_logs()
+# NOTE: /audit/logs is registered further down, after _require_admin is defined.
+# Depends() resolves at decoration time, so the route cannot be declared here —
+# doing so raises NameError at import and the app fails to boot.
 
 from fastapi import Depends, Header, File, UploadFile, Request
 
@@ -264,6 +264,11 @@ def _require_admin(auth_user: dict = Depends(_get_supabase_user)) -> dict:
 # These dump the internal pipeline's current document. Previously public — anyone
 # could fetch the in-progress internal report. Declared here (not at the top of the
 # module) because Depends(_require_admin) needs that function to already exist.
+
+@app.get("/audit/logs")
+def audit_logs(_admin: dict = Depends(_require_admin)):
+    return get_audit_logs()
+
 
 @app.get("/export/docx")
 async def export_docx(_admin: dict = Depends(_require_admin)):
