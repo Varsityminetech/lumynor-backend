@@ -23,25 +23,18 @@ import weekly_intel as wi
 
 app = FastAPI(title="Lumynor Systems Engine")
 
-# ── EXPORT ENDPOINTS ──────────────────────────────────────────────────────────
-@app.get("/export/docx")
-async def export_docx():
-    content = manager.pipeline_state.get("current_document", "No content available.")
-    path = os.path.join(os.path.dirname(__file__), "export.docx")
-    markdown_to_docx(content, path)
-    return FileResponse(path, filename="Lumynor_Report.docx")
-
-@app.get("/export/pptx")
-async def export_pptx():
-    content = manager.pipeline_state.get("current_document", "No content available.")
-    path = os.path.join(os.path.dirname(__file__), "export.pptx")
-    markdown_to_pptx(content, path)
-    return FileResponse(path, filename="Lumynor_Presentation.pptx")
+# NOTE: the /export/docx and /export/pptx routes are registered further down, after
+# _require_admin is defined — they expose internal pipeline output and are admin-only.
+# (Depends(_require_admin) is evaluated at decoration time, so the route must be
+# declared after that function exists, not here at the top of the module.)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    # Auth is Bearer-token in the Authorization header, never cookies — so credentialed
+    # CORS is not needed. "*" origins WITH allow_credentials=True is also an invalid combo
+    # browsers reject. Credentials off keeps the wildcard valid and correct.
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -156,7 +149,7 @@ def login(req: LoginRequest):
             "user": {"email": user["email"], "name": user["name"], "role": user["role"]}}
 
 @app.get("/audit/logs")
-def audit_logs():
+def audit_logs(_admin: dict = Depends(_require_admin)):
     return get_audit_logs()
 
 from fastapi import Depends, Header, File, UploadFile, Request
@@ -213,6 +206,26 @@ def _require_admin(auth_user: dict = Depends(_get_supabase_user)) -> dict:
     if not profile or profile.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     return {**auth_user, "role": "admin"}
+
+
+# ── EXPORT ENDPOINTS (admin-only) ─────────────────────────────────────────────
+# These dump the internal pipeline's current document. Previously public — anyone
+# could fetch the in-progress internal report. Declared here (not at the top of the
+# module) because Depends(_require_admin) needs that function to already exist.
+
+@app.get("/export/docx")
+async def export_docx(_admin: dict = Depends(_require_admin)):
+    content = manager.pipeline_state.get("current_document", "No content available.")
+    path = os.path.join(os.path.dirname(__file__), "export.docx")
+    markdown_to_docx(content, path)
+    return FileResponse(path, filename="Lumynor_Report.docx")
+
+@app.get("/export/pptx")
+async def export_pptx(_admin: dict = Depends(_require_admin)):
+    content = manager.pipeline_state.get("current_document", "No content available.")
+    path = os.path.join(os.path.dirname(__file__), "export.pptx")
+    markdown_to_pptx(content, path)
+    return FileResponse(path, filename="Lumynor_Presentation.pptx")
 
 
 # ── PUBLIC SITE SETTINGS ───────────────────────────────────────────────────────
@@ -1419,7 +1432,7 @@ def chat_lead(req: dict):
     return {"status": "success", "lead": new_lead}
 
 @app.get("/api/leads/all")
-def get_leads():
+def get_leads(_admin: dict = Depends(_require_admin)):
     return db.get_all_leads()
 
 @app.post("/api/leads/contact")
@@ -1506,12 +1519,12 @@ def get_published_blogs():
     return db.get_published_blogs()
 
 @app.get("/api/blogs/admin")
-def get_all_blogs():
+def get_all_blogs(_admin: dict = Depends(_require_admin)):
     return db.get_all_blogs()
 
 
 @app.get("/api/blogs/review-queue")
-def get_review_queue():
+def get_review_queue(_admin: dict = Depends(_require_admin)):
     """Return auto-posted draft blogs that need human review before publishing."""
     queue = db.get_review_queue()
     return {"count": len(queue), "blogs": queue}
@@ -1527,7 +1540,7 @@ def get_single_blog(slug_or_id: str):
     return {**blog, "comments": comments}
 
 @app.post("/api/blogs")
-def create_blog(req: BlogSaveRequest):
+def create_blog(req: BlogSaveRequest, _admin: dict = Depends(_require_admin)):
     new_blog = req.dict()
     new_blog["content"] = ensure_html_content(new_blog.get("content", ""))
     new_blog["id"] = str(uuid.uuid4())
@@ -1536,7 +1549,7 @@ def create_blog(req: BlogSaveRequest):
     return {"status": "success", "blog": new_blog}
 
 @app.put("/api/blogs/{blog_id}")
-def update_blog(blog_id: str, req: BlogSaveRequest):
+def update_blog(blog_id: str, req: BlogSaveRequest, _admin: dict = Depends(_require_admin)):
     existing = db.get_blog(blog_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Blog post not found")
@@ -1549,7 +1562,7 @@ def update_blog(blog_id: str, req: BlogSaveRequest):
     return {"status": "success", "blog": updated}
 
 @app.patch("/api/blogs/{blog_id}")
-def patch_blog(blog_id: str, req: dict):
+def patch_blog(blog_id: str, req: dict, _admin: dict = Depends(_require_admin)):
     """Partial update — merges fields without losing AI metadata."""
     existing = db.get_blog(blog_id)
     updated  = db.patch_blog(blog_id, req)
@@ -1562,7 +1575,7 @@ def patch_blog(blog_id: str, req: dict):
     return {"status": "success", "blog": updated}
 
 @app.delete("/api/blogs/{blog_id}")
-def delete_blog(blog_id: str):
+def delete_blog(blog_id: str, _admin: dict = Depends(_require_admin)):
     existing = db.get_blog(blog_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Blog post not found")
@@ -1626,7 +1639,7 @@ def add_comment(slug_or_id: str, req: BlogCommentRequest):
     return {"status": "success", "comment": new_comment}
 
 @app.get("/api/system/ollama-models")
-def get_ollama_models(baseUrl: str = "http://localhost:11434"):
+def get_ollama_models(baseUrl: str = "http://localhost:11434", _admin: dict = Depends(_require_admin)):
     try:
         url = f"{baseUrl.rstrip('/')}/api/tags"
         req = urllib.request.Request(url)
@@ -1639,7 +1652,7 @@ def get_ollama_models(baseUrl: str = "http://localhost:11434"):
         return {"status": "success", "models": []}
 
 @app.post("/api/blogs/generate")
-def generate_blog_draft(req: BlogGenerateRequest):
+def generate_blog_draft(req: BlogGenerateRequest, _admin: dict = Depends(_require_admin)):
     # Setup prompt
     system_instruction = (
         "You are an expert SEO and copywriter assistant. Generate a highly engaging blog post based on the requested user prompt, category, keywords, and tone.\n"
@@ -1697,7 +1710,7 @@ class BlogSeoOptimizeRequest(BaseModel):
     llmBaseUrl: str = ""
 
 @app.post("/api/blogs/optimize-seo")
-def optimize_seo_blog(req: BlogSeoOptimizeRequest):
+def optimize_seo_blog(req: BlogSeoOptimizeRequest, _admin: dict = Depends(_require_admin)):
     system_instruction = (
         "You are an expert SEO and copywriting analyst. You have been given a draft blog post that needs to be optimized for search engine optimization (SEO) and E-E-A-T guidelines.\n"
         "Analyze the current content, keywords, and layout, and rewrite it to satisfy all SEO rules. Specifically:\n"
@@ -1764,7 +1777,7 @@ class AutoBlogSettingsUpdateRequest(BaseModel):
     llmBaseUrl: str = ""
 
 @app.get("/api/system/auto-blog-settings")
-def get_auto_blog_settings():
+def get_auto_blog_settings(_admin: dict = Depends(_require_admin)):
     stored = db.get_settings("auto_blog")
     defaults = {
         "enabled": False,
@@ -1789,7 +1802,7 @@ def get_auto_blog_settings():
     return defaults
 
 @app.post("/api/system/auto-blog-settings")
-def update_auto_blog_settings(req: AutoBlogSettingsUpdateRequest):
+def update_auto_blog_settings(req: AutoBlogSettingsUpdateRequest, _admin: dict = Depends(_require_admin)):
     existing = db.get_settings("auto_blog")
     updated = {**existing, **req.dict()}
     db.save_settings(updated, "auto_blog")
@@ -2005,7 +2018,7 @@ from auto_blogger import (
 )
 
 @app.get("/api/system/test-images")
-async def test_images():
+async def test_images(_admin: dict = Depends(_require_admin)):
     """Test Pexels and Unsplash API keys from env — returns status, sample URL, or error for each."""
     import os as _os
     from auto_blogger import _search_pexels, _search_unsplash
@@ -2037,7 +2050,7 @@ async def test_images():
 
 
 @app.get("/api/system/test-tavily")
-async def test_tavily(key: str = ""):
+async def test_tavily(key: str = "", _admin: dict = Depends(_require_admin)):
     """Test whether a Tavily API key works. Pass ?key=tvly-xxx or leave blank to check env."""
     import os as _os
     resolved_key = key or _os.getenv("TAVILY_API_KEY", "")
@@ -2215,7 +2228,7 @@ async def _auto_generate_bg(merged_settings: dict, gemini_key: str, llm_cfg: dic
 
 
 @app.post("/api/blogs/auto-generate")
-async def auto_generate_blog(req: AutoBlogRunRequest):
+async def auto_generate_blog(req: AutoBlogRunRequest, _admin: dict = Depends(_require_admin)):
     """Kick off the full auto-blog pipeline as a background task and return 202 immediately."""
     settings = db.get_settings()
 
@@ -2262,7 +2275,7 @@ async def auto_generate_blog(req: AutoBlogRunRequest):
 
 
 @app.get("/api/trending-topics")
-async def get_trending_topics(niche: str = "Technology", keywords: str = ""):
+async def get_trending_topics(niche: str = "Technology", keywords: str = "", _admin: dict = Depends(_require_admin)):
     """Get trending topic suggestions for a niche without generating a full blog."""
     gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
     settings = db.get_settings()
@@ -2285,7 +2298,7 @@ class ImageGenerateRequest(BaseModel):
     nanobanana_url: str = ""
 
 @app.post("/api/images/generate")
-def generate_image(req: ImageGenerateRequest):
+def generate_image(req: ImageGenerateRequest, _admin: dict = Depends(_require_admin)):
     """Generate an AI image via Nanobanana (or fallback placeholder)."""
     import urllib.parse
     nanobanana_key = req.nanobanana_key or os.getenv("NANOBANANA_API_KEY", "")
@@ -2343,7 +2356,7 @@ class AutoBlogSettingsUpdateRequestV2(BaseModel):
     nanobanana_url: str = ""
 
 @app.post("/api/system/auto-blog-settings/v2")
-def update_auto_blog_settings_v2(req: AutoBlogSettingsUpdateRequestV2):
+def update_auto_blog_settings_v2(req: AutoBlogSettingsUpdateRequestV2, _admin: dict = Depends(_require_admin)):
     existing = db.get_settings()
     updated = {**existing, **req.dict()}
     db.save_settings(updated)
@@ -2471,7 +2484,7 @@ async def generate_and_post_auto_blog_v2(settings: dict):
 
 
 @app.post("/api/system/trigger-blog")
-async def trigger_blog_now():
+async def trigger_blog_now(_admin: dict = Depends(_require_admin)):
     """Force the auto-blogger daemon to run on its next tick (within 10 seconds).
     Returns immediately — generation runs in the background and is broadcast via WebSocket."""
     settings = db.get_settings()
@@ -2482,7 +2495,7 @@ async def trigger_blog_now():
 
 
 @app.get("/api/blogs/{blog_id}/audit")
-async def audit_blog(blog_id: str):
+async def audit_blog(blog_id: str, _admin: dict = Depends(_require_admin)):
     """Run SEO + credibility auditors on a saved blog and return both reports."""
     blog = db.get_blog(blog_id)
     if not blog:
@@ -2542,7 +2555,7 @@ async def audit_blog(blog_id: str):
 
 
 @app.post("/api/blogs/{blog_id}/revise-credibility")
-async def revise_blog_credibility_endpoint(blog_id: str):
+async def revise_blog_credibility_endpoint(blog_id: str, _admin: dict = Depends(_require_admin)):
     """Run up to 3 surgical credibility-rewrite loops on a saved blog post.
     Saves the improved content + score back to the database."""
     blog = db.get_blog(blog_id)
@@ -2610,7 +2623,7 @@ async def revise_blog_credibility_endpoint(blog_id: str):
 
 
 @app.post("/api/blogs/{blog_id}/revise-plagiarism")
-async def revise_blog_plagiarism_endpoint(blog_id: str):
+async def revise_blog_plagiarism_endpoint(blog_id: str, _admin: dict = Depends(_require_admin)):
     """Run up to 3 surgical plagiarism-rewrite loops on a saved blog post.
     Flagged sentences are rephrased with original wording. Saves revised content + score."""
     blog = db.get_blog(blog_id)
@@ -2681,7 +2694,7 @@ async def revise_blog_plagiarism_endpoint(blog_id: str):
 
 
 @app.post("/api/blogs/{blog_id}/format")
-async def format_blog_html_endpoint(blog_id: str):
+async def format_blog_html_endpoint(blog_id: str, _admin: dict = Depends(_require_admin)):
     """Convert content_markdown → branded HTML for Preview or Publish.
     Saves content_html + content back to the blog. Safe to call on already-HTML blogs (no-op)."""
     blog = db.get_blog(blog_id)
@@ -2712,18 +2725,18 @@ class AffiliateLinkUpdate(BaseModel):
     is_active: bool | None = None
 
 @app.get("/api/affiliate")
-async def list_affiliate_links():
+async def list_affiliate_links(_admin: dict = Depends(_require_admin)):
     """List all affiliate links with click stats."""
     return db.get_affiliate_stats()
 
 @app.post("/api/affiliate")
-async def create_affiliate_link(req: AffiliateLinkCreate):
+async def create_affiliate_link(req: AffiliateLinkCreate, _admin: dict = Depends(_require_admin)):
     if not req.keyword.strip() or not req.url.strip():
         raise HTTPException(status_code=400, detail="keyword and url are required")
     return db.create_affiliate_link(req.keyword, req.url)
 
 @app.patch("/api/affiliate/{link_id}")
-async def update_affiliate_link(link_id: str, req: AffiliateLinkUpdate):
+async def update_affiliate_link(link_id: str, req: AffiliateLinkUpdate, _admin: dict = Depends(_require_admin)):
     fields = {k: v for k, v in req.dict().items() if v is not None}
     updated = db.update_affiliate_link(link_id, fields)
     if not updated:
@@ -2731,7 +2744,7 @@ async def update_affiliate_link(link_id: str, req: AffiliateLinkUpdate):
     return updated
 
 @app.delete("/api/affiliate/{link_id}")
-async def delete_affiliate_link(link_id: str):
+async def delete_affiliate_link(link_id: str, _admin: dict = Depends(_require_admin)):
     db.delete_affiliate_link(link_id)
     return {"status": "deleted"}
 
@@ -2746,7 +2759,7 @@ async def track_affiliate_click(link_id: str, blog_id: str = "", blog_slug: str 
     return RedirectResponse(url=link["url"], status_code=302)
 
 @app.post("/api/blogs/{blog_id}/toggle-affiliates")
-async def toggle_blog_affiliates(blog_id: str):
+async def toggle_blog_affiliates(blog_id: str, _admin: dict = Depends(_require_admin)):
     """Enable or disable affiliate link injection on a specific blog.
     When enabling: injects active affiliate links into the blog HTML.
     When disabling: strips all affiliate links, restoring plain text."""
@@ -2775,7 +2788,7 @@ async def toggle_blog_affiliates(blog_id: str):
 
 
 @app.post("/api/blogs/{blog_id}/revise")
-async def revise_saved_blog(blog_id: str):
+async def revise_saved_blog(blog_id: str, _admin: dict = Depends(_require_admin)):
     """Run targeted content revision automation on a saved blog post.
     Classifies SEO issues into buckets → applies minimum surgical fix per bucket
     → re-audits → loops up to 2 times.
@@ -2907,7 +2920,7 @@ async def revise_saved_blog(blog_id: str):
 
 
 @app.post("/api/system/migrate-json-to-supabase")
-def migrate_json_to_supabase():
+def migrate_json_to_supabase(_admin: dict = Depends(_require_admin)):
     """One-time migration: copy blogs.json and leads.json into Supabase.
     Safe to run multiple times — skips rows that already exist by slug/email."""
     if not db.is_connected():

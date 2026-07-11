@@ -129,7 +129,13 @@ def update_event_status(event_id: str, status: str) -> dict | None:
 
 def verify_github_signature(body: bytes, signature: str) -> bool:
     if not GITHUB_SECRET:
-        return True  # dev mode: no secret configured
+        # Fail-OPEN: without a secret, ANYONE can POST forged events to
+        # /api/webhooks/github and inject fake activity/commits. This is only
+        # acceptable in local dev. Set GITHUB_WEBHOOK_SECRET in the Railway env
+        # (matching the secret configured on the GitHub webhook) to close it.
+        print("⚠️  SECURITY: GITHUB_WEBHOOK_SECRET is not set — webhook signature "
+              "verification is DISABLED and anyone can forge activity events.")
+        return True
     mac = hmac.new(GITHUB_SECRET.encode(), body, hashlib.sha256)
     expected = "sha256=" + mac.hexdigest()
     return hmac.compare_digest(expected, signature or "")

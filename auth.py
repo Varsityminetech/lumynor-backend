@@ -1,11 +1,18 @@
 import json
 import os
+import secrets
 import bcrypt
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
 
-SECRET_KEY = os.getenv("SECRET_KEY", "lumynor-super-secret-key-change-in-production")
+_DEFAULT_SECRET = "lumynor-super-secret-key-change-in-production"
+SECRET_KEY = os.getenv("SECRET_KEY", _DEFAULT_SECRET)
+if SECRET_KEY == _DEFAULT_SECRET:
+    # A predictable JWT signing key means anyone can forge legacy tokens (which are
+    # accepted by /ws and /auth/admin/credentials). Loudly flag it; set SECRET_KEY
+    # in the Railway environment to a long random value.
+    print("⚠️  SECURITY: SECRET_KEY is the insecure default — set SECRET_KEY env var to a random secret.")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 8
 
@@ -14,10 +21,18 @@ os.makedirs(_DATA_DIR, exist_ok=True)
 USERS_FILE = os.path.join(_DATA_DIR, "users.json")
 AUDIT_FILE = os.path.join(_DATA_DIR, "audit_log.json")
 
+# Seeded legacy passwords come from env, NOT a hardcoded well-known value. The old
+# hardcoded "lumynor_ceo_2024" was public in source and re-seeded on every Railway
+# deploy (ephemeral fs), so anyone could log in via /auth/login. Now: use
+# LEGACY_ADMIN_PASSWORD if set, otherwise a random per-boot password (effectively
+# disabling legacy login unless the operator sets one). The main dashboard uses
+# Supabase auth and does not depend on these.
+_LEGACY_PW = os.getenv("LEGACY_ADMIN_PASSWORD") or secrets.token_urlsafe(24)
+
 DEFAULT_USERS = [
-    {"email": "admin@lumynor.com",     "name": "CEO",        "role": "ceo",      "password": "lumynor_ceo_2024"},
-    {"email": "observer1@lumynor.com", "name": "Observer 1", "role": "observer", "password": "lumynor_obs1_2024"},
-    {"email": "observer2@lumynor.com", "name": "Observer 2", "role": "observer", "password": "lumynor_obs2_2024"},
+    {"email": "admin@lumynor.com",     "name": "CEO",        "role": "ceo",      "password": _LEGACY_PW},
+    {"email": "observer1@lumynor.com", "name": "Observer 1", "role": "observer", "password": secrets.token_urlsafe(24)},
+    {"email": "observer2@lumynor.com", "name": "Observer 2", "role": "observer", "password": secrets.token_urlsafe(24)},
 ]
 
 def _hash(password: str) -> str:
