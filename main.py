@@ -3,7 +3,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from auth import (
@@ -41,6 +41,58 @@ app.add_middleware(
 
 seed_users()
 seed_audit()
+
+# ── RATE LIMITING ─────────────────────────────────────────────────────────────
+# In-memory sliding-window limiter. Deliberately dependency-free (no slowapi) so
+# nothing new has to resolve on the Railway build path. Single-instance only —
+# counters are per-process, which is fine here but would need Redis if this ever
+# scales to multiple replicas.
+#
+# The abuse surface is the PUBLIC, unauthenticated endpoints: lead/comment spam,
+# login brute-force, and the WhatsApp webhook (which triggers paid LLM calls on
+# every inbound message and has no Twilio signature check yet).
+
+from collections import defaultdict, deque
+import threading
+
+_rl_lock = threading.Lock()
+_rl_hits: dict = defaultdict(deque)     # "scope:ip" -> deque[timestamps]
+
+
+def _client_ip(request: Request) -> str:
+    """Real client IP. Railway sits behind a proxy, so request.client.host is the
+    proxy — the true origin is the first entry in X-Forwarded-For."""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def rate_limit(limit: int, window_seconds: int, scope: str):
+    """FastAPI dependency: allow `limit` requests per `window_seconds` per client IP."""
+    def _dep(request: Request):
+        key = f"{scope}:{_client_ip(request)}"
+        now = time.time()
+        cutoff = now - window_seconds
+        with _rl_lock:
+            hits = _rl_hits[key]
+            while hits and hits[0] < cutoff:      # drop timestamps outside the window
+                hits.popleft()
+            if len(hits) >= limit:
+                retry = int(hits[0] + window_seconds - now) + 1
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Too many requests. Try again in {retry}s.",
+                    headers={"Retry-After": str(retry)},
+                )
+            hits.append(now)
+            # Opportunistic prune so the key dict can't grow unbounded from
+            # one-off IPs that never come back.
+            if len(_rl_hits) > 5000:
+                for k in [k for k, v in _rl_hits.items() if not v or v[-1] < cutoff]:
+                    _rl_hits.pop(k, None)
+    return _dep
+
 
 # ── MULTI-USER CONNECTION MANAGER ─────────────────────────────────────────────
 
@@ -140,7 +192,7 @@ class LoginRequest(BaseModel):
     password: str
 
 @app.post("/auth/login")
-def login(req: LoginRequest):
+def login(req: LoginRequest, _rl=Depends(rate_limit(10, 900, "login"))):
     user = authenticate_user(req.email, req.password)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -880,7 +932,7 @@ async def github_webhook(request: Request):
 
 
 @app.post("/api/webhooks/whatsapp", include_in_schema=False)
-async def whatsapp_webhook(request: Request):
+async def whatsapp_webhook(request: Request, _rl=Depends(rate_limit(20, 60, "wa_hook"))):
     """Twilio calls this on every inbound WhatsApp message. Replies async (outside
     Twilio's webhook timeout) by sending a follow-up message via the REST API."""
     form = await request.form()
@@ -1404,7 +1456,7 @@ class BlogGenerateRequest(BaseModel):
     llmBaseUrl: str = ""
 
 @app.post("/api/leads/subscribe")
-def subscribe_lead(req: LeadSubscribeRequest):
+def subscribe_lead(req: LeadSubscribeRequest, _rl=Depends(rate_limit(5, 600, "leads"))):
     if db.lead_exists(req.email):
         return {"status": "success", "message": "Already subscribed."}
     new_lead = {
@@ -1418,7 +1470,7 @@ def subscribe_lead(req: LeadSubscribeRequest):
     return {"status": "success", "lead": new_lead}
 
 @app.post("/api/leads/chat")
-def chat_lead(req: dict):
+def chat_lead(req: dict, _rl=Depends(rate_limit(5, 600, "leads"))):
     new_lead = {
         "id": str(uuid.uuid4()),
         "source": req.get("source", "chatbot"),
@@ -1436,7 +1488,7 @@ def get_leads(_admin: dict = Depends(_require_admin)):
     return db.get_all_leads()
 
 @app.post("/api/leads/contact")
-def contact_inquiry(req: dict):
+def contact_inquiry(req: dict, _rl=Depends(rate_limit(5, 600, "leads"))):
     """Store a full project inquiry from the Contact page."""
     new_lead = {
         "id":          str(uuid.uuid4()),
@@ -1627,7 +1679,7 @@ def indexer_status(_admin: dict = Depends(_require_admin)):
     ]
 
 @app.post("/api/blogs/{slug_or_id}/comments")
-def add_comment(slug_or_id: str, req: BlogCommentRequest):
+def add_comment(slug_or_id: str, req: BlogCommentRequest, _rl=Depends(rate_limit(10, 600, "comments"))):
     blog = db.get_blog(slug_or_id)
     if not blog:
         raise HTTPException(status_code=404, detail="Blog post not found")
