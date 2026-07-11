@@ -2,6 +2,7 @@
 Lumynor Activity OS — event storage, retrieval, and ATLAS intelligence.
 """
 import os
+import re
 import json
 import uuid
 import hmac
@@ -171,17 +172,32 @@ _REPO_MAP: dict[str, str] = {
 }
 
 
+def _slugify_repo(repo_name: str) -> str:
+    """Turn an arbitrary GitHub repo name into a stable project slug:
+    lowercase, non-alphanumerics collapsed to single underscores, trimmed.
+    e.g. 'Cool-New.App' -> 'cool_new_app'. Empty/garbage falls back to 'other'."""
+    slug = re.sub(r'[^a-z0-9]+', '_', (repo_name or "").lower()).strip('_')
+    return slug or "other"
+
+
 def _detect_project(repo_name: str) -> str:
-    """Map a GitHub repo name to one of the known project slugs."""
+    """Map a GitHub repo name to a project slug.
+
+    Known projects use their canonical slug (via the explicit map or substring
+    match). ANY other repo is auto-slugified into its OWN new project slug rather
+    than being dumped into 'other' — this is what lets a brand-new connected repo
+    show up as its own project in Activity OS without a code change. (Repos you
+    explicitly want ignored can still be pinned to 'other' in _REPO_MAP.)"""
     raw = (repo_name or "").strip()
+    if not raw:
+        return "other"
 
     # 1. Explicit override map (exact match on raw repo name)
     if raw in _REPO_MAP:
         return _REPO_MAP[raw]
 
-    # 2. Normalised substring matching — strip hyphens, underscores, digits for looser matching
+    # 2. Normalised substring matching for the known projects
     name = raw.lower().replace("-", "").replace("_", "").replace(" ", "")
-
     if "agentforge" in name:
         return "agentforge"
     if "linkforge" in name:
@@ -191,7 +207,9 @@ def _detect_project(repo_name: str) -> str:
         return "district21"
     if "website" in name or "lumynor" in name:
         return "lumynor_website"
-    return "other"
+
+    # 3. Unknown repo → its own auto-derived project slug (not 'other')
+    return _slugify_repo(raw)
 
 
 def parse_github_event(gh_event: str, payload: dict) -> dict | None:
