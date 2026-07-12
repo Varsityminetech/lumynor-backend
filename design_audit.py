@@ -643,7 +643,12 @@ def _visual_review(page_data: dict, gemini_key: str) -> dict | None:
     """
     shot_d = page_data.get("screenshot_desktop")
     shot_m = page_data.get("screenshot_mobile")
-    if not shot_d or not gemini_key:
+    if not shot_d:
+        print("[design_audit] vision SKIPPED: no desktop screenshot was captured")
+        return None
+    if not gemini_key:
+        print("[design_audit] vision SKIPPED: no Gemini key (vision needs Gemini even when the "
+              "main LLM is Ollama — set GEMINI_API_KEY in the environment)")
         return None
 
     parts = [{
@@ -1009,7 +1014,15 @@ def run_audit(url: str, pages: list = None, notes: str = "", auditor_notes: str 
         return {"error": "LLM module not available"}
 
     stored     = get_settings("auto_blog")
-    gemini_key = stored.get("llmApiKey", "")
+    # Fall back to the environment like the rest of the codebase does. Without this,
+    # gemini_key is empty whenever the configured provider is Ollama — which silently
+    # disabled the whole vision pass (visually_reviewed came back False in prod even
+    # though screenshots were captured fine).
+    import os as _os
+    gemini_key = (stored.get("llmApiKey")
+                  or _os.getenv("GEMINI_API_KEY")
+                  or _os.getenv("GOOGLE_API_KEY")
+                  or "")
     if not gemini_key and stored.get("llmProvider", "gemini") == "gemini":
         return {"error": "LLM not configured — set API key in Settings → Auto Blogger"}
 
@@ -1068,6 +1081,13 @@ def run_audit(url: str, pages: list = None, notes: str = "", auditor_notes: str 
     visual = _visual_review(page_data, gemini_key)
     if visual:
         page_data["visual"] = visual
+    else:
+        # Never fail silently — record WHY there is no visual verdict, so the report
+        # can be honest about it instead of quietly dropping a promised capability.
+        page_data["visual_skipped"] = (
+            "no screenshot captured" if not page_data.get("screenshot_desktop")
+            else "vision model unavailable"
+        )
 
     live_ctx  = _build_context(page_data, pagespeed)
 
@@ -1136,6 +1156,7 @@ Return ONLY valid JSON — no markdown fences, no explanation outside the JSON."
             "contrast": page_data.get("contrast"),
             "trust":    page_data.get("trust"),
             "visual":   page_data.get("visual"),
+            "visual_skipped": page_data.get("visual_skipped"),
             "rendered_on": ["desktop 1440x900", "mobile 390x844"]
                            if page_data.get("mobile") and not (page_data.get("mobile") or {}).get("error")
                            else ["desktop 1440x900"],
