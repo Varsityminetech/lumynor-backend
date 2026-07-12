@@ -788,6 +788,94 @@ def design_audit_delete(audit_id: str, _admin: dict = Depends(_require_admin)):
     return {"ok": True}
 
 
+# ── PUBLIC design audit (lead magnet) ─────────────────────────────────────────
+# Anyone can audit their own site: they get the score + top 3 issues free, then
+# trade an email for the full 41-point report (which lands in the leads pipeline).
+#
+# This is the ONLY public endpoint that spends real money per call (headless
+# Chromium + PageSpeed + ~7-9k input / 4k output LLM tokens), so it is guarded on
+# three axes:
+#   1. SSRF      — design_audit.assert_url_is_public() (blocks internal/private IPs)
+#   2. Cost      — hard IP rate limit below
+#   3. Capacity  — design_audit._AUDIT_SLOTS semaphore (can't OOM the shared box)
+
+def _teaser_from_report(report: dict) -> dict:
+    """Free slice: score, summary, and the 3 most severe issues. Everything else
+    (full issue lists, heuristic map, fix roadmap) stays locked behind the email."""
+    crit = report.get("critical_issues") or []
+    high = report.get("high_issues") or []
+    med  = report.get("medium_issues") or []
+    preview = (crit + high)[:3]          # most severe first
+    return {
+        "audit_id":          report.get("id"),
+        "url":               report.get("url", ""),
+        "overall_score":     report.get("overall_score", 0),
+        "executive_summary": report.get("executive_summary", ""),
+        "preview_issues":    preview,
+        "counts": {
+            "critical": len(crit),
+            "high":     len(high),
+            "medium":   len(med),
+            "total":    len(crit) + len(high) + len(med),
+        },
+        "locked":            True,
+        "locked_message":    "Enter your email to unlock the full report — every issue, the Nielsen heuristic map, and a prioritised fix roadmap.",
+    }
+
+
+@app.post("/api/public/audit")
+def public_audit(body: dict, _rl=Depends(rate_limit(3, 3600, "public_audit"))):
+    """Public: run a design audit, return only the teaser. 3/hour per IP."""
+    url = (body.get("url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Please enter a website URL.")
+
+    # Always 'generic': it's the visitor's own site, so grade it on its own merits
+    # against universal UX principles — never against Lumynor's design system.
+    report = da.run_audit(url, pages=[url], notes="", auditor_notes="", mode="generic")
+    if report.get("error"):
+        raise HTTPException(status_code=400, detail=report["error"])
+
+    saved = da.save_audit(report)          # persist full report; teaser references its id
+    return _teaser_from_report(saved)
+
+
+@app.post("/api/public/audit/unlock")
+def public_audit_unlock(body: dict, _rl=Depends(rate_limit(10, 3600, "public_unlock"))):
+    """Public: trade an email for the full report. Captures the lead."""
+    audit_id = (body.get("audit_id") or "").strip()
+    email    = (body.get("email") or "").strip().lower()
+    name     = (body.get("name") or "").strip()
+
+    if not audit_id:
+        raise HTTPException(status_code=400, detail="audit_id required")
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+
+    report = da.get_audit(audit_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="That audit could not be found — please run it again.")
+
+    # Capture the lead (idempotent — re-unlocking with the same email won't duplicate)
+    if not db.lead_exists(email):
+        try:
+            db.insert_lead({
+                "id":      str(uuid.uuid4()),
+                "source":  "design_audit",
+                "name":    name,
+                "email":   email,
+                "message": f"Ran a free design audit on {report.get('url', '')} — scored {report.get('overall_score', '?')}/10",
+                "created_at": datetime.utcnow().isoformat(),
+            })
+        except Exception as e:
+            # Never block the report the visitor already earned just because the
+            # CRM write failed — log it and still deliver.
+            print(f"[public_audit] lead capture failed for {email}: {e}")
+
+    report["locked"] = False
+    return report
+
+
 # ── Daily Digest ──────────────────────────────────────────────────────────────
 
 @app.get("/api/digest/preview")

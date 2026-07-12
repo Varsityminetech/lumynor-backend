@@ -9,10 +9,74 @@ import json
 import re
 import shutil
 import uuid
+import socket
+import ipaddress
+import threading
+from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 from db import _sb, get_settings
+
+
+# ── SSRF guard ────────────────────────────────────────────────────────────────
+# This module fetches a URL the CALLER supplies and then has an LLM read the
+# contents back to them. Exposed publicly that is a textbook SSRF: an attacker
+# submits http://169.254.169.254/ (cloud metadata) or http://127.0.0.1:8000/ and
+# our own server fetches internal resources and summarises them to the attacker.
+#
+# Checking the hostname string is NOT enough — "evil.com" can resolve to
+# 127.0.0.1. So we resolve the host to its actual IP(s) and reject if ANY of them
+# is private/loopback/link-local. Call this before every fetch.
+
+class UnsafeURLError(ValueError):
+    """Raised when a URL points somewhere we must never fetch (internal/private)."""
+
+
+def assert_url_is_public(url: str) -> None:
+    """Raise UnsafeURLError unless `url` is a public http(s) address.
+
+    Blocks: non-http(s) schemes (file://, gopher://, etc.), and any host that
+    resolves to loopback, private, link-local (incl. 169.254.169.254 metadata),
+    reserved, or multicast space.
+    """
+    parsed = urlparse(url)
+
+    if parsed.scheme.lower() not in ("http", "https"):
+        raise UnsafeURLError(f"Only http:// and https:// URLs are allowed (got '{parsed.scheme}://').")
+
+    host = parsed.hostname
+    if not host:
+        raise UnsafeURLError("URL has no hostname.")
+
+    # Resolve to real IPs — defeats DNS rebinding and hostnames that alias localhost.
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        raise UnsafeURLError(f"Could not resolve '{host}'. Check the domain is spelled correctly.")
+
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise UnsafeURLError(
+                f"'{host}' resolves to a private/internal address ({ip}). "
+                "Only public websites can be audited."
+            )
+
+
+# ── Concurrency cap ───────────────────────────────────────────────────────────
+# Each audit spawns a headless Chromium (~300MB RAM). This backend also runs the
+# blog pipeline, Lumy, the admin dashboard and several daemons on ONE Railway
+# instance — so unbounded concurrent renders would OOM the container and take the
+# whole production app down. Cap simultaneous renders; callers beyond the cap get
+# a clean "busy" error instead of dragging the box under.
+
+_AUDIT_SLOTS = threading.BoundedSemaphore(2)
+
+
+class AuditBusyError(RuntimeError):
+    """Raised when all audit slots are in use."""
 
 
 # ── Live page fetcher (Playwright headless browser) ───────────────────────────
@@ -605,8 +669,23 @@ def run_audit(url: str, pages: list = None, notes: str = "", auditor_notes: str 
     if url and not re.match(r'^https?://', url, re.I):
         url = "https://" + url
 
+    # SSRF guard — must run BEFORE any fetch. Mandatory once this is reachable by
+    # the public, and harmless for admin use.
+    try:
+        assert_url_is_public(url)
+    except UnsafeURLError as e:
+        return {"error": str(e)}
+
     # ── Step 1: fetch live data ───────────────────────────────────────────────
-    page_data = _fetch_page(url)
+    # Bounded: each render is a headless Chromium; unbounded concurrency would OOM
+    # the shared Railway box. Non-blocking acquire so a flood fails fast instead of
+    # queueing up and holding worker threads.
+    if not _AUDIT_SLOTS.acquire(blocking=False):
+        return {"error": "Audit capacity is full right now — please try again in a minute."}
+    try:
+        page_data = _fetch_page(url)
+    finally:
+        _AUDIT_SLOTS.release()
 
     # HARD FAIL if the page could not be fetched. Previously this fell through to
     # the LLM with an empty context: the scoring rule is "start at 10, deduct per
