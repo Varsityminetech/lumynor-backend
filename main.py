@@ -761,9 +761,14 @@ def design_audit_run(body: dict, _admin: dict = Depends(_require_admin)):
     pages         = body.get("pages") or [url]
     notes         = body.get("notes") or ""
     auditor_notes = body.get("auditor_notes") or ""
-    report = da.run_audit(url, pages, notes, auditor_notes)
+    # "lumynor" = grade against Lumynor's design principles (own products).
+    # "generic" = grade against universal UX heuristics (competitors/external sites).
+    mode          = (body.get("mode") or "lumynor").lower()
+    report = da.run_audit(url, pages, notes, auditor_notes, mode=mode)
     if report.get("error"):
-        raise HTTPException(status_code=500, detail=report["error"])
+        # 400, not 500 — an unreachable/invalid URL is a bad request, not a server
+        # fault, and this path is now hit whenever the page can't be fetched.
+        raise HTTPException(status_code=400, detail=report["error"])
     return da.save_audit(report)
 
 @app.get("/api/design-audit/history")

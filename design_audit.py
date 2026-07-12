@@ -539,9 +539,47 @@ ABSOLUTE RULES — violating any of these makes the audit worthless:
 """
 
 
+# ── Prompt mode ───────────────────────────────────────────────────────────────
+# The 41-item checklist is already built on universal, industry-standard heuristics
+# (Nielsen, Norman, Laws of UX, Gestalt, WCAG), so it applies to ANY site. Only the
+# persona header and one checklist item are Lumynor-specific. "generic" mode swaps
+# just those, so auditing a competitor/external site doesn't grade it as "fails to
+# match our design system".
+
+_GENERIC_HEADER = (
+    "You are a Senior UX Auditor. You evaluate ANY website against universal, "
+    "industry-standard usability and design principles.\n\n"
+    "IMPORTANT: This site is NOT yours and is NOT affiliated with you. Judge it on its "
+    "own merits — against its own apparent purpose, industry, and target audience. "
+    "NEVER grade it against another company's design system, brand, or house style, and "
+    "never suggest it should look like some other site. Infer what the site is trying to "
+    "be from its own content, then assess how well it achieves that."
+)
+
+_LUMYNOR_HEADER = (
+    "You are the Lumynor Design Audit Agent. Your knowledge base is the Lumynor UI/UX "
+    "Design Principles document (v1.0, June 2026)."
+)
+
+_C1_03_LUMYNOR = ("Visual design communicates premium quality appropriate to a "
+                  "digital product studio | van Schneider")
+_C1_03_GENERIC = ("Visual design communicates quality appropriate to the site's own "
+                  "apparent purpose and audience | van Schneider")
+
+
+def _system_prompt(mode: str) -> str:
+    """Return the system prompt for the requested mode ('lumynor' or 'generic')."""
+    if (mode or "lumynor").lower() != "generic":
+        return _SYSTEM_PROMPT
+    p = _SYSTEM_PROMPT.replace(_LUMYNOR_HEADER, _GENERIC_HEADER, 1)
+    p = p.replace(_C1_03_LUMYNOR, _C1_03_GENERIC, 1)
+    return p
+
+
 # ── Core audit function ───────────────────────────────────────────────────────
 
-def run_audit(url: str, pages: list = None, notes: str = "", auditor_notes: str = "") -> dict:
+def run_audit(url: str, pages: list = None, notes: str = "", auditor_notes: str = "",
+              mode: str = "lumynor") -> dict:
     """
     Run a full design audit:
     1. Render the live URL with Playwright (falls back to HTTP)
@@ -559,8 +597,39 @@ def run_audit(url: str, pages: list = None, notes: str = "", auditor_notes: str 
     if not gemini_key and stored.get("llmProvider", "gemini") == "gemini":
         return {"error": "LLM not configured — set API key in Settings → Auto Blogger"}
 
+    # ── Step 0: normalise the URL ─────────────────────────────────────────────
+    # A user typing "powerup.money" (no scheme) previously went straight to the
+    # fetcher, which cannot resolve a schemeless URL — it failed, and the audit
+    # then scored the empty result 10/10. Default to https:// when omitted.
+    url = (url or "").strip()
+    if url and not re.match(r'^https?://', url, re.I):
+        url = "https://" + url
+
     # ── Step 1: fetch live data ───────────────────────────────────────────────
     page_data = _fetch_page(url)
+
+    # HARD FAIL if the page could not be fetched. Previously this fell through to
+    # the LLM with an empty context: the scoring rule is "start at 10, deduct per
+    # failure", so with no data there was nothing to deduct and the audit returned
+    # a perfect 10/10 — while its own summary said "unable to reach the website"
+    # and every Nielsen heuristic was marked PASS. A confidently wrong 10/10 is
+    # worse than no audit, so refuse to score instead.
+    fetch_err = page_data.get("fetch_error")
+    if fetch_err:
+        return {"error": f"Could not reach {url} — {fetch_err}. No audit was run: a page that cannot be loaded cannot be scored."}
+
+    # Even without an explicit error, a page with no extractable content (empty
+    # response, bot-block, JS wall) must not be scored either.
+    has_content = any([
+        (page_data.get("title") or "").strip(),
+        (page_data.get("hero_text") or "").strip(),
+        page_data.get("nav_links"),
+        page_data.get("button_texts"),
+        page_data.get("link_texts"),
+    ])
+    if not has_content:
+        return {"error": f"Reached {url} but extracted no usable content (empty, bot-blocked, or JS-walled page). No audit was run."}
+
     pagespeed = _fetch_pagespeed(url)
     live_ctx  = _build_context(page_data, pagespeed)
 
@@ -598,7 +667,7 @@ Return ONLY valid JSON — no markdown fences, no explanation outside the JSON."
     try:
         llm_cfg = _build_llm_cfg(stored, gemini_key)
         raw = _llm(
-            f"{_SYSTEM_PROMPT}\n\n{user_prompt}",
+            f"{_system_prompt(mode)}\n\n{user_prompt}",
             llm_cfg,
             json_mode=False,
             timeout=120,
@@ -610,7 +679,8 @@ Return ONLY valid JSON — no markdown fences, no explanation outside the JSON."
             return {"error": "LLM did not return valid JSON", "raw": raw[:500]}
 
         report = json.loads(match.group())
-        report["url"]           = url
+        report["url"]           = url          # normalised (scheme added if omitted)
+        report["mode"]          = (mode or "lumynor").lower()
         report["audited_at"]    = datetime.now(timezone.utc).isoformat()
         report["notes"]         = notes
         report["pagespeed"]     = pagespeed
