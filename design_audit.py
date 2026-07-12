@@ -79,6 +79,173 @@ class AuditBusyError(RuntimeError):
     """Raised when all audit slots are in use."""
 
 
+# ── In-browser probes ─────────────────────────────────────────────────────────
+# These run INSIDE the rendered page, so they produce measured facts rather than
+# an LLM's guess. Everything here was previously either unverifiable ("requires
+# visual review") or, worse, silently assumed to pass.
+
+# WCAG contrast, computed properly: resolve each text node's effective background
+# by walking ancestors until something opaque, then compute the real ratio.
+_JS_CONTRAST = r"""
+() => {
+  const lum = (r, g, b) => {
+    const a = [r, g, b].map(v => {
+      v /= 255;
+      return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2];
+  };
+  const parse = c => {
+    const m = (c || '').match(/rgba?\(([^)]+)\)/);
+    if (!m) return null;
+    const p = m[1].split(',').map(s => parseFloat(s.trim()));
+    return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
+  };
+  const bgOf = el => {                       // first non-transparent ancestor bg
+    let n = el;
+    while (n && n !== document.documentElement) {
+      const c = parse(getComputedStyle(n).backgroundColor);
+      if (c && c.a > 0.1) return c;
+      n = n.parentElement;
+    }
+    const b = parse(getComputedStyle(document.body).backgroundColor);
+    return b && b.a > 0.1 ? b : { r: 255, g: 255, b: 255, a: 1 };
+  };
+
+  const fails = [];
+  let checked = 0;
+  const els = document.querySelectorAll('p,span,a,li,h1,h2,h3,h4,h5,h6,button,label,td,div');
+  for (const el of els) {
+    if (el.children.length > 0) continue;                 // leaf text only
+    const txt = (el.innerText || '').trim();
+    if (txt.length < 3) continue;
+    const st = getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.display === 'none' || parseFloat(st.opacity) < 0.1) continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) continue;
+
+    const fg = parse(st.color);
+    if (!fg) continue;
+    const bg = bgOf(el);
+    const L1 = lum(fg.r, fg.g, fg.b), L2 = lum(bg.r, bg.g, bg.b);
+    const ratio = (Math.max(L1, L2) + 0.05) / (Math.min(L1, L2) + 0.05);
+
+    const size = parseFloat(st.fontSize);
+    const bold = (parseInt(st.fontWeight) || 400) >= 700;
+    const isLarge = size >= 24 || (size >= 18.66 && bold);
+    const required = isLarge ? 3.0 : 4.5;                 // WCAG 2.1 AA
+
+    checked++;
+    if (ratio < required) {
+      fails.push({
+        text: txt.slice(0, 55),
+        ratio: Math.round(ratio * 100) / 100,
+        required,
+        font_px: Math.round(size),
+        color: st.color,
+        background: `rgb(${Math.round(bg.r)}, ${Math.round(bg.g)}, ${Math.round(bg.b)})`,
+      });
+    }
+  }
+  fails.sort((a, b) => a.ratio - b.ratio);                // worst first
+  return { checked, fail_count: fails.length, failures: fails.slice(0, 8) };
+}
+"""
+
+# Trust / social-proof signals — previously invisible to the auditor.
+_JS_TRUST = r"""
+() => {
+  const body = (document.body.innerText || '').toLowerCase();
+  const has = re => re.test(body);
+  const imgs = [...document.querySelectorAll('img')];
+  const alts = imgs.map(i => (i.alt || '').toLowerCase()).join(' ');
+  const hrefs = [...document.querySelectorAll('a')].map(a => (a.getAttribute('href') || '').toLowerCase());
+
+  return {
+    testimonials:   has(/testimonial|what our (clients|customers)|client(s)? say|review(s)?\b|"\s*[A-Z]/),
+    case_studies:   has(/case stud(y|ies)|success story|portfolio|our work/),
+    client_logos:   /logo|client|partner|brand|trusted by/.test(alts) || has(/trusted by|as seen (in|on)|our clients|partners/),
+    social_proof_numbers: has(/\d+\+?\s*(clients|customers|users|projects|businesses|companies)|\d+\s*(years|yrs)\b/),
+    team_or_about:  hrefs.some(h => /about|team|who-we-are/.test(h)),
+    contact_email:  has(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/),
+    contact_phone:  has(/(\+\d{1,3}[\s-]?)?\(?\d{3,5}\)?[\s-]?\d{3,4}[\s-]?\d{3,4}/),
+    physical_address: has(/\b(street|road|avenue|suite|floor|city|pin ?code|zip)\b/),
+    privacy_policy: hrefs.some(h => /privacy/.test(h)),
+    terms:          hrefs.some(h => /terms|t-and-c|tnc/.test(h)),
+    social_links:   hrefs.filter(h => /linkedin|twitter|x\.com|instagram|facebook|youtube/.test(h)).length,
+    guarantee_or_refund: has(/money[- ]back|guarantee|refund|no obligation|free trial/),
+  };
+}
+"""
+
+# Mobile reality check — the claim we could not previously back at all.
+_JS_MOBILE = r"""
+() => {
+  const vpMeta = document.querySelector('meta[name="viewport"]');
+  const vw = window.innerWidth;
+
+  // Horizontal overflow => the page does not fit the phone (classic broken responsive)
+  const docW = Math.max(document.documentElement.scrollWidth, document.body.scrollWidth);
+  const overflowPx = Math.max(0, Math.round(docW - vw));
+
+  // Which elements actually stick out past the right edge?
+  const offenders = [];
+  for (const el of document.querySelectorAll('body *')) {
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) continue;
+    if (r.right > vw + 2) {
+      const tag = el.tagName.toLowerCase();
+      const txt = (el.innerText || '').trim().slice(0, 40);
+      offenders.push({ tag, overflow_px: Math.round(r.right - vw), text: txt });
+      if (offenders.length >= 6) break;
+    }
+  }
+
+  // Touch targets: WCAG/Apple guidance is 44x44 CSS px minimum
+  const small = [];
+  const tappable = document.querySelectorAll('a, button, input, select, textarea, [role="button"]');
+  let tapChecked = 0;
+  for (const el of tappable) {
+    const st = getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden') continue;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) continue;
+    tapChecked++;
+    if (r.width < 44 || r.height < 44) {
+      small.push({
+        label: ((el.innerText || el.getAttribute('aria-label') || el.tagName) + '').trim().slice(0, 35),
+        w: Math.round(r.width),
+        h: Math.round(r.height),
+      });
+    }
+  }
+
+  // Text too small to read comfortably on a phone
+  let tiny = 0, textChecked = 0;
+  for (const el of document.querySelectorAll('p, span, li, a, div')) {
+    if (el.children.length) continue;
+    const t = (el.innerText || '').trim();
+    if (t.length < 8) continue;
+    const size = parseFloat(getComputedStyle(el).fontSize);
+    textChecked++;
+    if (size && size < 12) tiny++;
+  }
+
+  return {
+    viewport_meta: vpMeta ? (vpMeta.getAttribute('content') || '') : null,
+    viewport_width: vw,
+    horizontal_overflow_px: overflowPx,
+    overflow_offenders: offenders,
+    tap_targets_checked: tapChecked,
+    tap_targets_too_small: small.length,
+    tap_target_examples: small.slice(0, 6),
+    text_nodes_checked: textChecked,
+    text_below_12px: tiny,
+  };
+}
+"""
+
+
 # ── Live page fetcher (Playwright headless browser) ───────────────────────────
 
 def _find_system_chromium() -> str | None:
@@ -264,6 +431,59 @@ def _fetch_page_playwright(url: str) -> dict:
                 body_text = " ".join(page.inner_text("body").split())
                 result["body_text"] = body_text[:2000]
 
+                # ── Contrast, measured — not guessed ─────────────────────────
+                # Colour contrast was previously an "LLM eyeballs it" item, which it
+                # cannot do from DOM text. Compute the real WCAG ratio in-browser:
+                # deterministic, and impossible to hallucinate.
+                try:
+                    result["contrast"] = page.evaluate(_JS_CONTRAST)
+                except Exception as e:
+                    print(f"[design_audit] contrast probe failed: {e}")
+
+                # ── Trust signals ────────────────────────────────────────────
+                try:
+                    result["trust"] = page.evaluate(_JS_TRUST)
+                except Exception as e:
+                    print(f"[design_audit] trust probe failed: {e}")
+
+                # ── Desktop screenshot (for the vision pass) ─────────────────
+                try:
+                    import base64 as _b64
+                    shot = page.screenshot(type="jpeg", quality=60, full_page=False)
+                    result["screenshot_desktop"] = _b64.b64encode(shot).decode()
+                except Exception as e:
+                    print(f"[design_audit] desktop screenshot failed: {e}")
+
+                # ── MOBILE PASS — the biggest gap ────────────────────────────
+                # The audit claims to find "mobile gaps" but only ever rendered at
+                # 1440x900 desktop, so every mobile checkpoint (touch targets,
+                # responsive layout, hover-only elements) had NO data behind it.
+                # Render again on a real phone viewport and measure properly.
+                try:
+                    m_ctx = browser.new_context(
+                        viewport={"width": 390, "height": 844},          # iPhone 14-class
+                        device_scale_factor=3,
+                        is_mobile=True,
+                        has_touch=True,
+                        user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                                   "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                                   "Mobile/15E148 Safari/604.1",
+                    )
+                    m_page = m_ctx.new_page()
+                    m_page.goto(url, wait_until="networkidle", timeout=30_000)
+                    m_page.wait_for_timeout(2_000)
+                    result["mobile"] = m_page.evaluate(_JS_MOBILE)
+                    try:
+                        import base64 as _b64m
+                        mshot = m_page.screenshot(type="jpeg", quality=60, full_page=False)
+                        result["screenshot_mobile"] = _b64m.b64encode(mshot).decode()
+                    except Exception:
+                        pass
+                    m_ctx.close()
+                except Exception as e:
+                    print(f"[design_audit] mobile pass failed: {e}")
+                    result["mobile"] = {"error": str(e)[:200]}
+
             except PWTimeout:
                 result["fetch_error"] = "Page load timed out after 30s"
             finally:
@@ -409,6 +629,72 @@ def _fetch_pagespeed(url: str) -> dict:
 
 # ── Context builder ───────────────────────────────────────────────────────────
 
+def _visual_review(page_data: dict, gemini_key: str) -> dict | None:
+    """Actually LOOK at the page.
+
+    Until now the auditor never saw the site — it read extracted DOM text, so
+    "does this look good / feel crowded / read as premium" was structurally
+    unanswerable and the prompt correctly punted with "requires visual review".
+    Gemini 2.5 Flash is multimodal, so we send it the real desktop + mobile
+    screenshots and ask ONLY for the judgements that genuinely need eyes.
+
+    Returns None if unavailable — the audit degrades gracefully rather than
+    inventing visual findings.
+    """
+    shot_d = page_data.get("screenshot_desktop")
+    shot_m = page_data.get("screenshot_mobile")
+    if not shot_d or not gemini_key:
+        return None
+
+    parts = [{
+        "text": (
+            "You are a senior visual/UX designer. You are shown a real screenshot of a "
+            "website's above-the-fold view (desktop first, mobile second if present).\n\n"
+            "Judge ONLY what you can actually SEE. Do not speculate about behaviour, "
+            "code, or anything below the fold.\n\n"
+            "Assess:\n"
+            "1. visual_hierarchy — does the eye land on the right thing first? Is the "
+            "primary action obvious?\n"
+            "2. crowding — is it visually cluttered, or is whitespace used deliberately?\n"
+            "3. design_quality — does it look credible, current, and professionally made, "
+            "or dated/template-y/untrustworthy?\n"
+            "4. mobile_layout — if a mobile shot is shown: is anything cramped, cut off, "
+            "overlapping, or unreadable?\n"
+            "5. first_impression — in one sentence, what would a first-time visitor think?\n\n"
+            "Be concrete and honest. If something looks genuinely good, say so.\n\n"
+            'Return ONLY JSON: {"visual_hierarchy":"...","crowding":"...",'
+            '"design_quality":"...","mobile_layout":"...","first_impression":"...",'
+            '"visual_issues":[{"issue":"...","severity":"critical|high|medium","fix":"..."}]}'
+        )
+    }]
+    parts.append({"inline_data": {"mime_type": "image/jpeg", "data": shot_d}})
+    if shot_m:
+        parts.append({"text": "Above: desktop. Below: the SAME page on a 390px phone."})
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": shot_m}})
+
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "temperature": 0.3,                      # low — this is assessment, not prose
+            "maxOutputTokens": 1200,
+            "responseMimeType": "application/json",
+        },
+    }
+    api = ("https://generativelanguage.googleapis.com/v1beta/models/"
+           f"gemini-2.5-flash:generateContent?key={gemini_key}")
+    try:
+        r = requests.post(api, json=payload, timeout=90)
+        if not r.ok:
+            print(f"[design_audit] vision call failed: {r.status_code} {r.text[:180]}")
+            return None
+        txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        m = re.search(r"\{.*\}", txt, re.S)
+        return json.loads(m.group()) if m else None
+    except Exception as e:
+        print(f"[design_audit] vision error: {e}")
+        return None
+
+
 def _build_context(page: dict, pagespeed: dict) -> str:
     """Serialise fetched data into a readable block for the LLM prompt."""
     lines = [f"=== LIVE PAGE DATA: {page['url']} ==="]
@@ -483,6 +769,69 @@ def _build_context(page: dict, pagespeed: dict) -> str:
         lines.append(f"Lazy loading score: {pagespeed['images_not_lazy']}")
         lines.append(f"Image alt attribute score: {pagespeed['image_alts']}")
         lines.append(f"Tap target size score: {pagespeed['tap_targets']}")
+
+    # ── MEASURED MOBILE (real 390x844 phone render — not inferred) ────────────
+    mob = page.get("mobile") or {}
+    if mob and not mob.get("error"):
+        lines.append("\n★ MOBILE — MEASURED ON A REAL 390px PHONE VIEWPORT (authoritative)")
+        vpm = mob.get("viewport_meta")
+        lines.append(f"viewport meta tag: {vpm if vpm else 'MISSING — page will not scale on phones'}")
+        ov = mob.get("horizontal_overflow_px", 0)
+        if ov > 0:
+            lines.append(f"HORIZONTAL OVERFLOW: content is {ov}px wider than the screen — the page does NOT fit; users must pinch/scroll sideways. THIS IS A REAL, MEASURED FAILURE.")
+            for o in (mob.get("overflow_offenders") or [])[:4]:
+                lines.append(f"  · <{o['tag']}> sticks out {o['overflow_px']}px — \"{o.get('text','')}\"")
+        else:
+            lines.append("horizontal overflow: none — layout fits the phone screen correctly")
+        tt_small = mob.get("tap_targets_too_small", 0)
+        tt_all   = mob.get("tap_targets_checked", 0)
+        if tt_all:
+            if tt_small:
+                lines.append(f"TAP TARGETS: {tt_small} of {tt_all} are under the 44x44px minimum — measured:")
+                for t in (mob.get("tap_target_examples") or [])[:5]:
+                    lines.append(f"  · \"{t['label']}\" is only {t['w']}x{t['h']}px")
+            else:
+                lines.append(f"tap targets: all {tt_all} meet the 44x44px minimum")
+        tiny = mob.get("text_below_12px", 0)
+        if tiny:
+            lines.append(f"TEXT SIZE: {tiny} text elements render below 12px on mobile — hard to read.")
+        else:
+            lines.append("text size: no text below 12px on mobile")
+
+    # ── MEASURED CONTRAST (real WCAG ratios — not eyeballed) ──────────────────
+    con = page.get("contrast") or {}
+    if con.get("checked"):
+        lines.append("\n★ COLOUR CONTRAST — COMPUTED WCAG 2.1 AA RATIOS (authoritative, do NOT guess)")
+        if con.get("fail_count"):
+            lines.append(f"{con['fail_count']} of {con['checked']} text elements FAIL the required ratio. Worst offenders:")
+            for f in con.get("failures", [])[:6]:
+                lines.append(
+                    f"  · \"{f['text']}\" — {f['ratio']}:1 (needs {f['required']}:1) "
+                    f"at {f['font_px']}px, {f['color']} on {f['background']}"
+                )
+        else:
+            lines.append(f"All {con['checked']} text elements PASS WCAG AA contrast. C1-06 PASSES.")
+
+    # ── TRUST SIGNALS (detected in the rendered page) ─────────────────────────
+    tr = page.get("trust") or {}
+    if tr:
+        lines.append("\n★ TRUST & SOCIAL-PROOF SIGNALS (detected in the live page)")
+        present = [k for k, v in tr.items() if v]
+        missing = [k for k, v in tr.items() if not v and k != "social_links"]
+        lines.append(f"present: {', '.join(present) if present else 'NONE'}")
+        lines.append(f"absent:  {', '.join(missing) if missing else 'none'}")
+        lines.append(f"social profile links found: {tr.get('social_links', 0)}")
+
+    # ── VISUAL REVIEW (a vision model actually LOOKED at the page) ────────────
+    vis = page.get("visual") or {}
+    if vis:
+        lines.append("\n★ VISUAL REVIEW — a vision model SAW the rendered page (desktop + mobile screenshots)")
+        lines.append("These are eyes-on judgements. Treat them as observed fact, not speculation.")
+        for k in ("first_impression", "visual_hierarchy", "crowding", "design_quality", "mobile_layout"):
+            if vis.get(k):
+                lines.append(f"{k}: {vis[k]}")
+        for vi in (vis.get("visual_issues") or [])[:6]:
+            lines.append(f"  · [{vi.get('severity','medium')}] {vi.get('issue','')} → fix: {vi.get('fix','')}")
 
     return "\n".join(lines)
 
@@ -586,7 +935,10 @@ ABSOLUTE RULES — violating any of these makes the audit worthless:
 1. The LIVE PAGE DATA above was captured by a headless browser that fully rendered the React app. It is authoritative. Nav labels, headings, button texts, and link texts shown are EXACTLY what users see.
 2. NEVER invent or assume content not present in the LIVE PAGE DATA. If nav_links shows ['Work', 'Products', 'Blog', 'About'], those are the real labels — report them verbatim.
 3. For checklist items that CAN be verified from fetched data (nav labels, headings, image alt, HTTPS, footer links, PageSpeed scores), your finding MUST match the data exactly.
-4. For items that require visual inspection (colour contrast ratios, whitespace quality, animation quality), note: "Requires visual review — cannot verify from rendered source."
+4. VISUAL ITEMS ARE NOW MEASURED — do NOT punt on them.
+   · Colour contrast (C1-06): the "★ COLOUR CONTRAST" block gives COMPUTED WCAG ratios. Use them verbatim. If it reports failures, C1-06 FAILS and you must quote the real ratio (e.g. "2.9:1, needs 4.5:1"). If it says all pass, C1-06 PASSES. NEVER write "requires visual review" for contrast — we measured it.
+   · Crowding / hierarchy / design quality (C1-03, C1-07): the "★ VISUAL REVIEW" block is a vision model that actually SAW the page. Treat it as observed fact and cite it. Only fall back to "requires visual review" if that block is entirely absent.
+   · Animation quality (C4-03) still cannot be judged from a still frame — that one may remain unverifiable.
 5. For performance items: USE the PageSpeed scores provided. If PageSpeed errored, write "PageSpeed unavailable — cannot verify." NEVER invent LCP/CLS values.
 6. Overall score: start at 10. Deduct 1 per Critical fail (evidence-based only). Deduct 0.5 per High fail (evidence-based only). Items that cannot be verified from a static render do NOT cause deductions and must NOT appear in critical_issues or high_issues.
 7. Every finding must include: a principle citation AND a specific, actionable fix. Generic fixes are not acceptable.
@@ -594,7 +946,7 @@ ABSOLUTE RULES — violating any of these makes the audit worthless:
 9. NAVIGATION COUNT (C2-01): The nav_links field is already deduplicated. Count only the unique items shown. Do NOT report duplicates unless the exact same label appears twice in the deduplicated list.
 10. HERO AND AUDIENCE (C1-01, C6-04): If "★ TARGET AUDIENCE STATEMENT" field exists, C6-04 PASSES — NEVER mark it failing when this field is present. If H1 and hero_text are present with a value proposition, C1-01 passes.
 11. ACTIVE NAV STATE (C2-03): If "★ ACTIVE NAV LINKS" field is non-empty, C2-03 PASSES — the active state system is implemented. Do NOT flag C2-03 as failing when active_nav_links contains items.
-12. UNVERIFIABLE ITEMS — PLACEMENT RULE: Any finding that "cannot be verified from static render" or "requires interactive testing" MUST be placed in medium_issues ONLY. It MUST NOT appear in critical_issues or high_issues. This applies to: C4-01 (hover/active CSS states), C4-03 (animation quality), C4-07 (loading indicators), and any other check that requires user interaction. Placing an unverifiable item in high_issues causes incorrect score deductions — this is strictly forbidden.
+12. UNVERIFIABLE ITEMS — PLACEMENT RULE: A finding that genuinely cannot be verified goes in medium_issues ONLY, never critical/high. This now applies ONLY to: C4-01 (hover/active states), C4-03 (animation quality), C4-07 (loading indicators). It does NOT apply to mobile layout, tap targets, text size, or colour contrast — those are now MEASURED on a real device viewport and with computed WCAG ratios, so they are fully verifiable and MUST be scored normally (critical/high where the data shows a real failure).
 13. HOVER STATES (C4-01): CSS :hover and :active are invisible to static renders. If you cannot verify, put ONLY in medium_issues with note "Requires interactive testing." NEVER in high_issues.
 14. LOADING INDICATORS (C4-07): Loading spinners only appear after form submission. NEVER flag C4-07 in high_issues from a static render. Put ONLY in medium_issues if you cannot verify.
 15. NAV ITEM COUNT (C2-01): Miller's Law says 7 ± 2 items. A nav with ≤ 7 items IS within the law and PASSES C2-01. The context block already pre-calculates this verdict. NEVER flag a nav with 5, 6, or 7 items as "could be streamlined" in high_issues — that is NOT a failure. Only flag C2-01 as failing when nav_links count exceeds 7.
@@ -710,6 +1062,13 @@ def run_audit(url: str, pages: list = None, notes: str = "", auditor_notes: str 
         return {"error": f"Reached {url} but extracted no usable content (empty, bot-blocked, or JS-walled page). No audit was run."}
 
     pagespeed = _fetch_pagespeed(url)
+
+    # Look at the page with actual eyes. This is what makes the visual checkpoints
+    # (crowding, hierarchy, "does it look credible") answerable instead of punted.
+    visual = _visual_review(page_data, gemini_key)
+    if visual:
+        page_data["visual"] = visual
+
     live_ctx  = _build_context(page_data, pagespeed)
 
     # ── Step 2: build prompt ──────────────────────────────────────────────────
