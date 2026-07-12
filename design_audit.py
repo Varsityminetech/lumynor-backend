@@ -114,6 +114,7 @@ _JS_CONTRAST = r"""
 
   const fails = [];
   let checked = 0;
+  let unmeasurable = 0;        // gradient/clipped text — real, but not measurable from `color`
   const els = document.querySelectorAll('p,span,a,li,h1,h2,h3,h4,h5,h6,button,label,td,div');
   for (const el of els) {
     if (el.children.length > 0) continue;                 // leaf text only
@@ -124,9 +125,35 @@ _JS_CONTRAST = r"""
     const rect = el.getBoundingClientRect();
     if (rect.width < 2 || rect.height < 2) continue;
 
-    const fg = parse(st.color);
-    if (!fg) continue;
+    const fgRaw = parse(st.color);
+    if (!fgRaw) continue;
+
+    // Gradient text (background-clip:text + transparent color) is painted by a
+    // background-image, NOT by `color` — the computed color comes back
+    // rgba(0,0,0,0), which naively scores ~1:1 and fabricates a critical
+    // "invisible text" finding on a heading that is perfectly readable. Contrast
+    // genuinely is not computable from `color` here, so don't guess: skip it and
+    // let the vision pass (which can actually see the glyphs) judge it.
+    const clip  = st.webkitBackgroundClip || st.backgroundClip || '';
+    const fillA = parse(st.webkitTextFillColor || '');
+    if (fgRaw.a < 0.1 || clip.includes('text') || (fillA && fillA.a < 0.1)) {
+      unmeasurable++;
+      continue;
+    }
+
     const bg = bgOf(el);
+
+    // Semi-transparent text (Tailwind's text-white/70 and friends, used heavily)
+    // actually paints as a blend over its backdrop. Scoring the raw colour treats
+    // it as fully opaque and OVERSTATES contrast — hiding real failures. Composite
+    // it over the resolved background first.
+    const a  = fgRaw.a;
+    const fg = a < 1
+      ? { r: fgRaw.r * a + bg.r * (1 - a),
+          g: fgRaw.g * a + bg.g * (1 - a),
+          b: fgRaw.b * a + bg.b * (1 - a) }
+      : fgRaw;
+
     const L1 = lum(fg.r, fg.g, fg.b), L2 = lum(bg.r, bg.g, bg.b);
     const ratio = (Math.max(L1, L2) + 0.05) / (Math.min(L1, L2) + 0.05);
 
@@ -148,7 +175,7 @@ _JS_CONTRAST = r"""
     }
   }
   fails.sort((a, b) => a.ratio - b.ratio);                // worst first
-  return { checked, fail_count: fails.length, failures: fails.slice(0, 8) };
+  return { checked, unmeasurable, fail_count: fails.length, failures: fails.slice(0, 8) };
 }
 """
 
@@ -847,6 +874,15 @@ def _build_context(page: dict, pagespeed: dict) -> str:
                 )
         else:
             lines.append(f"All {con['checked']} text elements PASS WCAG AA contrast. C1-06 PASSES.")
+        if con.get("unmeasurable"):
+            # Be explicit that these were EXCLUDED, not passed — otherwise the model
+            # reads "all N pass" as covering every word on the page.
+            lines.append(
+                f"({con['unmeasurable']} more elements use gradient/clipped text, where contrast "
+                f"cannot be computed from the CSS colour. They were EXCLUDED from the counts above — "
+                f"do NOT report them as failures, and do NOT claim they passed. If the visual review "
+                f"flags them as hard to read, use that instead.)"
+            )
 
     # ── TRUST SIGNALS (detected in the rendered page) ─────────────────────────
     tr = page.get("trust") or {}
