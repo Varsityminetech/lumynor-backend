@@ -1175,13 +1175,28 @@ def save_audit(report: dict) -> dict:
         "render_method":     report.get("render_method", ""),
         "mode":              report.get("mode", "lumynor"),
     }
+    # The evidence/pagespeed/render_method/mode columns are NEW. If the Supabase table
+    # doesn't have them yet, Postgres rejects the whole insert — which would mean the
+    # audit never saves and every email-unlock 404s. So: try the full row, and if the
+    # schema isn't migrated yet, fall back to the columns we know exist rather than
+    # losing the audit entirely. Run supabase_migration_design_audit_evidence.sql to
+    # enable full evidence persistence.
+    _NEW_COLS = ("evidence", "pagespeed", "render_method", "mode")
     try:
         res = sb.table("design_audits").insert(row).execute()
         saved = (res.data or [{}])[0]
         return {**report, "id": saved.get("id", row["id"])}
     except Exception as e:
-        print(f"[design_audit] save error: {e}")
-        return {**report, "id": row["id"]}
+        print(f"[design_audit] full save failed ({str(e)[:120]}) — retrying without new columns")
+        legacy = {k: v for k, v in row.items() if k not in _NEW_COLS}
+        try:
+            res = sb.table("design_audits").insert(legacy).execute()
+            saved = (res.data or [{}])[0]
+            print("[design_audit] saved without evidence columns — run the migration to persist them")
+            return {**report, "id": saved.get("id", legacy["id"])}
+        except Exception as e2:
+            print(f"[design_audit] save error: {e2}")
+            return {**report, "id": row["id"]}
 
 
 def get_audits(limit: int = 20) -> list:
