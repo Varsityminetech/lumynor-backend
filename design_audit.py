@@ -641,15 +641,24 @@ def _visual_review(page_data: dict, gemini_key: str) -> dict | None:
     Returns None if unavailable — the audit degrades gracefully rather than
     inventing visual findings.
     """
+    def _skip(reason: str) -> None:
+        """Record WHY there is no visual verdict, on the page_data we were handed.
+
+        The caller can't reconstruct this, and a silently-missing vision pass is
+        exactly the bug this function shipped with: the report kept claiming
+        'we looked at your page' while nothing had looked at anything.
+        """
+        page_data["visual_skipped"] = reason
+        print(f"[design_audit] vision SKIPPED: {reason}")
+        return None
+
     shot_d = page_data.get("screenshot_desktop")
     shot_m = page_data.get("screenshot_mobile")
     if not shot_d:
-        print("[design_audit] vision SKIPPED: no desktop screenshot was captured")
-        return None
+        return _skip("no desktop screenshot was captured")
     if not gemini_key:
-        print("[design_audit] vision SKIPPED: no Gemini key (vision needs Gemini even when the "
-              "main LLM is Ollama — set GEMINI_API_KEY in the environment)")
-        return None
+        return _skip("no Gemini key — vision needs Gemini even when the main LLM is "
+                     "Ollama; set GEMINI_API_KEY in the environment")
 
     parts = [{
         "text": (
@@ -681,7 +690,15 @@ def _visual_review(page_data: dict, gemini_key: str) -> dict | None:
         "contents": [{"parts": parts}],
         "generationConfig": {
             "temperature": 0.3,                      # low — this is assessment, not prose
-            "maxOutputTokens": 1200,
+            # gemini-2.5-flash is a THINKING model: its reasoning tokens are billed
+            # against maxOutputTokens. Reasoning over a screenshot burned the entire
+            # old 1200-token budget, so the API returned finishReason=MAX_TOKENS with a
+            # `content` that has no `parts` at all — the parse below raised KeyError, it
+            # was swallowed, and vision silently never ran. Thinking buys nothing on a
+            # "describe what you see" task, so switch it off and give the budget to the
+            # answer (8192 matches _gemini_generate in auto_blogger.py).
+            "thinkingConfig": {"thinkingBudget": 0},
+            "maxOutputTokens": 8192,
             "responseMimeType": "application/json",
         },
     }
@@ -690,14 +707,28 @@ def _visual_review(page_data: dict, gemini_key: str) -> dict | None:
     try:
         r = requests.post(api, json=payload, timeout=90)
         if not r.ok:
-            print(f"[design_audit] vision call failed: {r.status_code} {r.text[:180]}")
-            return None
-        txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            return _skip(f"vision API returned {r.status_code}: {r.text[:160]}")
+
+        body = r.json()
+        cands = body.get("candidates") or []
+        if not cands:
+            fb = (body.get("promptFeedback") or {}).get("blockReason", "no candidates")
+            return _skip(f"vision API returned no candidates ({fb})")
+
+        cand   = cands[0]
+        pieces = (cand.get("content") or {}).get("parts") or []
+        txt    = "".join(p.get("text", "") for p in pieces).strip()
+        if not txt:
+            # Don't guess — say exactly why the model gave us nothing.
+            return _skip(f"vision model returned no text (finishReason="
+                         f"{cand.get('finishReason', 'unknown')})")
+
         m = re.search(r"\{.*\}", txt, re.S)
-        return json.loads(m.group()) if m else None
+        if not m:
+            return _skip(f"vision model returned non-JSON: {txt[:120]}")
+        return json.loads(m.group())
     except Exception as e:
-        print(f"[design_audit] vision error: {e}")
-        return None
+        return _skip(f"vision error: {type(e).__name__}: {e}")
 
 
 def _build_context(page: dict, pagespeed: dict) -> str:
@@ -1078,16 +1109,11 @@ def run_audit(url: str, pages: list = None, notes: str = "", auditor_notes: str 
 
     # Look at the page with actual eyes. This is what makes the visual checkpoints
     # (crowding, hierarchy, "does it look credible") answerable instead of punted.
+    # On failure this records the exact reason in page_data["visual_skipped"] — never
+    # fails silently, so the report stays honest about a capability it didn't deliver.
     visual = _visual_review(page_data, gemini_key)
     if visual:
         page_data["visual"] = visual
-    else:
-        # Never fail silently — record WHY there is no visual verdict, so the report
-        # can be honest about it instead of quietly dropping a promised capability.
-        page_data["visual_skipped"] = (
-            "no screenshot captured" if not page_data.get("screenshot_desktop")
-            else "vision model unavailable"
-        )
 
     live_ctx  = _build_context(page_data, pagespeed)
 

@@ -853,6 +853,7 @@ def _teaser_from_report(report: dict) -> dict:
         "contrast_checked":  (ev.get("contrast") or {}).get("checked", 0),
         "mobile_tested":     bool(ev.get("mobile") and not (ev.get("mobile") or {}).get("error")),
         "visually_reviewed": bool(ev.get("visual")),
+        "visual_skipped":    ev.get("visual_skipped"),   # why, if it didn't run
         "counts": {
             "critical": len(crit),
             "high":     len(high),
