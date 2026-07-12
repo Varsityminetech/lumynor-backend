@@ -1096,7 +1096,9 @@ INSTRUCTIONS:
 - Every finding based on nav labels, headings, button texts, footer links, or PageSpeed scores MUST quote the actual fetched value.
 - The rendered DOM data is accurate — do not second-guess it.
 - If PageSpeed errored, do not penalise performance items — mark them as unverifiable.
-- For visual-only items (contrast ratios, animation quality), note "Requires visual review."
+- Contrast, mobile layout, tap targets and text size are now MEASURED (see the ★ blocks above). Quote the real numbers and score them normally. Do NOT write "requires visual review" for any of them.
+- Crowding, hierarchy and design quality come from a vision model that SAW the page (★ VISUAL REVIEW). Cite it as observed fact.
+- Only animation quality (C4-03), hover states (C4-01) and loading indicators (C4-07) remain genuinely unverifiable.
 - Do NOT assume anything not present in the data. If you cannot verify it, say so.
 
 Return ONLY valid JSON — no markdown fences, no explanation outside the JSON."""
@@ -1124,6 +1126,20 @@ Return ONLY valid JSON — no markdown fences, no explanation outside the JSON."
         report["pagespeed"]     = pagespeed
         report["is_spa"]        = page_data.get("is_spa", False)
         report["render_method"] = page_data.get("render_method", "http")
+
+        # Carry the measured evidence onto the report so the delivered audit can SHOW
+        # its work ("tested on a 390px phone", "contrast computed, 3 failures") rather
+        # than just asserting findings. Screenshots are deliberately NOT attached —
+        # they're large base64 and the visual verdict already carries the signal.
+        report["evidence"] = {
+            "mobile":   page_data.get("mobile"),
+            "contrast": page_data.get("contrast"),
+            "trust":    page_data.get("trust"),
+            "visual":   page_data.get("visual"),
+            "rendered_on": ["desktop 1440x900", "mobile 390x844"]
+                           if page_data.get("mobile") and not (page_data.get("mobile") or {}).get("error")
+                           else ["desktop 1440x900"],
+        }
         return report
 
     except json.JSONDecodeError as e:
@@ -1152,6 +1168,12 @@ def save_audit(report: dict) -> dict:
         "fix_roadmap":       report.get("fix_roadmap", []),
         "notes":             report.get("notes", ""),
         "created_at":        report.get("audited_at", datetime.now(timezone.utc).isoformat()),
+        # Provenance — previously dropped on save, so an unlocked report lost all
+        # trace of HOW it was produced (render method, mobile pass, contrast, vision).
+        "evidence":          report.get("evidence", {}),
+        "pagespeed":         report.get("pagespeed", {}),
+        "render_method":     report.get("render_method", ""),
+        "mode":              report.get("mode", "lumynor"),
     }
     try:
         res = sb.table("design_audits").insert(row).execute()
