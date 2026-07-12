@@ -256,6 +256,9 @@ def index_all_blogs(blogs: list[dict]) -> dict:
 STATIC_PAGES = [
     ("",         "1.0", "weekly"),
     ("blog",     "0.9", "daily"),
+    # The free design-audit lead magnet — high priority: it's the main inbound
+    # entry point, so it needs to be indexable and rank.
+    ("audit",    "0.9", "monthly"),
     ("about",    "0.7", "monthly"),
     ("contact",  "0.7", "monthly"),
     ("products", "0.6", "monthly"),
