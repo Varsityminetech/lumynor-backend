@@ -839,12 +839,20 @@ def _teaser_from_report(report: dict) -> dict:
     high = report.get("high_issues") or []
     med  = report.get("medium_issues") or []
     preview = (crit + high)[:3]          # most severe first
+    ev = report.get("evidence") or {}
     return {
         "audit_id":          report.get("id"),
         "url":               report.get("url", ""),
         "overall_score":     report.get("overall_score", 0),
         "executive_summary": report.get("executive_summary", ""),
         "preview_issues":    preview,
+        # Provenance, shown free: it's proof-of-work, not paid content — and a
+        # visitor deserves to know HOW their site was scanned before trading an email.
+        "render_method":     report.get("render_method", ""),
+        "rendered_on":       ev.get("rendered_on") or [],
+        "contrast_checked":  (ev.get("contrast") or {}).get("checked", 0),
+        "mobile_tested":     bool(ev.get("mobile") and not (ev.get("mobile") or {}).get("error")),
+        "visually_reviewed": bool(ev.get("visual")),
         "counts": {
             "critical": len(crit),
             "high":     len(high),
