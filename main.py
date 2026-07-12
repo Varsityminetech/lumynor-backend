@@ -68,6 +68,39 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def quota_check(request: Request, limit: int, window_seconds: int, scope: str) -> None:
+    """Read-only quota check — raises 429 if the caller is already at the limit,
+    but does NOT consume a slot. Pair with quota_charge() after the expensive work
+    actually succeeds.
+
+    Why this exists: the rate_limit() dependency below runs before the handler, so
+    it charges even for requests that fail validation (a typo'd URL, a blocked SSRF
+    attempt). Those cost nothing to serve, yet they'd burn a visitor's audit quota
+    and lock them out for an hour before their real audit ever ran. Expensive
+    endpoints should only spend quota on work they actually performed."""
+    key = f"{scope}:{_client_ip(request)}"
+    now = time.time()
+    cutoff = now - window_seconds
+    with _rl_lock:
+        hits = _rl_hits[key]
+        while hits and hits[0] < cutoff:
+            hits.popleft()
+        if len(hits) >= limit:
+            retry = int(hits[0] + window_seconds - now) + 1
+            raise HTTPException(
+                status_code=429,
+                detail=f"You've used your {limit} free audits for now. Try again in {retry // 60 + 1} minute(s).",
+                headers={"Retry-After": str(retry)},
+            )
+
+
+def quota_charge(request: Request, scope: str) -> None:
+    """Consume one slot — call ONLY after the expensive operation succeeded."""
+    key = f"{scope}:{_client_ip(request)}"
+    with _rl_lock:
+        _rl_hits[key].append(time.time())
+
+
 def rate_limit(limit: int, window_seconds: int, scope: str):
     """FastAPI dependency: allow `limit` requests per `window_seconds` per client IP."""
     def _dep(request: Request):
@@ -824,18 +857,36 @@ def _teaser_from_report(report: dict) -> dict:
 
 
 @app.post("/api/public/audit")
-def public_audit(body: dict, _rl=Depends(rate_limit(3, 3600, "public_audit"))):
-    """Public: run a design audit, return only the teaser. 3/hour per IP."""
+def public_audit(
+    body: dict,
+    request: Request,
+    # Cheap anti-hammering guard: stops someone machine-gunning the endpoint even
+    # with invalid input. Generous, because rejected requests cost us nothing.
+    _rl=Depends(rate_limit(20, 3600, "public_audit_hammer")),
+):
+    """Public: run a design audit, return only the teaser.
+
+    Quota is 3 REAL audits/hour per IP, charged only when an audit actually runs —
+    so typos and blocked URLs (which cost nothing) never eat a visitor's quota.
+    """
+    AUDIT_QUOTA, WINDOW, SCOPE = 3, 3600, "public_audit"
+
     url = (body.get("url") or "").strip()
     if not url:
         raise HTTPException(status_code=400, detail="Please enter a website URL.")
+
+    # Are they already out of real audits? Check first — don't spend an LLM call
+    # just to tell them no.
+    quota_check(request, AUDIT_QUOTA, WINDOW, SCOPE)
 
     # Always 'generic': it's the visitor's own site, so grade it on its own merits
     # against universal UX principles — never against Lumynor's design system.
     report = da.run_audit(url, pages=[url], notes="", auditor_notes="", mode="generic")
     if report.get("error"):
+        # Unreachable/invalid/blocked URL — nothing was spent, so charge nothing.
         raise HTTPException(status_code=400, detail=report["error"])
 
+    quota_charge(request, SCOPE)           # only now did we actually spend money
     saved = da.save_audit(report)          # persist full report; teaser references its id
     return _teaser_from_report(saved)
 
