@@ -166,6 +166,67 @@ _JS_NAV = r"""
 }
 """
 
+# Primary CTAs. The old selector was '[class*="btn-primary"]' — our own Tailwind class,
+# which no other site has. Every external audit therefore found zero CTAs and reported
+# "no clear primary call-to-action" about pages full of buttons. A real CTA is recognisable
+# by how it is PAINTED: an actionable element with a solid fill, sitting above the fold.
+_JS_CTA = r"""
+() => {
+  const vw = window.innerWidth, fold = window.innerHeight;
+  const opaque = c => {
+    const m = (c || '').match(/rgba?\(([^)]+)\)/);
+    if (!m) return false;
+    const p = m[1].split(',').map(s => parseFloat(s.trim()));
+    return (p.length > 3 ? p[3] : 1) > 0.15;      // a real fill, not transparent
+  };
+
+  const cands = [...document.querySelectorAll(
+    'button, a, [role="button"], input[type="submit"], input[type="button"]'
+  )];
+
+  const out = [];
+  for (const el of cands) {
+    const st = getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.display === 'none' || parseFloat(st.opacity) < 0.1) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 40 || r.height < 20) continue;                 // too small to be a CTA
+    if (r.top < 0 || r.top > fold) continue;                     // above the fold only
+    if (r.width > vw * 0.9) continue;                            // full-width bar, not a button
+
+    const t = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+    if (!t || t.length > 40) continue;
+
+    // Styled like a button: a solid background, OR a visible border, OR named like one.
+    const cls = String(el.className || '');
+    const filled  = opaque(st.backgroundColor);
+    const bordered = parseFloat(st.borderTopWidth) > 0 && opaque(st.borderTopColor);
+    const named   = /\b(btn|button|cta)\b/i.test(cls);
+    const isBtn   = el.tagName === 'BUTTON' || el.getAttribute('role') === 'button'
+                    || el.tagName === 'INPUT';
+
+    if (filled || bordered || named || isBtn) {
+      out.push({ text: t, filled, area: r.width * r.height, top: r.top });
+    }
+  }
+
+  // "Primary" = filled ones first (that is what a primary CTA looks like), then by how
+  // prominent/early they are. Dedupe by label.
+  out.sort((a, b) => (b.filled - a.filled) || (a.top - b.top) || (b.area - a.area));
+  const seen = new Set(), primary = [];
+  for (const o of out) {
+    if (seen.has(o.text)) continue;
+    seen.add(o.text);
+    primary.push(o.text);
+    if (primary.length >= 8) break;
+  }
+  return {
+    primary,
+    filled_count: out.filter(o => o.filled).length,
+    source: primary.length ? 'above-fold actionable elements (fill/border/role)' : '',
+  };
+}
+"""
+
 _JS_CONTRAST = r"""
 () => {
   const lum = (r, g, b) => {
@@ -514,25 +575,39 @@ def _fetch_page_playwright(url: str) -> dict:
                     page.query_selector_all("input, select, textarea")
                 )
 
-                # Primary CTA elements — btn-primary styled links/buttons are the
-                # explicit conversion actions (e.g. "Start Your Project", "Contact Us")
-                result["primary_ctas"] = [
-                    el.text_content().strip()
-                    for el in page.query_selector_all('[class*="btn-primary"]')
-                    if el.text_content().strip()
-                ][:8]
+                # Primary CTAs. The old selector was '[class*="btn-primary"]' — OUR OWN
+                # Tailwind class. No other site on earth has it, so every external audit
+                # came back with zero CTAs and the model duly reported "no clear primary
+                # call-to-action" about pages covered in buttons. _JS_CTA identifies real
+                # actions by how they're PAINTED (solid fill, above the fold), not by our
+                # class names.
+                try:
+                    cta = page.evaluate(_JS_CTA)
+                except Exception as e:
+                    print(f"[design_audit] cta probe failed: {e}")
+                    cta = {}
+                result["primary_ctas"] = cta.get("primary", [])
+                result["cta_source"]   = cta.get("source", "")
 
-                # Target audience statement — explicitly labelled element that answers
-                # "who is this for?" Use aria-label="target-audience" on the element.
+                # Target audience statement. aria-label="target-audience" is a convention we
+                # invented for OUR site so this check would pass; no external site uses it.
+                # Keep reading it (it's authoritative when present) but never treat its
+                # absence as a failure — see the INCONCLUSIVE handling in _build_context.
                 audience_el = page.query_selector('[aria-label="target-audience"]')
                 if audience_el:
                     result["audience_statement"] = audience_el.text_content().strip()
 
-                # Hero section text — first <section> captures the above-fold content
-                # including audience tag, H1, and primary CTA copy
-                first_section = page.query_selector("section")
-                if first_section:
-                    result["hero_text"] = " ".join(first_section.inner_text().split())[:600]
+                # Hero text. The first <section> works on our site; a great many sites use
+                # <div>/<main>. Fall through, and last-resort take the top of the body so
+                # the hero is never empty on a page that obviously has one.
+                for _sel in ("section", "main > div", "header + div", "main", "body"):
+                    _el = page.query_selector(_sel)
+                    if _el:
+                        _txt = " ".join(_el.inner_text().split())
+                        if _txt:
+                            result["hero_text"] = _txt[:600]
+                            result["hero_source"] = _sel
+                            break
 
                 # Body text (rendered)
                 body_text = " ".join(page.inner_text("body").split())
@@ -921,13 +996,34 @@ def _build_context(page: dict, pagespeed: dict) -> str:
             if page.get("audience_statement"):
                 lines.append(f"★ TARGET AUDIENCE STATEMENT (explicit element with aria-label='target-audience', visible above H1): \"{page['audience_statement']}\"")
                 lines.append("  → C6-04 PASSES: the page explicitly answers 'Who is this for?' via this element.")
+            else:
+                # aria-label="target-audience" is a convention WE invented for our own site.
+                # Its absence tells you nothing about anyone else's site — judge C6-04 from
+                # the hero copy, which is where every normal site states who it's for.
+                lines.append(
+                    "★ TARGET AUDIENCE: no explicitly-tagged audience element (this tag is a "
+                    "Lumynor-only convention — its absence is EXPECTED and MEANINGLESS on any "
+                    "other site). Judge C6-04 from the HERO SECTION TEXT and the visual review: "
+                    "if the hero makes clear who the product is for, C6-04 PASSES. Never fail "
+                    "C6-04 merely because this tag is absent."
+                )
+
             # Primary CTAs are the most important conversion elements
             if page.get("primary_ctas"):
-                lines.append(f"★ PRIMARY CTA ELEMENTS (btn-primary styled — these are the main conversion actions visible on the page): {page['primary_ctas']}")
+                lines.append(
+                    f"★ PRIMARY CTA ELEMENTS (detected via {page.get('cta_source') or 'DOM'} — "
+                    f"the main conversion actions visible above the fold): {page['primary_ctas']}"
+                )
                 lines.append("  → C1-02 PASSES: a primary CTA is present and visible above the fold.")
-                lines.append("  → C6-01 STATUS: having one btn-primary CTA + a subtle secondary text link is standard UX — this is NOT three competing conversion goals.")
+                lines.append("  → C6-01 STATUS: one dominant CTA plus a subtle secondary link is standard UX — this is NOT three competing conversion goals.")
             else:
-                lines.append("Primary CTA elements: none detected via btn-primary class")
+                lines.append(
+                    "★ PRIMARY CTA: our probe found no clearly-styled action above the fold. "
+                    "This is INCONCLUSIVE, NOT a finding. Cross-check against 'Button texts' "
+                    "below and the VISUAL REVIEW — if either shows an obvious action (Get "
+                    "Started, Sign Up, Download…), C1-02 PASSES. Only claim a missing CTA if "
+                    "the screenshot genuinely shows none."
+                )
             lines.append(f"Button texts (all buttons): {page['button_texts']}")
             lines.append(f"Link texts (sample): {page['link_texts'][:20]}")
             lines.append(f"Footer links: {page['footer_links']}")
@@ -1164,9 +1260,9 @@ ABSOLUTE RULES — violating any of these makes the audit worthless:
 5. For performance items: USE the PageSpeed scores provided. If PageSpeed errored, write "PageSpeed unavailable — cannot verify." NEVER invent LCP/CLS values.
 6. Overall score: start at 10. Deduct 1 per Critical fail (evidence-based only). Deduct 0.5 per High fail (evidence-based only). Items that cannot be verified from a static render do NOT cause deductions and must NOT appear in critical_issues or high_issues.
 7. Every finding must include: a principle citation AND a specific, actionable fix. Generic fixes are not acceptable.
-8. PRIMARY CTA (C1-02): The "★ PRIMARY CTA ELEMENTS" field lists all btn-primary styled elements. If it lists items like "Start Your Project", that CTA IS present and visible. Do NOT flag C1-02 as failing if primary CTAs are listed.
+8. PRIMARY CTA (C1-02): The "★ PRIMARY CTA ELEMENTS" field lists actions detected above the fold. If it lists items, the CTA IS present and visible — do NOT flag C1-02 as failing. If the block instead says INCONCLUSIVE, do NOT conclude the site has no CTA: check the "Button texts" list and the visual review first. A page showing "Get Started" / "Sign Up" / "Book a Demo" HAS a CTA no matter what our probe returned.
 9. NAVIGATION COUNT (C2-01): The nav_links field is already deduplicated. Count only the unique items shown. Do NOT report duplicates unless the exact same label appears twice in the deduplicated list.
-10. HERO AND AUDIENCE (C1-01, C6-04): If "★ TARGET AUDIENCE STATEMENT" field exists, C6-04 PASSES — NEVER mark it failing when this field is present. If H1 and hero_text are present with a value proposition, C1-01 passes.
+10. HERO AND AUDIENCE (C1-01, C6-04): If "★ TARGET AUDIENCE STATEMENT" field exists, C6-04 PASSES — NEVER mark it failing when this field is present. Its ABSENCE means nothing: that tag is a Lumynor-only convention, so on any other site judge C6-04 from the hero copy and the visual review — if the hero makes clear who the product serves, C6-04 PASSES. If H1 and hero_text are present with a value proposition, C1-01 passes.
 11. ACTIVE NAV STATE (C2-03): If "★ ACTIVE NAV LINKS" field is non-empty, C2-03 PASSES — the active state system is implemented. Do NOT flag C2-03 as failing when active_nav_links contains items. If the block instead says the active state is INCONCLUSIVE, obey it: an active page is very often marked with a purely visual cue (underline, dot, colour) that leaves no DOM trace. Do NOT fail C2-03 on a DOM miss.
 12. UNVERIFIABLE ITEMS — PLACEMENT RULE: A finding that genuinely cannot be verified goes in medium_issues ONLY, never critical/high. This now applies ONLY to: C4-01 (hover/active states), C4-03 (animation quality), C4-07 (loading indicators). It does NOT apply to mobile layout, tap targets, text size, or colour contrast — those are now MEASURED on a real device viewport and with computed WCAG ratios, so they are fully verifiable and MUST be scored normally (critical/high where the data shows a real failure).
 13. HOVER STATES (C4-01): CSS :hover and :active are invisible to static renders. If you cannot verify, put ONLY in medium_issues with note "Requires interactive testing." NEVER in high_issues.
@@ -1369,6 +1465,14 @@ Return ONLY valid JSON — no markdown fences, no explanation outside the JSON."
             "trust":    page_data.get("trust"),
             "visual":   page_data.get("visual"),
             "visual_skipped": page_data.get("visual_skipped"),
+            # Which strategy actually found each thing. Empty means "our probe missed it",
+            # which is NOT the same as "the site lacks it" — keep the distinction in the
+            # record so a false "X is missing" finding is traceable to the probe that
+            # caused it rather than looking like the model made it up.
+            "nav_source":        page_data.get("nav_source"),
+            "active_nav_source": page_data.get("active_nav_source"),
+            "cta_source":        page_data.get("cta_source"),
+            "hero_source":       page_data.get("hero_source"),
             "rendered_on": ["desktop 1440x900", "mobile 390x844"]
                            if page_data.get("mobile") and not (page_data.get("mobile") or {}).get("error")
                            else ["desktop 1440x900"],
