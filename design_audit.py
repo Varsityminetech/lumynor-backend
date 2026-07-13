@@ -127,13 +127,17 @@ _JS_NAV = r"""
     if (got.length >= 2) { found = got; source = name; break; }   // >=2: one link is a logo, not a menu
   }
 
-  // Geometry fallback: a header built from unsemantic divs still PAINTS its links in a
+  // Geometry fallback: a header built from unsemantic divs still PAINTS its menu in a
   // horizontal strip at the top of the page. That is observable regardless of markup.
+  // Note this must NOT be limited to <a> — plenty of SPAs route from <button>s or
+  // click-handling <div>s (powerup.money does), which is why the earlier <a>-only
+  // version still came back empty on a site with an obvious menu.
   if (!found.length) {
-    const got = grab('a').filter(o => {
-      const r = o.el.getBoundingClientRect();
-      return r.top >= 0 && r.top < 150 && r.height < 80;
-    });
+    const got = grab('a, button, [role="link"], [role="menuitem"], [role="button"], [onclick]')
+      .filter(o => {
+        const r = o.el.getBoundingClientRect();
+        return r.top >= 0 && r.top < 150 && r.height < 80;
+      });
     if (got.length >= 2) { found = got; source = 'top-strip geometry'; }
   }
 
@@ -227,6 +231,47 @@ _JS_CTA = r"""
 }
 """
 
+# Footer. "footer a" assumes a semantic <footer>. On a site that builds its footer from
+# plain divs the selector returned [] and the auditor confidently reported "footer contains
+# no links, missing key navigation and contact information" — about a footer full of links.
+_JS_FOOTER = r"""
+() => {
+  const visible = el => {
+    const st = getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.display === 'none' || parseFloat(st.opacity) < 0.1) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 1 && r.height > 1;
+  };
+  const label = a => ((a.innerText || a.getAttribute('aria-label') || '').trim());
+  const ok = t => t && t.length > 0 && t.length <= 60;
+
+  const grab = sel => [...document.querySelectorAll(sel)]
+    .filter(visible).map(label).filter(ok);
+
+  for (const [name, sel] of [
+    ['<footer>',        'footer a'],
+    ['role=contentinfo','[role="contentinfo"] a'],
+    ['class/id ~ footer','[class*="footer" i] a, [id*="footer" i] a'],
+  ]) {
+    const got = grab(sel);
+    if (got.length) return { items: [...new Set(got)], source: name };
+  }
+
+  // Geometry: whatever the markup, a footer is painted at the bottom of the document.
+  const docH = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+  const cut  = docH * 0.8;
+  const got = [...document.querySelectorAll('a')].filter(a => {
+    if (!visible(a)) return false;
+    const r = a.getBoundingClientRect();
+    return (r.top + window.scrollY) >= cut;      // absolute position, not viewport-relative
+  }).map(label).filter(ok);
+
+  return got.length
+    ? { items: [...new Set(got)], source: 'bottom-of-document geometry' }
+    : { items: [], source: '' };
+}
+"""
+
 _JS_CONTRAST = r"""
 () => {
   const lum = (r, g, b) => {
@@ -259,6 +304,10 @@ _JS_CONTRAST = r"""
   const els = document.querySelectorAll('p,span,a,li,h1,h2,h3,h4,h5,h6,button,label,td,div');
   for (const el of els) {
     if (el.children.length > 0) continue;                 // leaf text only
+    // WCAG 1.4.3 exempts purely decorative text from contrast requirements, and both
+    // Lighthouse and axe skip aria-hidden subtrees for this reason. We were flagging
+    // decorative glyphs (e.g. a faint "< / >" ornament) as CRITICAL contrast failures.
+    if (el.closest('[aria-hidden="true"]')) continue;
     const txt = (el.innerText || '').trim();
     if (txt.length < 3) continue;
     const st = getComputedStyle(el);
@@ -551,11 +600,18 @@ def _fetch_page_playwright(url: str) -> dict:
                 ][:30]
 
                 # Footer links
-                result["footer_links"] = [
-                    el.text_content().strip()
-                    for el in page.query_selector_all("footer a")
-                    if el.text_content().strip()
-                ]
+                # Footer. "footer a" assumes a semantic <footer> — same trap as the nav.
+                # On powerup.money this returned [] and the auditor reported "footer contains
+                # no links, missing key navigation and contact information" about a footer
+                # that has them. Fall through markup conventions, then geometry (links in the
+                # bottom fifth of the document).
+                try:
+                    foot = page.evaluate(_JS_FOOTER)
+                except Exception as e:
+                    print(f"[design_audit] footer probe failed: {e}")
+                    foot = {}
+                result["footer_links"]  = foot.get("items", [])
+                result["footer_source"] = foot.get("source", "")
 
                 # Images
                 imgs = page.query_selector_all("img")
@@ -778,14 +834,33 @@ def _fetch_page(url: str) -> dict:
 
 def _fetch_pagespeed(url: str) -> dict:
     """
-    Call Google PageSpeed Insights API (unauthenticated, mobile strategy).
+    Call Google PageSpeed Insights API (mobile strategy).
     Returns real Core Web Vitals and Lighthouse scores.
+
+    Unauthenticated calls are aggressively rate-limited — we were getting 429s, which
+    surfaced in reports as TWO HIGH ISSUES against the audited site ("PageSpeed API
+    returned 429 — cannot verify"). That is our infrastructure failing, not a defect in
+    anyone's website. Send a key when we have one, and back off on 429/5xx.
     """
+    import os as _os, time as _time
+    key = _os.getenv("PAGESPEED_API_KEY") or _os.getenv("GOOGLE_API_KEY") or ""
+    api = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&strategy=mobile"
+    if key:
+        api += f"&key={key}"
     try:
-        api = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&strategy=mobile"
-        resp = requests.get(api, timeout=45)
-        if resp.status_code != 200:
-            return {"error": f"PageSpeed API returned {resp.status_code}"}
+        resp = None
+        for attempt in range(3):
+            resp = requests.get(api, timeout=45)
+            if resp.status_code == 200:
+                break
+            if resp.status_code in (429, 500, 503) and attempt < 2:
+                _time.sleep((2 ** attempt) * 5)          # 5s, 10s
+                continue
+            break
+        if resp is None or resp.status_code != 200:
+            code = resp.status_code if resp is not None else "no response"
+            hint = " (no PAGESPEED_API_KEY set — unauthenticated quota is very low)" if not key else ""
+            return {"error": f"PageSpeed API returned {code}{hint}"}
 
         data   = resp.json()
         cats   = data.get("lighthouseResult", {}).get("categories", {})
@@ -1026,7 +1101,16 @@ def _build_context(page: dict, pagespeed: dict) -> str:
                 )
             lines.append(f"Button texts (all buttons): {page['button_texts']}")
             lines.append(f"Link texts (sample): {page['link_texts'][:20]}")
-            lines.append(f"Footer links: {page['footer_links']}")
+            if page.get("footer_links"):
+                lines.append(
+                    f"Footer links (via {page.get('footer_source') or 'DOM'}): {page['footer_links']}"
+                )
+            else:
+                lines.append(
+                    "★ FOOTER: our probe found no footer links. This is INCONCLUSIVE, NOT a "
+                    "finding — do NOT claim the footer is empty or missing links. Footers are "
+                    "often below the fold and outside what we captured."
+                )
             lines.append(f"Images: {page['images_total']} total, {page['images_missing_alt']} missing alt attribute")
             lines.append(f"External links without target=_blank: {page['external_links_no_target']}")
             lines.append(f"Form input fields: {page['form_fields']}")
@@ -1041,7 +1125,13 @@ def _build_context(page: dict, pagespeed: dict) -> str:
     lines.append("=== GOOGLE PAGESPEED INSIGHTS (Mobile) ===")
     if "error" in pagespeed:
         lines.append(f"⚠ PageSpeed API error: {pagespeed['error']}")
-        lines.append("  Do NOT invent performance numbers. Mark C5-01 and C5-02 as 'Requires PageSpeed data — cannot verify.'")
+        lines.append(
+            "  This is OUR tool failing to fetch data — it is NOT a defect in the audited "
+            "website. Do NOT invent performance numbers, and do NOT raise C5-01/C5-02 as "
+            "critical, high, or medium issues: the site is not at fault for our API quota. "
+            "OMIT them from the issue lists entirely and simply note in the executive summary "
+            "that load performance could not be measured on this run."
+        )
     else:
         lines.append(f"Performance: {pagespeed['performance']}/100")
         lines.append(f"Accessibility: {pagespeed['accessibility']}/100")
@@ -1257,17 +1347,22 @@ ABSOLUTE RULES — violating any of these makes the audit worthless:
    · Colour contrast (C1-06): the "★ COLOUR CONTRAST" block gives COMPUTED WCAG ratios. Use them verbatim. If it reports failures, C1-06 FAILS and you must quote the real ratio (e.g. "2.9:1, needs 4.5:1"). If it says all pass, C1-06 PASSES. NEVER write "requires visual review" for contrast — we measured it.
    · Crowding / hierarchy / design quality (C1-03, C1-07): the "★ VISUAL REVIEW" block is a vision model that actually SAW the page. Treat it as observed fact and cite it. Only fall back to "requires visual review" if that block is entirely absent.
    · Animation quality (C4-03) still cannot be judged from a still frame — that one may remain unverifiable.
-5. For performance items: USE the PageSpeed scores provided. If PageSpeed errored, write "PageSpeed unavailable — cannot verify." NEVER invent LCP/CLS values.
+5. For performance items: USE the PageSpeed scores provided. NEVER invent LCP/CLS values. If PageSpeed ERRORED (429, timeout, quota), that is OUR tool failing — NOT a fault of the audited site. NEVER penalise a site for our own failed API call: OMIT C5-01/C5-02 from critical_issues, high_issues AND medium_issues entirely, and just note in the executive summary that load performance could not be measured. A site must never lose points for our infrastructure.
+5b. NEVER report a limitation of THIS TOOL as a defect of the website. "Cannot verify X", "API returned an error", "requires interactive testing" describe US, not them. Such statements are not findings and must not appear in critical_issues or high_issues.
 6. Overall score: start at 10. Deduct 1 per Critical fail (evidence-based only). Deduct 0.5 per High fail (evidence-based only). Items that cannot be verified from a static render do NOT cause deductions and must NOT appear in critical_issues or high_issues.
 7. Every finding must include: a principle citation AND a specific, actionable fix. Generic fixes are not acceptable.
 8. PRIMARY CTA (C1-02): The "★ PRIMARY CTA ELEMENTS" field lists actions detected above the fold. If it lists items, the CTA IS present and visible — do NOT flag C1-02 as failing. If the block instead says INCONCLUSIVE, do NOT conclude the site has no CTA: check the "Button texts" list and the visual review first. A page showing "Get Started" / "Sign Up" / "Book a Demo" HAS a CTA no matter what our probe returned.
 9. NAVIGATION COUNT (C2-01): The nav_links field is already deduplicated. Count only the unique items shown. Do NOT report duplicates unless the exact same label appears twice in the deduplicated list.
 10. HERO AND AUDIENCE (C1-01, C6-04): If "★ TARGET AUDIENCE STATEMENT" field exists, C6-04 PASSES — NEVER mark it failing when this field is present. Its ABSENCE means nothing: that tag is a Lumynor-only convention, so on any other site judge C6-04 from the hero copy and the visual review — if the hero makes clear who the product serves, C6-04 PASSES. If H1 and hero_text are present with a value proposition, C1-01 passes.
-11. ACTIVE NAV STATE (C2-03): If "★ ACTIVE NAV LINKS" field is non-empty, C2-03 PASSES — the active state system is implemented. Do NOT flag C2-03 as failing when active_nav_links contains items. If the block instead says the active state is INCONCLUSIVE, obey it: an active page is very often marked with a purely visual cue (underline, dot, colour) that leaves no DOM trace. Do NOT fail C2-03 on a DOM miss.
+11. ACTIVE NAV STATE (C2-03): If "★ ACTIVE NAV LINKS" field is non-empty, C2-03 PASSES — the active state system is implemented. Do NOT flag C2-03 as failing when active_nav_links contains items. If the block says INCONCLUSIVE, obey it: an active page is very often marked with a purely visual cue (underline, dot, colour) that leaves no DOM trace, and a small cue is easy for a vision model to miss. C2-03 may therefore NEVER exceed medium_issues, and you must NEVER phrase it as "no DOM-based active state detected" — that describes OUR probe, not their site (see rule 5b). Also: on a single-page site with no current section, an active state is not even applicable — in that case C2-03 PASSES.
 12. UNVERIFIABLE ITEMS — PLACEMENT RULE: A finding that genuinely cannot be verified goes in medium_issues ONLY, never critical/high. This now applies ONLY to: C4-01 (hover/active states), C4-03 (animation quality), C4-07 (loading indicators). It does NOT apply to mobile layout, tap targets, text size, or colour contrast — those are now MEASURED on a real device viewport and with computed WCAG ratios, so they are fully verifiable and MUST be scored normally (critical/high where the data shows a real failure).
 13. HOVER STATES (C4-01): CSS :hover and :active are invisible to static renders. If you cannot verify, put ONLY in medium_issues with note "Requires interactive testing." NEVER in high_issues.
 14. LOADING INDICATORS (C4-07): Loading spinners only appear after form submission. NEVER flag C4-07 in high_issues from a static render. Put ONLY in medium_issues if you cannot verify.
 15. NAV ITEM COUNT (C2-01): Miller's Law says 7 ± 2 items. A nav with ≤ 7 items IS within the law and PASSES C2-01. The context block already pre-calculates this verdict. NEVER flag a nav with 5, 6, or 7 items as "could be streamlined" in high_issues — that is NOT a failure. Only flag C2-01 as failing when nav_links count exceeds 7.
+15b. NAV JARGON (C2-02): "Jargon" means a label a visitor CANNOT UNDERSTAND — internal team names, acronyms, or system terms ("Synergy Hub", "CRM", "Tier 2 Assets"). It does NOT mean:
+   · Standard web conventions. "Contact Us", "About", "Blog", "Products", "Pricing", "Work", "Login" are the plainest labels in existence — NEVER flag these. Flagging "Contact Us" as jargon is absurd and destroys trust in the audit.
+   · PRODUCT AND BRAND NAMES. Companies legitimately put their product names in the nav (Notion, Figma, Slack all do). A named product in the nav is a deliberate branding decision, not a usability defect. NEVER recommend renaming a product to a generic description.
+   Only fail C2-02 when a label would genuinely leave a first-time visitor unable to guess where it leads. If in doubt, C2-02 PASSES.
 16. PRIMARY CTA VISIBILITY (C1-02): C1-02 asks ONLY: is there a primary CTA visible above the fold? If "★ PRIMARY CTA ELEMENTS" is non-empty, the answer is YES — C1-02 PASSES. A subtle secondary text link ("or chat on WhatsApp") next to the primary button does NOT make C1-02 fail. C1-02 is about CTA presence and visibility, NOT about uniqueness. Do NOT fail C1-02 when primary_ctas is populated.
 17. VISUAL DENSITY (C1-01 scope): C1-01 asks whether the value proposition communicates within 5 seconds. This is verified by: (a) Is there a clear H1? (b) Is there an audience statement? (c) Is there a primary CTA? If yes to all three — C1-01 PASSES. "The text looks dense" is a VISUAL judgement you cannot make from extracted DOM text. The context block pre-calculates C1-01 when hero_text and H1 are both present. Never re-fail C1-01 on grounds of "density" or "too much text" — those require visual review and go in medium_issues at most.
 """
