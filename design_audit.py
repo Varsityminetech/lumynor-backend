@@ -1568,6 +1568,7 @@ Return ONLY valid JSON — no markdown fences, no explanation outside the JSON."
             "active_nav_source": page_data.get("active_nav_source"),
             "cta_source":        page_data.get("cta_source"),
             "hero_source":       page_data.get("hero_source"),
+            "footer_source":     page_data.get("footer_source"),
             "rendered_on": ["desktop 1440x900", "mobile 390x844"]
                            if page_data.get("mobile") and not (page_data.get("mobile") or {}).get("error")
                            else ["desktop 1440x900"],
