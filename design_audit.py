@@ -86,6 +86,86 @@ class AuditBusyError(RuntimeError):
 
 # WCAG contrast, computed properly: resolve each text node's effective background
 # by walking ancestors until something opaque, then compute the real ratio.
+# Navigation. The old `nav a` selector assumed a semantic <nav>, which is true of our
+# site and false of a great many real ones — so it returned [] on sites with an obvious
+# menu and the auditor called the navigation "completely missing". Try semantics first,
+# then markup conventions, then pure geometry (links painted in the top strip of the
+# page). `source` records which strategy won, so "we found nothing" can be told apart
+# from "we looked in the wrong place".
+_JS_NAV = r"""
+() => {
+  const visible = el => {
+    const st = getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.display === 'none' || parseFloat(st.opacity) < 0.1) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 1 && r.height > 1;
+  };
+  // aria-label catches icon-only links; cap the length so a whole paragraph wrapped in
+  // an <a> can't masquerade as a nav item.
+  const label = a => ((a.innerText || a.getAttribute('aria-label') || '').trim());
+  const isNavish = t => t && t.length > 0 && t.length <= 40 && !t.includes('\n');
+
+  const grab = sel => {
+    let out = [];
+    for (const a of document.querySelectorAll(sel)) {
+      if (!visible(a)) continue;
+      const t = label(a);
+      if (isNavish(t)) out.push({ el: a, text: t });
+    }
+    return out;
+  };
+
+  let found = [], source = '';
+  const strategies = [
+    ['<nav>',            'nav a'],
+    ['role=navigation',  '[role="navigation"] a'],
+    ['<header>',         'header a'],
+    ['class/id ~ nav',   '[class*="nav" i] a, [class*="menu" i] a, [id*="nav" i] a, [id*="header" i] a'],
+  ];
+  for (const [name, sel] of strategies) {
+    const got = grab(sel);
+    if (got.length >= 2) { found = got; source = name; break; }   // >=2: one link is a logo, not a menu
+  }
+
+  // Geometry fallback: a header built from unsemantic divs still PAINTS its links in a
+  // horizontal strip at the top of the page. That is observable regardless of markup.
+  if (!found.length) {
+    const got = grab('a').filter(o => {
+      const r = o.el.getBoundingClientRect();
+      return r.top >= 0 && r.top < 150 && r.height < 80;
+    });
+    if (got.length >= 2) { found = got; source = 'top-strip geometry'; }
+  }
+
+  // Active state. aria-current is the accessible way, but plenty of sites indicate the
+  // current page purely visually (an underline, a dot). Not finding a marker here does
+  // NOT mean there is no active state — it means we cannot see it from the DOM, and the
+  // vision pass must decide. Hence active_source.
+  let active = [], activeSource = '';
+  const ariaOn = found.filter(o => o.el.getAttribute('aria-current') === 'page');
+  if (ariaOn.length) {
+    active = ariaOn.map(o => o.text);
+    activeSource = 'aria-current="page"';
+  } else {
+    const cls = found.filter(o => {
+      const c = (o.el.className || '') + ' ' + ((o.el.parentElement || {}).className || '');
+      return /\b(active|current|selected|is-active)\b/i.test(String(c));
+    });
+    if (cls.length) {
+      active = cls.map(o => o.text);
+      activeSource = 'active/current class';
+    }
+  }
+
+  const items = [...new Set(found.map(o => o.text))];   // dedupe desktop + hidden mobile menu
+  return {
+    items, count: items.length, source,
+    active: [...new Set(active)], active_source: activeSource,
+    detected: items.length > 0,
+  };
+}
+"""
+
 _JS_CONTRAST = r"""
 () => {
   const lum = (r, g, b) => {
@@ -378,22 +458,22 @@ def _fetch_page_playwright(url: str) -> dict:
                     if el.text_content().strip()
                 ][:8]
 
-                # Navigation — deduplicate to avoid counting mobile menu items twice
-                # (both desktop and hidden mobile menus live inside <nav> in the DOM)
-                nav_raw = [
-                    el.text_content().strip()
-                    for el in page.query_selector_all("nav a")
-                    if el.text_content().strip()
-                ]
-                result["nav_links"] = list(dict.fromkeys(nav_raw))
-
-                # Active nav links — links marked with aria-current="page" indicate
-                # the current page state is visually and semantically implemented
-                result["active_nav_links"] = [
-                    el.text_content().strip()
-                    for el in page.query_selector_all('nav a[aria-current="page"]')
-                    if el.text_content().strip()
-                ]
+                # Navigation. `nav a` alone only works on sites that use a semantic
+                # <nav> — i.e. ours. On a site whose header is plain divs it matched
+                # nothing, and the auditor then reported "navigation links are
+                # completely missing" about a page with a perfectly visible menu.
+                # _JS_NAV falls back through several strategies and, crucially, tells
+                # us WHICH one worked so absence can be distinguished from
+                # not-looking-in-the-right-place.
+                try:
+                    nav = page.evaluate(_JS_NAV)
+                except Exception as e:
+                    print(f"[design_audit] nav probe failed: {e}")
+                    nav = {}
+                result["nav_links"]        = nav.get("items", [])
+                result["nav_source"]       = nav.get("source", "")
+                result["active_nav_links"] = nav.get("active", [])
+                result["active_nav_source"] = nav.get("active_source", "")
 
                 # Buttons
                 result["button_texts"] = [
@@ -580,7 +660,14 @@ def _fetch_page_http(url: str) -> dict:
             result["h1s"]          = [h.get_text(strip=True) for h in soup.find_all("h1")][:5]
             result["h2s"]          = [h.get_text(strip=True) for h in soup.find_all("h2")][:8]
             result["h3s"]          = [h.get_text(strip=True) for h in soup.find_all("h3")][:8]
-            result["nav_links"]    = [a.get_text(strip=True) for a in soup.select("nav a") if a.get_text(strip=True)]
+            # Same trap as the Playwright path: "nav a" only matches a semantic <nav>.
+            # Fall through the common header conventions before concluding there is none.
+            for _sel in ('nav a', '[role="navigation"] a', 'header a'):
+                _found = [a.get_text(strip=True) for a in soup.select(_sel) if a.get_text(strip=True)]
+                if len(_found) >= 2:                      # one link is a logo, not a menu
+                    result["nav_links"]  = list(dict.fromkeys(_found))
+                    result["nav_source"] = _sel
+                    break
             result["button_texts"] = [b.get_text(strip=True) for b in soup.find_all("button") if b.get_text(strip=True)][:15]
             result["link_texts"]   = [a.get_text(strip=True) for a in soup.find_all("a") if a.get_text(strip=True)][:30]
             result["footer_links"] = [a.get_text(strip=True) for a in soup.select("footer a")]
@@ -701,10 +788,19 @@ def _visual_review(page_data: dict, gemini_key: str) -> dict | None:
             "or dated/template-y/untrustworthy?\n"
             "4. mobile_layout — if a mobile shot is shown: is anything cramped, cut off, "
             "overlapping, or unreadable?\n"
-            "5. first_impression — in one sentence, what would a first-time visitor think?\n\n"
+            "5. first_impression — in one sentence, what would a first-time visitor think?\n"
+            "6. nav_visible — is there a navigation menu visible in the header? true/false. "
+            "Our DOM probe misses menus built without semantic markup, so YOU are the "
+            "authority on whether one exists. If you can see it, it exists.\n"
+            "7. nav_labels — the menu item labels you can actually read, as a list "
+            "(empty list if no menu is visible).\n"
+            "8. active_nav_indicated — is the CURRENT page marked in the menu by any visual "
+            "means at all (underline, dot, highlight, bolder or brighter text)? true/false. "
+            "Many sites do this with pure styling and no DOM attribute.\n\n"
             "Be concrete and honest. If something looks genuinely good, say so.\n\n"
             'Return ONLY JSON: {"visual_hierarchy":"...","crowding":"...",'
             '"design_quality":"...","mobile_layout":"...","first_impression":"...",'
+            '"nav_visible":true,"nav_labels":["..."],"active_nav_indicated":true,'
             '"visual_issues":[{"issue":"...","severity":"critical|high|medium","fix":"..."}]}'
         )
     }]
@@ -782,14 +878,45 @@ def _build_context(page: dict, pagespeed: dict) -> str:
             lines.append(f"H1 headings: {page['h1s']}")
             lines.append(f"H2 headings: {page['h2s']}")
             nav_count = len(page['nav_links'])
-            nav_verdict = "PASSES C2-01 (within Miller's 7±2 rule)" if nav_count <= 7 else f"FAILS C2-01 ({nav_count} > 7)"
-            lines.append(f"Navigation links (actual labels, deduplicated — {nav_count} items — {nav_verdict}): {page['nav_links']}")
+            if nav_count:
+                nav_verdict = ("PASSES C2-01 (within Miller's 7±2 rule)" if nav_count <= 7
+                               else f"FAILS C2-01 ({nav_count} > 7)")
+                lines.append(
+                    f"Navigation links (found via {page.get('nav_source') or 'DOM'}, deduplicated — "
+                    f"{nav_count} items — {nav_verdict}): {page['nav_links']}"
+                )
+            else:
+                # An empty result here means OUR PROBE found nothing — not that the site
+                # has no menu. We previously printed an empty list and the model turned it
+                # into a confident "navigation links are completely missing" on sites whose
+                # menu is plainly visible in the screenshot. Never let a detection miss
+                # become a finding.
+                lines.append(
+                    "★ NAVIGATION: our DOM probe could not identify a nav menu on this page. "
+                    "This is INCONCLUSIVE, NOT a finding — many sites build headers without "
+                    "semantic markup. You MUST NOT claim navigation is missing/absent. If the "
+                    "VISUAL REVIEW shows a menu, the navigation exists and C2-01/C2-02 PASS. "
+                    "Only if the visual review ALSO shows no menu may you raise it, and then "
+                    "only as a medium issue."
+                )
+
             # Active nav state
             if page.get("active_nav_links"):
-                lines.append(f"★ ACTIVE NAV LINKS (aria-current='page' — active state IS implemented): {page['active_nav_links']}")
+                lines.append(
+                    f"★ ACTIVE NAV LINKS (via {page.get('active_nav_source') or 'DOM'} — "
+                    f"active state IS implemented): {page['active_nav_links']}"
+                )
                 lines.append("  → C2-03 PASSES: at least one nav link shows the current page state.")
             else:
-                lines.append("Active nav links (aria-current='page'): none detected on this render")
+                # Same trap: an active page is very often marked with a purely visual cue —
+                # an underline, a dot, a colour change — that carries no DOM signal at all.
+                lines.append(
+                    "★ ACTIVE NAV STATE: no DOM marker (aria-current / .active class) found. "
+                    "This is INCONCLUSIVE, NOT a finding — active state is frequently indicated "
+                    "visually only (underline, dot, colour). Do NOT fail C2-03 on this alone. "
+                    "Defer to the VISUAL REVIEW; if it shows no current-page indication, raise "
+                    "C2-03 as MEDIUM at most."
+                )
             # Target audience statement (aria-label="target-audience")
             if page.get("audience_statement"):
                 lines.append(f"★ TARGET AUDIENCE STATEMENT (explicit element with aria-label='target-audience', visible above H1): \"{page['audience_statement']}\"")
@@ -902,6 +1029,28 @@ def _build_context(page: dict, pagespeed: dict) -> str:
         for k in ("first_impression", "visual_hierarchy", "crowding", "design_quality", "mobile_layout"):
             if vis.get(k):
                 lines.append(f"{k}: {vis[k]}")
+
+        # The vision model's word on navigation OVERRIDES the DOM probe. A menu it can
+        # see is a menu that exists, whatever the markup looks like — this is what stops
+        # us telling someone their navigation is missing while it sits in their screenshot.
+        if vis.get("nav_visible"):
+            labels = vis.get("nav_labels") or []
+            lines.append(
+                f"→ NAVIGATION IS VISIBLE in the screenshot{f' — labels seen: {labels}' if labels else ''}. "
+                "The site HAS navigation. C2-01/C2-02 PASS. You MUST NOT report navigation as "
+                "missing or absent, regardless of what the DOM probe found."
+            )
+        elif vis.get("nav_visible") is False:
+            lines.append(
+                "→ No navigation menu is visible in the screenshot either. Combined with the DOM "
+                "probe, missing navigation is now a supportable finding."
+            )
+        if vis.get("active_nav_indicated"):
+            lines.append(
+                "→ The CURRENT PAGE IS VISUALLY INDICATED in the nav (underline/dot/highlight). "
+                "C2-03 PASSES — do NOT report a missing active state."
+            )
+
         for vi in (vis.get("visual_issues") or [])[:6]:
             lines.append(f"  · [{vi.get('severity','medium')}] {vi.get('issue','')} → fix: {vi.get('fix','')}")
 
@@ -1006,6 +1155,7 @@ OUTPUT FORMAT — respond with ONLY valid JSON matching this exact schema:
 ABSOLUTE RULES — violating any of these makes the audit worthless:
 1. The LIVE PAGE DATA above was captured by a headless browser that fully rendered the React app. It is authoritative. Nav labels, headings, button texts, and link texts shown are EXACTLY what users see.
 2. NEVER invent or assume content not present in the LIVE PAGE DATA. If nav_links shows ['Work', 'Products', 'Blog', 'About'], those are the real labels — report them verbatim.
+2b. ABSENCE OF DETECTION IS NOT EVIDENCE OF ABSENCE. This is the single most damaging mistake you can make. An empty field, a zero count, or a missing block means OUR PROBE DID NOT FIND IT — it does NOT mean the site lacks the feature. Our probes look for specific markup, and a huge number of real sites are built differently (no semantic <nav>, no aria-current, visual-only state, styling we don't recognise). NEVER write "X is completely missing", "the site has no X", or "X is absent" on the strength of an empty field alone. Any block marked INCONCLUSIVE must be treated as unknown, not as failed. Where a VISUAL REVIEW block exists, it outranks every DOM probe: if the vision model can SEE the thing, the thing exists and the check PASSES, no matter what the DOM said. Reporting a feature as missing when a visitor can plainly see it on their own screen destroys all trust in this audit.
 3. For checklist items that CAN be verified from fetched data (nav labels, headings, image alt, HTTPS, footer links, PageSpeed scores), your finding MUST match the data exactly.
 4. VISUAL ITEMS ARE NOW MEASURED — do NOT punt on them.
    · Colour contrast (C1-06): the "★ COLOUR CONTRAST" block gives COMPUTED WCAG ratios. Use them verbatim. If it reports failures, C1-06 FAILS and you must quote the real ratio (e.g. "2.9:1, needs 4.5:1"). If it says all pass, C1-06 PASSES. NEVER write "requires visual review" for contrast — we measured it.
@@ -1017,7 +1167,7 @@ ABSOLUTE RULES — violating any of these makes the audit worthless:
 8. PRIMARY CTA (C1-02): The "★ PRIMARY CTA ELEMENTS" field lists all btn-primary styled elements. If it lists items like "Start Your Project", that CTA IS present and visible. Do NOT flag C1-02 as failing if primary CTAs are listed.
 9. NAVIGATION COUNT (C2-01): The nav_links field is already deduplicated. Count only the unique items shown. Do NOT report duplicates unless the exact same label appears twice in the deduplicated list.
 10. HERO AND AUDIENCE (C1-01, C6-04): If "★ TARGET AUDIENCE STATEMENT" field exists, C6-04 PASSES — NEVER mark it failing when this field is present. If H1 and hero_text are present with a value proposition, C1-01 passes.
-11. ACTIVE NAV STATE (C2-03): If "★ ACTIVE NAV LINKS" field is non-empty, C2-03 PASSES — the active state system is implemented. Do NOT flag C2-03 as failing when active_nav_links contains items.
+11. ACTIVE NAV STATE (C2-03): If "★ ACTIVE NAV LINKS" field is non-empty, C2-03 PASSES — the active state system is implemented. Do NOT flag C2-03 as failing when active_nav_links contains items. If the block instead says the active state is INCONCLUSIVE, obey it: an active page is very often marked with a purely visual cue (underline, dot, colour) that leaves no DOM trace. Do NOT fail C2-03 on a DOM miss.
 12. UNVERIFIABLE ITEMS — PLACEMENT RULE: A finding that genuinely cannot be verified goes in medium_issues ONLY, never critical/high. This now applies ONLY to: C4-01 (hover/active states), C4-03 (animation quality), C4-07 (loading indicators). It does NOT apply to mobile layout, tap targets, text size, or colour contrast — those are now MEASURED on a real device viewport and with computed WCAG ratios, so they are fully verifiable and MUST be scored normally (critical/high where the data shows a real failure).
 13. HOVER STATES (C4-01): CSS :hover and :active are invisible to static renders. If you cannot verify, put ONLY in medium_issues with note "Requires interactive testing." NEVER in high_issues.
 14. LOADING INDICATORS (C4-07): Loading spinners only appear after form submission. NEVER flag C4-07 in high_issues from a static render. Put ONLY in medium_issues if you cannot verify.
