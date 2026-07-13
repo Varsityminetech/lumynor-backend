@@ -854,6 +854,11 @@ def _teaser_from_report(report: dict) -> dict:
         "mobile_tested":     bool(ev.get("mobile") and not (ev.get("mobile") or {}).get("error")),
         "visually_reviewed": bool(ev.get("visual")),
         "visual_skipped":    ev.get("visual_skipped"),   # why, if it didn't run
+        # "Real Speed Data — Never Estimated" is live copy on the product card; this is
+        # its receipt. False + the reason when our PageSpeed fetch failed (quota, no key).
+        "speed_measured":    bool((report.get("pagespeed") or {}) and "error" not in (report.get("pagespeed") or {})),
+        "speed_skipped":     (report.get("pagespeed") or {}).get("error"),
+        "performance_score": (report.get("pagespeed") or {}).get("performance"),
         "counts": {
             "critical": len(crit),
             "high":     len(high),
