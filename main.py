@@ -293,6 +293,28 @@ def _require_admin(auth_user: dict = Depends(_get_supabase_user)) -> dict:
     return {**auth_user, "role": "admin"}
 
 
+def _is_admin_request(request: Request) -> bool:
+    """Non-throwing admin check for PUBLIC endpoints that stay open to everyone.
+
+    _require_admin (above) is a gate — no token, no entry. This is the opposite: an
+    anonymous visitor must sail through unaffected (return False, never raise), but a
+    logged-in admin gets recognised so public-tier limits can be waived for them.
+    First use: the founder demoing UXRay kept burning the visitor free-audit quota on
+    their own product — with this, an admin session skips the cap entirely.
+    """
+    auth = request.headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
+        return False
+    try:
+        user = _get_supabase_user(auth)
+        if user["email"] == OWNER_EMAIL:
+            return True
+        profile = db.get_user_profile(user["id"])
+        return bool(profile and profile.get("role") == "admin")
+    except Exception:
+        return False   # bad/expired token = ordinary visitor, not an error
+
+
 # ── EXPORT ENDPOINTS (admin-only) ─────────────────────────────────────────────
 # These dump the internal pipeline's current document. Previously public — anyone
 # could fetch the in-progress internal report. Declared here (not at the top of the
@@ -889,9 +911,15 @@ def public_audit(
     if not url:
         raise HTTPException(status_code=400, detail="Please enter a website URL.")
 
+    # Admins are exempt from the visitor free tier: the founder demoing or testing
+    # their own product must never see "you've used your 3 free audits". Anonymous
+    # visitors are completely unaffected (no token -> False, never an error).
+    is_admin = _is_admin_request(request)
+
     # Are they already out of real audits? Check first — don't spend an LLM call
     # just to tell them no.
-    quota_check(request, AUDIT_QUOTA, WINDOW, SCOPE)
+    if not is_admin:
+        quota_check(request, AUDIT_QUOTA, WINDOW, SCOPE)
 
     # Always 'generic': it's the visitor's own site, so grade it on its own merits
     # against universal UX principles — never against Lumynor's design system.
@@ -900,7 +928,8 @@ def public_audit(
         # Unreachable/invalid/blocked URL — nothing was spent, so charge nothing.
         raise HTTPException(status_code=400, detail=report["error"])
 
-    quota_charge(request, SCOPE)           # only now did we actually spend money
+    if not is_admin:
+        quota_charge(request, SCOPE)       # only now did we actually spend money
     saved = da.save_audit(report)          # persist full report; teaser references its id
     return _teaser_from_report(saved)
 
