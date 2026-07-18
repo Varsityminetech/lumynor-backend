@@ -1576,9 +1576,19 @@ Return ONLY valid JSON — no markdown fences, no explanation outside the JSON."
         return report
 
     except json.JSONDecodeError as e:
-        return {"error": f"JSON parse error: {str(e)}", "raw": raw[:500] if 'raw' in dir() else ""}
+        print(f"[design_audit] LLM returned invalid JSON: {str(e)[:200]}")
+        return {"error": "The AI evaluation returned malformed output. Please try again."}
     except Exception as e:
-        return {"error": str(e)[:300]}
+        # Log the real exception for debugging, but never show a visitor raw text
+        # like "HTTP Error 429: Too Many Requests" — that was happening whenever
+        # BOTH configured LLM providers were exhausted. Say what's actually true
+        # (our infrastructure couldn't complete this right now) without dressing
+        # it up as something the visitor did wrong.
+        err_text = str(e)
+        print(f"[design_audit] LLM evaluation failed: {err_text[:300]}")
+        if re.search(r'\b429\b|rate.?limit|quota|too many requests', err_text, re.I):
+            return {"error": "Our AI provider is at capacity right now — please try again in a few minutes."}
+        return {"error": "We couldn't complete this audit right now. Please try again in a moment."}
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────

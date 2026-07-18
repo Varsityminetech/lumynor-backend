@@ -21,10 +21,20 @@ _OLLAMA_DEFAULT_MODEL = "gpt-oss:120b"  # alternatives: deepseek-v3.1:671b, glm-
 
 def _build_llm_cfg(settings: dict, gemini_key: str) -> dict:
     """Decide which LLM the pipeline uses. If an Ollama Cloud key is present
-    (settings or OLLAMA_API_KEY env), use Ollama Cloud; otherwise Gemini."""
+    (settings or OLLAMA_API_KEY env), use Ollama Cloud; otherwise Gemini.
+
+    The Gemini key is always attached too, even when Ollama is primary — Ollama
+    Cloud is a metered, paid API with its own account-level rate limit; when that
+    account is over quota, EVERY model in the writing chain fails with the same
+    429 (they share one quota), and previously there was nowhere left to go: the
+    raw HTTP error propagated straight to the caller, including public visitors
+    running a UXRay audit. Carrying gemini_key here lets _llm() cross over to
+    Gemini as a last resort instead of failing outright."""
     name = (settings.get("llmApiName") or "").lower()
     ollama_key = (settings.get("llmApiKey", "") if name in ("ollama_cloud", "ollama") else "") \
         or os.getenv("OLLAMA_API_KEY", "")
+    _gkey = (gemini_key or (settings.get("llmApiKey", "") if name not in ("ollama_cloud", "ollama") else "") or
+             os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", ""))
     if ollama_key:
         # Best-quality model chain — all tasks use this, no fast/small model.
         # Override via OLLAMA_WRITING_MODELS env (comma-separated, best first).
@@ -36,10 +46,8 @@ def _build_llm_cfg(settings: dict, gemini_key: str) -> dict:
             "writing_models": writing_models,
             "ollama_key": ollama_key,
             "ollama_host": settings.get("llmBaseUrl") or os.getenv("OLLAMA_HOST") or "https://ollama.com",
+            "gemini_key": _gkey,   # fallback only — see _llm()
         }
-    # Check both GEMINI_API_KEY and GOOGLE_API_KEY — Railway may set either.
-    _gkey = (gemini_key or settings.get("llmApiKey", "") or
-             os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", ""))
     return {"provider": "gemini", "gemini_key": _gkey}
 
 
@@ -53,13 +61,36 @@ def _llm(prompt: str, llm_cfg, json_mode: bool = False, timeout: int = 60, max_t
         # Always use the quality chain for every task — time is not a constraint.
         chain = llm_cfg.get("writing_models") or [llm_cfg.get("model")]
         last_err = None
+        rate_limited = False
         for m in [x for x in chain if x]:
             try:
                 return _ollama_generate(prompt, llm_cfg, json_mode, timeout, max_tokens, model=m)
+            except urllib.error.HTTPError as e:
+                last_err = e
+                if e.code == 429:
+                    rate_limited = True
+                print(f"[ollama_cloud] model '{m}' failed ({str(e)[:80]}); trying next in chain...")
+                continue
             except Exception as e:
                 last_err = e
                 print(f"[ollama_cloud] model '{m}' failed ({str(e)[:80]}); trying next in chain...")
                 continue
+
+        # The whole chain failed. If it was quota/rate-limit (not e.g. every model
+        # being individually broken), retrying more Ollama models is pointless —
+        # they all draw from the same account limit. Cross over to Gemini instead
+        # of surfacing a raw "HTTP Error 429" to whoever triggered this call.
+        gemini_key = llm_cfg.get("gemini_key", "")
+        if gemini_key:
+            reason = "rate-limited" if rate_limited else "unavailable"
+            print(f"[ollama_cloud] entire chain {reason} — falling back to Gemini")
+            try:
+                return _gemini_generate(prompt, gemini_key, json_mode, timeout, max_tokens)
+            except Exception as gemini_err:
+                # Both providers are down — this is now genuinely unrecoverable info,
+                # not noise to hide.
+                print(f"[llm] Gemini fallback also failed: {str(gemini_err)[:150]}")
+                raise
         if last_err:
             raise last_err
         raise RuntimeError("No Ollama Cloud model available")
