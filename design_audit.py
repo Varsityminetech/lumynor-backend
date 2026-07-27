@@ -1529,12 +1529,22 @@ Return ONLY valid JSON — no markdown fences, no explanation outside the JSON."
     # ── Step 3: LLM evaluation ────────────────────────────────────────────────
     try:
         llm_cfg = _build_llm_cfg(stored, gemini_key)
+        # json_mode=True: force structured output instead of hoping the "Return ONLY
+        # valid JSON" instruction is obeyed — a stray preface or an imperfect markdown
+        # fence previously left nothing for the regex extractor below to find at all.
+        # disable_thinking=True: gemini-2.5-flash is a thinking model; its reasoning
+        # tokens bill against this SAME 4000-token cap. This exact combination (tight
+        # cap + thinking enabled) already silently killed the vision pass for weeks
+        # before that call got this same fix, and reproduced itself here — a live
+        # "LLM did not return valid JSON" failure on a real audit is what sent me
+        # back to patch it on this call too.
         raw = _llm(
             f"{_system_prompt(mode)}\n\n{user_prompt}",
             llm_cfg,
-            json_mode=False,
+            json_mode=True,
             timeout=120,
             max_tokens=4000,
+            disable_thinking=True,
         )
 
         match = re.search(r'\{.*\}', raw, re.DOTALL)

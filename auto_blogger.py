@@ -51,10 +51,16 @@ def _build_llm_cfg(settings: dict, gemini_key: str) -> dict:
     return {"provider": "gemini", "gemini_key": _gkey}
 
 
-def _llm(prompt: str, llm_cfg, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192) -> str:
+def _llm(prompt: str, llm_cfg, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192,
+         disable_thinking: bool = False) -> str:
     """Dispatch a text-generation call to the configured provider.
     For Ollama: always uses the best writing-quality model chain — no fast/small
-    model is ever used. Quality over speed."""
+    model is ever used. Quality over speed.
+
+    disable_thinking only affects Gemini calls (direct, or the fallback below) — see
+    _gemini_generate's docstring. Ollama's own thinking-model risk (minimax-m2, glm-4.6,
+    etc.) is already handled in _ollama_generate by reading the 'thinking' field when
+    'content' comes back empty, so no equivalent flag is needed on that path."""
     if isinstance(llm_cfg, str):  # back-compat: bare Gemini key
         llm_cfg = {"provider": "gemini", "gemini_key": llm_cfg}
     if llm_cfg.get("provider") in ("ollama_cloud", "ollama"):
@@ -85,7 +91,7 @@ def _llm(prompt: str, llm_cfg, json_mode: bool = False, timeout: int = 60, max_t
             reason = "rate-limited" if rate_limited else "unavailable"
             print(f"[ollama_cloud] entire chain {reason} — falling back to Gemini")
             try:
-                return _gemini_generate(prompt, gemini_key, json_mode, timeout, max_tokens)
+                return _gemini_generate(prompt, gemini_key, json_mode, timeout, max_tokens, disable_thinking)
             except Exception as gemini_err:
                 # Both providers are down — this is now genuinely unrecoverable info,
                 # not noise to hide.
@@ -94,11 +100,23 @@ def _llm(prompt: str, llm_cfg, json_mode: bool = False, timeout: int = 60, max_t
         if last_err:
             raise last_err
         raise RuntimeError("No Ollama Cloud model available")
-    return _gemini_generate(prompt, llm_cfg.get("gemini_key", ""), json_mode, timeout, max_tokens)
+    return _gemini_generate(prompt, llm_cfg.get("gemini_key", ""), json_mode, timeout, max_tokens, disable_thinking)
 
 
-def _gemini_generate(prompt: str, api_key: str, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192) -> str:
-    """Call Gemini 2.5 Flash with retry/backoff on transient errors (429/503)."""
+def _gemini_generate(prompt: str, api_key: str, json_mode: bool = False, timeout: int = 60,
+                      max_tokens: int = 8192, disable_thinking: bool = False) -> str:
+    """Call Gemini 2.5 Flash with retry/backoff on transient errors (429/503).
+
+    disable_thinking: gemini-2.5-flash is a THINKING model — its reasoning tokens are
+    billed against the SAME maxOutputTokens budget as the answer. This is opt-in
+    (default False, unchanged for every existing caller) because thinking can genuinely
+    help on complex tasks. But for a caller with a tight token cap and a task that's
+    pure extraction/scoring (no multi-step reasoning payoff), it's a live footgun: this
+    exact failure mode already silently killed the design-audit vision pass for weeks
+    (thinking consumed the whole budget, leaving no room for the actual answer — not
+    even a partial one), and reproduced itself in the main audit-evaluation call the
+    day this parameter was added. Callers on a tight max_tokens budget for a
+    non-reasoning task should pass True."""
     import time
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
     payload = {
@@ -111,6 +129,8 @@ def _gemini_generate(prompt: str, api_key: str, json_mode: bool = False, timeout
     if json_mode:
         payload["generationConfig"]["responseMimeType"] = "application/json"
         payload["generationConfig"]["temperature"] = 0.5
+    if disable_thinking:
+        payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
 
     data = json.dumps(payload).encode("utf-8")
     last_err = None
