@@ -57,10 +57,10 @@ def _llm(prompt: str, llm_cfg, json_mode: bool = False, timeout: int = 60, max_t
     For Ollama: always uses the best writing-quality model chain — no fast/small
     model is ever used. Quality over speed.
 
-    disable_thinking only affects Gemini calls (direct, or the fallback below) — see
-    _gemini_generate's docstring. Ollama's own thinking-model risk (minimax-m2, glm-4.6,
-    etc.) is already handled in _ollama_generate by reading the 'thinking' field when
-    'content' comes back empty, so no equivalent flag is needed on that path."""
+    disable_thinking sends the equivalent "no reasoning, just answer" signal to
+    whichever provider ends up handling the call — Gemini's thinkingConfig, or
+    Ollama's top-level "think": false — see each generate function's docstring.
+    """
     if isinstance(llm_cfg, str):  # back-compat: bare Gemini key
         llm_cfg = {"provider": "gemini", "gemini_key": llm_cfg}
     if llm_cfg.get("provider") in ("ollama_cloud", "ollama"):
@@ -70,7 +70,8 @@ def _llm(prompt: str, llm_cfg, json_mode: bool = False, timeout: int = 60, max_t
         rate_limited = False
         for m in [x for x in chain if x]:
             try:
-                return _ollama_generate(prompt, llm_cfg, json_mode, timeout, max_tokens, model=m)
+                return _ollama_generate(prompt, llm_cfg, json_mode, timeout, max_tokens, model=m,
+                                         disable_thinking=disable_thinking)
             except urllib.error.HTTPError as e:
                 last_err = e
                 if e.code == 429:
@@ -158,9 +159,20 @@ def _gemini_generate(prompt: str, api_key: str, json_mode: bool = False, timeout
         raise last_err
 
 
-def _ollama_generate(prompt: str, cfg: dict, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192, model: str = None) -> str:
+def _ollama_generate(prompt: str, cfg: dict, json_mode: bool = False, timeout: int = 60, max_tokens: int = 8192,
+                      model: str = None, disable_thinking: bool = False) -> str:
     """Call an Ollama Cloud model (https://ollama.com) with retry/backoff.
-    Uses the standard Ollama /api/chat shape with Bearer auth + format=json."""
+    Uses the standard Ollama /api/chat shape with Bearer auth + format=json.
+
+    disable_thinking sends the documented top-level "think": false parameter
+    (docs.ollama.com/capabilities/thinking) — the Ollama equivalent of Gemini's
+    thinkingConfig.thinkingBudget=0. Several of the writing_models (gpt-oss:120b,
+    devstral-2:123b, etc.) are reasoning models that otherwise spend the ENTIRE
+    num_predict budget narrating their plan before ever writing the actual answer —
+    confirmed live: a design-audit call came back with content truncated mid-word
+    inside the reasoning trace itself ("...critical issues, high issues, streng"),
+    not even a JSON attempt.
+    """
     import time
     host = (cfg.get("ollama_host") or "https://ollama.com").rstrip("/")
     # Ollama model names are lowercase; normalize so a config typo (e.g.
@@ -175,6 +187,8 @@ def _ollama_generate(prompt: str, cfg: dict, json_mode: bool = False, timeout: i
     }
     if json_mode:
         payload["format"] = "json"
+    if disable_thinking:
+        payload["think"] = False
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if key:
@@ -187,12 +201,24 @@ def _ollama_generate(prompt: str, cfg: dict, json_mode: bool = False, timeout: i
                 result = json.loads(resp.read().decode())
                 msg = result.get("message", {})
                 content = (msg.get("content") or "").strip()
-                # Some models (e.g. minimax-m2, glm-4.6) are "thinking" models that
-                # put their reasoning in 'thinking' and the final answer in 'content'.
-                # When content is empty (token budget consumed by thinking), fall back
-                # to the thinking text so the pipeline gets something usable.
-                if not content:
+                if not content and not disable_thinking:
+                    # Some models (e.g. minimax-m2, glm-4.6) are "thinking" models that
+                    # put their reasoning in 'thinking' and the final answer in 'content'.
+                    # When content is empty (token budget consumed by thinking), fall
+                    # back to the thinking text so the pipeline gets SOMETHING usable —
+                    # acceptable for free-form tasks (e.g. blog prose), but NEVER for a
+                    # caller that explicitly asked for a clean answer: thinking text is
+                    # narrative prose, frequently truncated mid-sentence by the token
+                    # cap, and is never valid JSON. Silently returning it as if it were
+                    # real content is what let this failure masquerade as a success and
+                    # skip the retry/fallback chain entirely — raise instead, below.
                     content = (msg.get("thinking") or "").strip()
+                if not content:
+                    raise RuntimeError(
+                        f"model '{model}' returned no usable content"
+                        + (" (thinking budget likely consumed the response — "
+                           "try again or use a non-reasoning model)" if disable_thinking else "")
+                    )
                 return content
         except urllib.error.HTTPError as e:
             last_err = e

@@ -926,16 +926,7 @@ def public_audit(
     report = da.run_audit(url, pages=[url], notes="", auditor_notes="", mode="generic")
     if report.get("error"):
         # Unreachable/invalid/blocked URL — nothing was spent, so charge nothing.
-        detail = report["error"]
-        # TEMPORARY diagnostic: the "LLM did not return valid JSON" failure is
-        # reproducing after the json_mode+disable_thinking fix, and there is no
-        # other way to see what the model actually returned (no admin auth, no
-        # Railway log access from here). Appends a short, truncated raw snippet
-        # ONLY for this specific error, ONLY long enough to diagnose, then must be
-        # reverted — this is intentionally not a permanent behavior change.
-        if report.get("raw") and "valid JSON" in detail:
-            detail += f" [diag: {report['raw'][:180]!r}]"
-        raise HTTPException(status_code=400, detail=detail)
+        raise HTTPException(status_code=400, detail=report["error"])
 
     if not is_admin:
         quota_charge(request, SCOPE)       # only now did we actually spend money
