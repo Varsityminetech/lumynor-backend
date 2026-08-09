@@ -3627,6 +3627,23 @@ def billing_invoice_pdf(invoice_id: str, user=Depends(_require_admin)):
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
+# Payments ── manual records; source of truth for an invoice's amount_paid
+@app.post("/api/billing/invoices/{invoice_id}/mark-paid")
+def billing_invoice_mark_paid(invoice_id: str, body: dict, user=Depends(_require_admin)):
+    try:
+        return bill.record_payment(
+            invoice_id, amount=body.get("amount"), paid_at=body.get("paid_at"),
+            method=body.get("method", "bank_transfer"),
+            reference_note=body.get("reference_note"),
+            recorded_by=user.get("email"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/billing/payments")
+def billing_payments_list(invoice_id: str = None, user=Depends(_require_admin)):
+    return bill.get_payments(invoice_id=invoice_id)
+
 
 # ── Wire Lumy's WhatsApp orchestrator to the real backend agents ───────────────
 # Read-only / contained actions run immediately; anything that touches the live

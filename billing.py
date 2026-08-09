@@ -522,6 +522,55 @@ def build_invoice_html(invoice: dict, company_profile: dict, recipient: dict) ->
 </body></html>"""
 
 
+def get_payments(invoice_id: str = None) -> list:
+    sb = _sb()
+    if not sb:
+        return []
+    q = sb.table("billing_payments").select("*").order("paid_at", desc=True)
+    if invoice_id:
+        q = q.eq("invoice_id", invoice_id)
+    return q.execute().data or []
+
+
+def record_payment(invoice_id: str, amount: float, paid_at: str, method: str = "bank_transfer",
+                    reference_note: str = None, recorded_by: str = None) -> dict:
+    """Inserts the payment, recomputes amount_paid from the sum of all payments
+    against this invoice (source of truth is the payments table, not a running
+    counter, so this stays correct even if a payment is later deleted by hand
+    in Supabase), and syncs the invoice + its linked order once fully settled."""
+    sb = _sb()
+    if not sb:
+        return {}
+    invoice = get_invoice(invoice_id)
+    if not invoice:
+        raise ValueError("Invoice not found")
+
+    sb.table("billing_payments").insert({
+        "invoice_id":     invoice_id,
+        "amount":         float(amount),
+        "paid_at":        paid_at,
+        "method":         method,
+        "reference_note": reference_note or "",
+        "recorded_by":    recorded_by or "",
+    }).execute()
+
+    payments = get_payments(invoice_id)
+    amount_paid = round(sum(float(p.get("amount") or 0) for p in payments), 2)
+    total = float(invoice.get("total") or 0)
+    new_status = "paid" if amount_paid >= total else ("partially_paid" if amount_paid > 0 else invoice["status"])
+
+    sb.table("billing_invoices").update({
+        "amount_paid": amount_paid,
+        "status":      new_status,
+        "updated_at":  _now(),
+    }).eq("id", invoice_id).execute()
+
+    if new_status == "paid" and invoice.get("order_id"):
+        update_order(invoice["order_id"], status="paid")
+
+    return get_invoice(invoice_id)
+
+
 def generate_invoice_pdf(invoice_id: str) -> bytes:
     from playwright.sync_api import sync_playwright
 
