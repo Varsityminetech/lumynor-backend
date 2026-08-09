@@ -7,10 +7,30 @@ Clients (project/service engagements) and Customers (product subscribers) are
 deliberately two separate tables/concepts, not one shared "account" — an
 invoice bills exactly one or the other (see billing_invoices' CHECK constraint).
 """
+import base64
+import os
 import shutil
 from datetime import datetime, timezone, date
 from urllib.parse import quote
 from db import _sb, get_settings, save_settings
+
+_LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "lumynor-logo-text.png")
+_logo_b64_cache = None
+
+
+def _logo_data_uri() -> str:
+    """Base64-embeds the site's actual logo (transparent bg, violet->cyan brand
+    gradient wordmark) so the invoice PDF is unmistakably a Lumynor document
+    instead of a generic black-on-white template. Cached after first read —
+    the file never changes at runtime."""
+    global _logo_b64_cache
+    if _logo_b64_cache is None:
+        try:
+            with open(_LOGO_PATH, "rb") as f:
+                _logo_b64_cache = base64.b64encode(f.read()).decode("ascii")
+        except OSError:
+            _logo_b64_cache = ""
+    return f"data:image/png;base64,{_logo_b64_cache}" if _logo_b64_cache else ""
 
 # Mirrors the INDIAN_STATES list in Settings.jsx — kept identical so the state
 # comparison behind CGST/SGST-vs-IGST is an exact string match, not fuzzy text.
@@ -32,13 +52,29 @@ ALERT_TYPES = ['due_soon', 'overdue']
 MANDATE_STATUSES = ['none', 'pending', 'active', 'paused', 'cancelled', 'failed']
 
 _PARTY_FIELDS = {
-    "name", "legal_name", "contact_name", "email", "phone", "whatsapp_number",
+    "name", "contact_name", "email", "phone", "whatsapp_number",
     "billing_address", "state", "gstin", "notes", "status",
 }
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def party_display_name(party: dict) -> str:
+    """Company name if set, otherwise the contact person's name — an
+    individual client/customer with no company bills in their own name."""
+    return (party.get("name") or party.get("contact_name") or "").strip()
+
+
+def _require_a_name(payload: dict, existing: dict = None) -> None:
+    """A client/customer needs a company name OR a contact person name — never
+    neither. `existing` lets a partial update check the post-merge state
+    instead of just the fields being changed in this call."""
+    name = payload.get("name", existing.get("name") if existing else None)
+    contact = payload.get("contact_name", existing.get("contact_name") if existing else None)
+    if not (name or "").strip() and not (contact or "").strip():
+        raise ValueError("Provide a company name or a contact person name")
 
 
 # ── Clients (project/service engagements) ───────────────────────────────────────
@@ -66,6 +102,7 @@ def create_client(data: dict) -> dict:
     if not sb:
         return {}
     payload = {k: v for k, v in data.items() if k in _PARTY_FIELDS}
+    _require_a_name(payload)
     payload.setdefault("status", "active")
     res = sb.table("billing_clients").insert(payload).execute()
     return (res.data or [{}])[0]
@@ -76,6 +113,8 @@ def update_client(client_id: str, **kwargs) -> dict:
     if not sb:
         return {}
     payload = {k: v for k, v in kwargs.items() if k in _PARTY_FIELDS}
+    if "name" in payload or "contact_name" in payload:
+        _require_a_name(payload, existing=get_client(client_id) or {})
     payload["updated_at"] = _now()
     res = sb.table("billing_clients").update(payload).eq("id", client_id).execute()
     return (res.data or [{}])[0]
@@ -114,6 +153,7 @@ def create_customer(data: dict) -> dict:
     if not sb:
         return {}
     payload = {k: v for k, v in data.items() if k in _PARTY_FIELDS}
+    _require_a_name(payload)
     payload.setdefault("status", "active")
     res = sb.table("billing_customers").insert(payload).execute()
     return (res.data or [{}])[0]
@@ -124,6 +164,8 @@ def update_customer(customer_id: str, **kwargs) -> dict:
     if not sb:
         return {}
     payload = {k: v for k, v in kwargs.items() if k in _PARTY_FIELDS}
+    if "name" in payload or "contact_name" in payload:
+        _require_a_name(payload, existing=get_customer(customer_id) or {})
     payload["updated_at"] = _now()
     res = sb.table("billing_customers").update(payload).eq("id", customer_id).execute()
     return (res.data or [{}])[0]
@@ -509,21 +551,28 @@ def _find_system_chromium() -> str | None:
 
 
 def build_invoice_html(invoice: dict, company_profile: dict, recipient: dict) -> str:
+    """Branded to match the actual site (lumynor-website/tailwind.config.js):
+    accent #7c3aed / secondary #00f0ff brand gradient, Space Grotesk for display
+    text, DM Sans for body — same fonts and colors a visitor sees on the site,
+    just on a white page since a printed/emailed legal document needs to stay
+    printable and readable in any mail client, not a dark UI surface."""
     items = invoice.get("items", [])
     is_interstate = float(invoice.get("igst_amount") or 0) > 0
+    is_paid = invoice.get("status") == "paid"
+    balance_due = float(invoice.get("total") or 0) - float(invoice.get("amount_paid") or 0)
 
     rows_html = "".join(f"""
         <tr>
-          <td>{i + 1}</td>
+          <td class="mono muted">{i + 1:02d}</td>
           <td>{it.get('description', '')}</td>
-          <td>{it.get('hsn_sac_code', '') or '-'}</td>
+          <td class="mono muted">{it.get('hsn_sac_code', '') or '—'}</td>
           <td class="num">{it.get('quantity', '')}</td>
           <td class="num">₹{_fmt_amount(it.get('unit_price'))}</td>
-          <td class="num">{_fmt_amount(it.get('discount_percent'))}%</td>
+          <td class="num muted">{_fmt_amount(it.get('discount_percent'))}%</td>
           <td class="num">₹{_fmt_amount(it.get('taxable_amount'))}</td>
-          <td class="num">{_fmt_amount(it.get('gst_rate_percent'))}%</td>
+          <td class="num muted">{_fmt_amount(it.get('gst_rate_percent'))}%</td>
           <td class="num">₹{_fmt_amount((it.get('cgst_amount') or 0) + (it.get('sgst_amount') or 0) + (it.get('igst_amount') or 0))}</td>
-          <td class="num">₹{_fmt_amount(it.get('line_total'))}</td>
+          <td class="num strong">₹{_fmt_amount(it.get('line_total'))}</td>
         </tr>
     """ for i, it in enumerate(items))
 
@@ -536,80 +585,138 @@ def build_invoice_html(invoice: dict, company_profile: dict, recipient: dict) ->
 
     bank = ""
     if company_profile.get("bank_account_number"):
-        upi = f' · UPI: {company_profile.get("upi_id")}' if company_profile.get("upi_id") else ""
+        upi = f'<div class="totrow"><span>UPI</span><span>{company_profile.get("upi_id")}</span></div>' if company_profile.get("upi_id") else ""
         bank = f"""
-          <div class="bank">
-            <strong>Bank Details</strong><br/>
-            {company_profile.get('bank_account_name', '')}<br/>
-            {company_profile.get('bank_name', '')} · A/C {company_profile.get('bank_account_number', '')}<br/>
-            IFSC: {company_profile.get('bank_ifsc', '')}{upi}
+          <div class="panel">
+            <div class="panel-label">Payment Details</div>
+            <div class="totrow"><span>Account Name</span><span>{company_profile.get('bank_account_name', '')}</span></div>
+            <div class="totrow"><span>Bank</span><span>{company_profile.get('bank_name', '')}</span></div>
+            <div class="totrow"><span>Account No.</span><span class="mono">{company_profile.get('bank_account_number', '')}</span></div>
+            <div class="totrow"><span>IFSC</span><span class="mono">{company_profile.get('bank_ifsc', '')}</span></div>
+            {upi}
           </div>
         """
 
-    balance_due = float(invoice.get("total") or 0) - float(invoice.get("amount_paid") or 0)
-    notes_html = f'<div class="meta" style="margin-top:20px;">{invoice.get("notes", "")}</div>' if invoice.get("notes") else ""
+    balance_html = (
+        '<div class="totrow balance paid"><span>Balance Due</span><span>PAID IN FULL</span></div>'
+        if is_paid else
+        f'<div class="totrow balance"><span>Balance Due</span><span>₹{_fmt_amount(balance_due)}</span></div>'
+    )
+
+    logo = _logo_data_uri()
+    logo_html = f'<img class="logo" src="{logo}" alt="Lumynor Systems" />' if logo else '<div class="logo-fallback">LUMYNOR</div>'
+
+    notes_html = f'<div class="panel"><div class="panel-label">Notes</div><p class="muted">{invoice.get("notes", "")}</p></div>' if invoice.get("notes") else ""
 
     return f"""<!doctype html><html><head><meta charset="utf-8"/>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
-  body {{ font-family: -apple-system, Helvetica, Arial, sans-serif; color: #1a1a1a; padding: 40px; font-size: 12px; }}
-  h1 {{ font-size: 20px; margin: 0 0 4px; }}
-  .row {{ display: flex; justify-content: space-between; margin-bottom: 24px; }}
-  .block {{ max-width: 45%; }}
-  .label {{ text-transform: uppercase; font-size: 9px; letter-spacing: 0.08em; color: #888; margin-bottom: 4px; }}
-  table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
-  th, td {{ border: 1px solid #ddd; padding: 6px 8px; text-align: left; font-size: 11px; }}
-  th {{ background: #f4f4f4; text-transform: uppercase; font-size: 9px; letter-spacing: 0.04em; }}
-  td.num, th.num {{ text-align: right; }}
-  .totals {{ margin-top: 16px; margin-left: auto; width: 280px; }}
-  .totrow {{ display: flex; justify-content: space-between; padding: 4px 0; }}
-  .grand {{ font-weight: 700; font-size: 14px; border-top: 2px solid #1a1a1a; padding-top: 8px; margin-top: 4px; }}
-  .bank {{ margin-top: 32px; font-size: 11px; color: #444; }}
-  .meta {{ font-size: 11px; color: #444; }}
+  :root {{ --accent: #7c3aed; --secondary: #00f0ff; --ink: #16181d; --muted: #6b7280; --line: #e6e4ee; }}
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: 'DM Sans', -apple-system, Helvetica, Arial, sans-serif; color: var(--ink); margin: 0; font-size: 12.5px; }}
+  .accent-bar {{ height: 6px; background: linear-gradient(90deg, var(--secondary), var(--accent)); }}
+  .page {{ padding: 36px 44px 44px; }}
+  h1, .display {{ font-family: 'Space Grotesk', 'DM Sans', sans-serif; }}
+  .muted {{ color: var(--muted); }}
+  .mono {{ font-family: 'SF Mono', Menlo, monospace; }}
+  .strong {{ font-weight: 700; }}
+
+  .header {{ display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 30px; }}
+  .logo {{ height: 34px; }}
+  .logo-fallback {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 22px;
+    background: linear-gradient(90deg, var(--accent), var(--secondary)); -webkit-background-clip: text; color: transparent; }}
+  .company-meta {{ margin-top: 10px; font-size: 11px; line-height: 1.6; color: var(--muted); }}
+  .invoice-meta {{ text-align: right; }}
+  .invoice-kicker {{ text-transform: uppercase; letter-spacing: 0.14em; font-size: 10px; font-weight: 700; color: var(--accent); }}
+  .invoice-number {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 22px; margin: 4px 0 8px; }}
+  .invoice-dates {{ font-size: 11px; line-height: 1.6; color: var(--muted); }}
+
+  .divider {{ height: 1px; background: var(--line); margin: 0 0 24px; }}
+
+  .bill-to-label {{ text-transform: uppercase; letter-spacing: 0.1em; font-size: 9.5px; font-weight: 700; color: var(--accent); margin-bottom: 6px; }}
+  .bill-to-name {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; margin-bottom: 3px; }}
+  .bill-to-detail {{ font-size: 11.5px; color: var(--muted); line-height: 1.6; }}
+
+  table {{ width: 100%; border-collapse: collapse; margin: 26px 0 20px; }}
+  thead th {{ text-align: left; text-transform: uppercase; letter-spacing: 0.06em; font-size: 8.5px; font-weight: 700;
+    color: var(--accent); background: rgba(124,58,237,0.06); padding: 9px 10px; border-bottom: 1.5px solid var(--accent); }}
+  th.num, td.num {{ text-align: right; }}
+  tbody td {{ padding: 9px 10px; border-bottom: 1px solid var(--line); font-size: 11.5px; vertical-align: top; }}
+  tbody tr:last-child td {{ border-bottom: 1.5px solid var(--ink); }}
+
+  .totals-row {{ display: flex; justify-content: flex-end; }}
+  .totals {{ width: 280px; }}
+  .totrow {{ display: flex; justify-content: space-between; padding: 5px 0; font-size: 11.5px; }}
+  .totrow.grand {{ font-weight: 700; font-size: 14px; border-top: 1.5px solid var(--ink); padding-top: 10px; margin-top: 6px; }}
+  .totrow.balance {{ font-weight: 700; font-size: 13px; color: #dc2626; background: rgba(220,38,38,0.06); padding: 8px 10px; margin-top: 8px; }}
+  .totrow.balance.paid {{ color: #059669; background: rgba(5,150,105,0.08); }}
+
+  .panel {{ margin-top: 22px; padding: 14px 16px; background: #fafafa; border: 1px solid var(--line); max-width: 320px; }}
+  .panel-label {{ text-transform: uppercase; letter-spacing: 0.1em; font-size: 9px; font-weight: 700; color: var(--accent); margin-bottom: 8px; }}
+  .panel .totrow {{ font-size: 11px; }}
+
+  .footer {{ margin-top: 40px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 9.5px; color: var(--muted); text-align: center; }}
 </style></head>
 <body>
-  <div class="row">
-    <div class="block">
-      <h1>{company_profile.get('legal_name', '')}</h1>
-      <div class="meta">{company_profile.get('address', '')}<br/>
-      {company_profile.get('state', '')}<br/>
-      {('GSTIN: ' + company_profile.get('gstin', '')) if company_profile.get('gstin') else ''}</div>
+  <div class="accent-bar"></div>
+  <div class="page">
+    <div class="header">
+      <div>
+        {logo_html}
+        <div class="company-meta">
+          {company_profile.get('legal_name', '')}<br/>
+          {company_profile.get('address', '')}<br/>
+          {company_profile.get('state', '')}
+          {('&nbsp;·&nbsp;GSTIN ' + company_profile.get('gstin', '')) if company_profile.get('gstin') else ''}
+        </div>
+      </div>
+      <div class="invoice-meta">
+        <div class="invoice-kicker">Tax Invoice</div>
+        <div class="invoice-number mono">{invoice.get('invoice_number', '')}</div>
+        <div class="invoice-dates">
+          Issue Date: {invoice.get('issue_date', '')}<br/>
+          Due Date: {invoice.get('due_date', '')}
+        </div>
+      </div>
     </div>
-    <div class="block" style="text-align:right;">
-      <div class="label">Invoice</div>
-      <h1>{invoice.get('invoice_number', '')}</h1>
-      <div class="meta">Issue Date: {invoice.get('issue_date', '')}<br/>Due Date: {invoice.get('due_date', '')}</div>
+
+    <div class="divider"></div>
+
+    <div>
+      <div class="bill-to-label">Billed To</div>
+      <div class="bill-to-name">{party_display_name(recipient)}</div>
+      <div class="bill-to-detail">
+        {recipient.get('billing_address', '')}<br/>
+        {recipient.get('state', '')}
+        {('&nbsp;·&nbsp;GSTIN ' + recipient.get('gstin', '')) if recipient.get('gstin') else ''}
+      </div>
     </div>
-  </div>
 
-  <div class="row">
-    <div class="block">
-      <div class="label">Billed To</div>
-      <strong>{recipient.get('legal_name') or recipient.get('name', '')}</strong><br/>
-      {recipient.get('billing_address', '')}<br/>
-      {recipient.get('state', '')}<br/>
-      {('GSTIN: ' + recipient.get('gstin', '')) if recipient.get('gstin') else ''}
+    <table>
+      <thead><tr>
+        <th style="width:28px">#</th><th>Description</th><th>HSN/SAC</th><th class="num">Qty</th>
+        <th class="num">Rate</th><th class="num">Disc.</th><th class="num">Taxable</th>
+        <th class="num">GST</th><th class="num">Tax</th><th class="num">Total</th>
+      </tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+
+    <div class="totals-row">
+      <div class="totals">
+        <div class="totrow"><span>Taxable Amount</span><span>₹{_fmt_amount(invoice.get('taxable_amount'))}</span></div>
+        {tax_rows}
+        <div class="totrow grand"><span>Total</span><span>₹{_fmt_amount(invoice.get('total'))}</span></div>
+        <div class="totrow"><span class="muted">Amount Paid</span><span>₹{_fmt_amount(invoice.get('amount_paid'))}</span></div>
+        {balance_html}
+      </div>
     </div>
+
+    {bank}
+    {notes_html}
+
+    <div class="footer">{company_profile.get('legal_name', 'Lumynor Systems')} · Generated via the Billing &amp; Accounts OS</div>
   </div>
-
-  <table>
-    <thead><tr>
-      <th>#</th><th>Description</th><th>HSN/SAC</th><th class="num">Qty</th>
-      <th class="num">Rate</th><th class="num">Disc.</th><th class="num">Taxable</th>
-      <th class="num">GST</th><th class="num">Tax Amt</th><th class="num">Total</th>
-    </tr></thead>
-    <tbody>{rows_html}</tbody>
-  </table>
-
-  <div class="totals">
-    <div class="totrow"><span>Taxable Amount</span><span>₹{_fmt_amount(invoice.get('taxable_amount'))}</span></div>
-    {tax_rows}
-    <div class="totrow grand"><span>Total</span><span>₹{_fmt_amount(invoice.get('total'))}</span></div>
-    <div class="totrow"><span>Amount Paid</span><span>₹{_fmt_amount(invoice.get('amount_paid'))}</span></div>
-    <div class="totrow" style="font-weight:700;"><span>Balance Due</span><span>₹{_fmt_amount(balance_due)}</span></div>
-  </div>
-
-  {bank}
-  {notes_html}
 </body></html>"""
 
 

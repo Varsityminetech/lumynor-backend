@@ -3503,7 +3503,10 @@ def billing_clients_list(status: str = None, user=Depends(_require_admin)):
 
 @app.post("/api/billing/clients")
 def billing_client_create(body: dict, user=Depends(_require_admin)):
-    client = bill.create_client(body)
+    try:
+        client = bill.create_client(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if not client:
         raise HTTPException(status_code=500, detail="Failed to create client")
     return client
@@ -3517,7 +3520,10 @@ def billing_client_get(client_id: str, user=Depends(_require_admin)):
 
 @app.patch("/api/billing/clients/{client_id}")
 def billing_client_update(client_id: str, body: dict, user=Depends(_require_admin)):
-    return bill.update_client(client_id, **body)
+    try:
+        return bill.update_client(client_id, **body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.delete("/api/billing/clients/{client_id}")
 def billing_client_delete(client_id: str, user=Depends(_require_admin)):
@@ -3532,7 +3538,10 @@ def billing_customers_list(status: str = None, user=Depends(_require_admin)):
 
 @app.post("/api/billing/customers")
 def billing_customer_create(body: dict, user=Depends(_require_admin)):
-    customer = bill.create_customer(body)
+    try:
+        customer = bill.create_customer(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if not customer:
         raise HTTPException(status_code=500, detail="Failed to create customer")
     return customer
@@ -3546,7 +3555,10 @@ def billing_customer_get(customer_id: str, user=Depends(_require_admin)):
 
 @app.patch("/api/billing/customers/{customer_id}")
 def billing_customer_update(customer_id: str, body: dict, user=Depends(_require_admin)):
-    return bill.update_customer(customer_id, **body)
+    try:
+        return bill.update_customer(customer_id, **body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.delete("/api/billing/customers/{customer_id}")
 def billing_customer_delete(customer_id: str, user=Depends(_require_admin)):
