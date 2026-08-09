@@ -8,7 +8,8 @@ deliberately two separate tables/concepts, not one shared "account" — an
 invoice bills exactly one or the other (see billing_invoices' CHECK constraint).
 """
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
+from urllib.parse import quote
 from db import _sb, get_settings, save_settings
 
 # Mirrors the INDIAN_STATES list in Settings.jsx — kept identical so the state
@@ -569,6 +570,124 @@ def record_payment(invoice_id: str, amount: float, paid_at: str, method: str = "
         update_order(invoice["order_id"], status="paid")
 
     return get_invoice(invoice_id)
+
+
+# ── Reminders & delivery (manual-assisted WhatsApp, real email send) ────────────
+# WhatsApp reminders stay manual-assisted, not automated: the only WhatsApp send
+# capability in this codebase (atlas_brain.send_whatsapp, Twilio) is a personal
+# sandbox tied to the founder's own phone with a 24h session window — not usable
+# for arbitrary client numbers. So this drafts the message and hands back a
+# pre-filled wa.me link for the founder to review and send themselves, same
+# pattern as WhatsAppFloating.jsx.
+
+def get_recipient(invoice: dict) -> dict | None:
+    """The client or customer this invoice bills — whichever is set."""
+    if invoice.get("client_id"):
+        return get_client(invoice["client_id"])
+    if invoice.get("customer_id"):
+        return get_customer(invoice["customer_id"])
+    return None
+
+
+def build_reminder_wa_link(invoice: dict, recipient: dict) -> str:
+    number = (recipient.get("whatsapp_number") or "").strip()
+    name = recipient.get("contact_name") or recipient.get("name") or ""
+    balance = round(float(invoice.get("total") or 0) - float(invoice.get("amount_paid") or 0), 2)
+    text = (
+        f"Hi {name}, this is a reminder that invoice {invoice.get('invoice_number')} "
+        f"for ₹{_fmt_amount(balance)} was due on {invoice.get('due_date')}. "
+        f"Please let us know once it's paid. Thank you — Lumynor Systems"
+    )
+    return f"https://wa.me/{number}?text={quote(text)}"
+
+
+def build_invoice_email_body(invoice: dict, recipient: dict) -> tuple[str, str]:
+    name = recipient.get("contact_name") or recipient.get("name") or ""
+    subject = f"Invoice {invoice.get('invoice_number')} from Lumynor Systems"
+    body = (
+        f"Hi {name},\n\n"
+        f"Please find attached invoice {invoice.get('invoice_number')} for "
+        f"₹{_fmt_amount(invoice.get('total'))}, due {invoice.get('due_date')}.\n\n"
+        f"Thanks,\nLumynor Systems"
+    )
+    return subject, body
+
+
+# ── Pending-payment alerts ───────────────────────────────────────────────────
+# Materialized rows (billing_alerts), not a live query — the UI needs a stable
+# badge count and a dismiss/acknowledge state, same reasoning as lumy_reminders.
+
+def get_overdue_invoices() -> list:
+    sb = _sb()
+    if not sb:
+        return []
+    today = date.today().isoformat()
+    return sb.table("billing_invoices").select("*") \
+        .lt("due_date", today) \
+        .not_.in_("status", ["paid", "cancelled"]) \
+        .execute().data or []
+
+
+def get_due_soon_invoices(days: int = 3) -> list:
+    sb = _sb()
+    if not sb:
+        return []
+    today = date.today().isoformat()
+    from datetime import timedelta
+    horizon = (date.today() + timedelta(days=days)).isoformat()
+    return sb.table("billing_invoices").select("*") \
+        .gte("due_date", today).lte("due_date", horizon) \
+        .not_.in_("status", ["paid", "cancelled"]) \
+        .execute().data or []
+
+
+def refresh_billing_alerts() -> dict:
+    """Daemon entry point. Upserts on (invoice_id, alert_type) so re-running
+    every 60s never duplicates a row, and flips overdue invoices/orders."""
+    sb = _sb()
+    if not sb:
+        return {"overdue": 0, "due_soon": 0}
+
+    overdue = get_overdue_invoices()
+    for inv in overdue:
+        sb.table("billing_alerts").upsert({
+            "invoice_id":   inv["id"],
+            "alert_type":   "overdue",
+            "message":      f"Invoice {inv['invoice_number']} is overdue (due {inv['due_date']}).",
+            "acknowledged": False,
+        }, on_conflict="invoice_id,alert_type").execute()
+        if inv["status"] != "overdue":
+            sb.table("billing_invoices").update({"status": "overdue", "updated_at": _now()}) \
+                .eq("id", inv["id"]).execute()
+            if inv.get("order_id"):
+                update_order(inv["order_id"], status="overdue")
+
+    due_soon = get_due_soon_invoices()
+    for inv in due_soon:
+        sb.table("billing_alerts").upsert({
+            "invoice_id":   inv["id"],
+            "alert_type":   "due_soon",
+            "message":      f"Invoice {inv['invoice_number']} is due {inv['due_date']}.",
+            "acknowledged": False,
+        }, on_conflict="invoice_id,alert_type").execute()
+
+    return {"overdue": len(overdue), "due_soon": len(due_soon)}
+
+
+def get_active_alerts() -> list:
+    sb = _sb()
+    if not sb:
+        return []
+    return sb.table("billing_alerts").select("*, billing_invoices(invoice_number,total,due_date)") \
+        .eq("acknowledged", False).order("created_at", desc=True).execute().data or []
+
+
+def acknowledge_alert(alert_id: str) -> bool:
+    sb = _sb()
+    if not sb:
+        return False
+    sb.table("billing_alerts").update({"acknowledged": True}).eq("id", alert_id).execute()
+    return True
 
 
 def generate_invoice_pdf(invoice_id: str) -> bytes:

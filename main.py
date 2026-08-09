@@ -1706,30 +1706,50 @@ def contact_inquiry(req: dict, _rl=Depends(rate_limit(5, 600, "leads"))):
 
 # ── Alert helpers (fire-and-forget; env vars gate them) ───────────────────────
 
-def _send_email_alert(subject: str, body: str):
-    """Send plain-text email via SMTP SSL.
-    Requires env vars: ALERT_EMAIL_TO, ALERT_SMTP_HOST, ALERT_SMTP_USER, ALERT_SMTP_PASS.
-    Silently no-ops when any of those are missing."""
-    import smtplib, email.mime.text, email.mime.multipart, threading
-    to   = os.getenv("ALERT_EMAIL_TO", "")
+def _send_email(to: str, subject: str, body: str, attachments: list = None) -> bool:
+    """Send plain-text email via SMTP SSL, optionally with attachments
+    (list of (filename, bytes, mime_subtype) tuples). Requires env vars
+    ALERT_SMTP_HOST, ALERT_SMTP_USER, ALERT_SMTP_PASS (same sending account
+    the blog alert pipeline already uses — just a parameterized recipient
+    now instead of the hardcoded ALERT_EMAIL_TO).
+
+    Synchronous by design, unlike _send_email_alert below — a founder-
+    initiated send (e.g. emailing an invoice) needs a real pass/fail
+    response, not a fire-and-forget thread. Returns True on success."""
+    import smtplib, email.mime.text, email.mime.multipart, email.mime.application
     host = os.getenv("ALERT_SMTP_HOST", "")
     user = os.getenv("ALERT_SMTP_USER", "")
     pwd  = os.getenv("ALERT_SMTP_PASS", "")
     if not (to and host and user and pwd):
-        return
-    def _send():
-        try:
-            msg = email.mime.multipart.MIMEMultipart()
-            msg["From"] = user
-            msg["To"]   = to
-            msg["Subject"] = f"[Lumynor Blog] {subject}"
-            msg.attach(email.mime.text.MIMEText(body, "plain"))
-            with smtplib.SMTP_SSL(host, 465, timeout=15) as srv:
-                srv.login(user, pwd)
-                srv.sendmail(user, to, msg.as_string())
-        except Exception as _e:
-            print(f"[email_alert] {_e}")
-    threading.Thread(target=_send, daemon=True).start()
+        return False
+    try:
+        msg = email.mime.multipart.MIMEMultipart()
+        msg["From"] = user
+        msg["To"] = to
+        msg["Subject"] = subject
+        msg.attach(email.mime.text.MIMEText(body, "plain"))
+        for filename, data, subtype in (attachments or []):
+            part = email.mime.application.MIMEApplication(data, _subtype=subtype)
+            part.add_header("Content-Disposition", "attachment", filename=filename)
+            msg.attach(part)
+        with smtplib.SMTP_SSL(host, 465, timeout=15) as srv:
+            srv.login(user, pwd)
+            srv.sendmail(user, to, msg.as_string())
+        return True
+    except Exception as e:
+        print(f"[email] {e}")
+        return False
+
+
+def _send_email_alert(subject: str, body: str):
+    """Fire-and-forget internal alert pipeline (lead inquiries, pipeline
+    failures) — unchanged behavior for every existing caller, just now a thin
+    wrapper delegating the actual send to _send_email."""
+    import threading
+    to = os.getenv("ALERT_EMAIL_TO", "")
+    threading.Thread(
+        target=_send_email, args=(to, f"[Lumynor Blog] {subject}", body), daemon=True
+    ).start()
 
 
 def _fire_publish_webhook(blog: dict):
@@ -3219,6 +3239,7 @@ async def startup_event():
     asyncio.create_task(atlas_proactive_daemon())
     asyncio.create_task(lumy_reminder_daemon())
     asyncio.create_task(whatsapp_session_keepalive_daemon())
+    asyncio.create_task(billing_alert_daemon())
 
 
 async def digest_daemon():
@@ -3645,6 +3666,55 @@ def billing_payments_list(invoice_id: str = None, user=Depends(_require_admin)):
     return bill.get_payments(invoice_id=invoice_id)
 
 
+# Reminders & delivery ── manual-assisted WhatsApp (wa.me link), real email send
+@app.get("/api/billing/invoices/{invoice_id}/reminder-link")
+def billing_invoice_reminder_link(invoice_id: str, user=Depends(_require_admin)):
+    invoice = bill.get_invoice(invoice_id)
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    recipient = bill.get_recipient(invoice)
+    if not recipient:
+        raise HTTPException(status_code=404, detail="Recipient not found")
+    return {"url": bill.build_reminder_wa_link(invoice, recipient)}
+
+@app.post("/api/billing/invoices/{invoice_id}/email")
+def billing_invoice_email(invoice_id: str, user=Depends(_require_admin)):
+    invoice = bill.get_invoice(invoice_id)
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    recipient = bill.get_recipient(invoice)
+    if not recipient or not recipient.get("email"):
+        raise HTTPException(status_code=400, detail="Recipient has no email on file")
+    try:
+        pdf_bytes = bill.generate_invoice_pdf(invoice_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    subject, body = bill.build_invoice_email_body(invoice, recipient)
+    filename = f"{invoice['invoice_number'].replace('/', '-')}.pdf"
+    sent = _send_email(recipient["email"], subject, body, attachments=[(filename, pdf_bytes, "pdf")])
+    if not sent:
+        raise HTTPException(status_code=502, detail="Email send failed — check ALERT_SMTP_* env vars")
+    bill.mark_invoice_sent(invoice_id)
+    return {"ok": True, "sent_to": recipient["email"]}
+
+
+# Pending-payment alerts ── materialized by billing_alert_daemon() every 60s
+@app.get("/api/billing/alerts")
+def billing_alerts_list(acknowledged: bool = None, user=Depends(_require_admin)):
+    if acknowledged is False or acknowledged is None:
+        return bill.get_active_alerts()
+    sb_ = db._sb()
+    if not sb_:
+        return []
+    return sb_.table("billing_alerts").select("*, billing_invoices(invoice_number,total,due_date)") \
+        .eq("acknowledged", acknowledged).order("created_at", desc=True).execute().data or []
+
+@app.post("/api/billing/alerts/{alert_id}/acknowledge")
+def billing_alert_acknowledge(alert_id: str, user=Depends(_require_admin)):
+    bill.acknowledge_alert(alert_id)
+    return {"ok": True}
+
+
 # ── Wire Lumy's WhatsApp orchestrator to the real backend agents ───────────────
 # Read-only / contained actions run immediately; anything that touches the live
 # site (publishing) requires a "haan"/"yes" confirmation reply first.
@@ -3818,6 +3888,21 @@ async def lumy_reminder_daemon():
                     print(f"[reminders] send failed (will retry next tick): {result.get('error')}")
         except Exception as e:
             print(f"[reminders] daemon error: {e}")
+        await _aio.sleep(60)
+
+
+async def billing_alert_daemon():
+    """Scans invoices every 60s and materializes billing_alerts rows the
+    founder sees in the Billing UI. Sends nothing itself — WhatsApp reminders
+    stay manual-assisted (wa.me links) and email only sends on an explicit
+    founder click, so this daemon's only job is detection, not delivery."""
+    import asyncio as _aio
+    await _aio.sleep(45)
+    while True:
+        try:
+            bill.refresh_billing_alerts()
+        except Exception as e:
+            print(f"[billing_alerts] daemon error: {e}")
         await _aio.sleep(60)
 
 
