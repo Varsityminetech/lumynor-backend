@@ -3562,6 +3562,72 @@ def billing_order_delete(order_id: str, user=Depends(_require_admin)):
     return {"ok": True}
 
 
+# Invoices ── GST-compliant, snapshot the recipient's GST facts at creation time
+@app.get("/api/billing/invoices")
+def billing_invoices_list(client_id: str = None, customer_id: str = None,
+                           status: str = None, user=Depends(_require_admin)):
+    return bill.get_invoices(client_id=client_id, customer_id=customer_id, status=status)
+
+@app.post("/api/billing/invoices")
+def billing_invoice_create(body: dict, user=Depends(_require_admin)):
+    try:
+        invoice = bill.create_invoice(
+            client_id=body.get("client_id"),
+            customer_id=body.get("customer_id"),
+            order_id=body.get("order_id"),
+            subscription_id=body.get("subscription_id"),
+            items=body.get("items") or [],
+            due_date=body.get("due_date"),
+            issue_date=body.get("issue_date"),
+            notes=body.get("notes"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not invoice:
+        raise HTTPException(status_code=500, detail="Failed to create invoice")
+    return invoice
+
+@app.get("/api/billing/invoices/{invoice_id}")
+def billing_invoice_get(invoice_id: str, user=Depends(_require_admin)):
+    invoice = bill.get_invoice(invoice_id)
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    return invoice
+
+@app.patch("/api/billing/invoices/{invoice_id}")
+def billing_invoice_update(invoice_id: str, body: dict, user=Depends(_require_admin)):
+    return bill.update_invoice(invoice_id, **body)
+
+@app.delete("/api/billing/invoices/{invoice_id}")
+def billing_invoice_delete(invoice_id: str, user=Depends(_require_admin)):
+    try:
+        bill.delete_invoice(invoice_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True}
+
+@app.post("/api/billing/invoices/{invoice_id}/mark-sent")
+def billing_invoice_mark_sent(invoice_id: str, user=Depends(_require_admin)):
+    return bill.mark_invoice_sent(invoice_id)
+
+# Sync `def`, not `async def` — Playwright's sync API used inside
+# generate_invoice_pdf() would block the event loop; FastAPI automatically runs
+# sync routes in its threadpool instead.
+@app.get("/api/billing/invoices/{invoice_id}/pdf")
+def billing_invoice_pdf(invoice_id: str, user=Depends(_require_admin)):
+    try:
+        pdf_bytes = bill.generate_invoice_pdf(invoice_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    invoice = bill.get_invoice(invoice_id)
+    filename = f"{invoice['invoice_number'].replace('/', '-')}.pdf" if invoice else "invoice.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 # ── Wire Lumy's WhatsApp orchestrator to the real backend agents ───────────────
 # Read-only / contained actions run immediately; anything that touches the live
 # site (publishing) requires a "haan"/"yes" confirmation reply first.
