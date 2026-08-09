@@ -3438,6 +3438,43 @@ def revenue_catalogue(user=Depends(_require_admin)):
     }
 
 
+# ── Billing & Accounts OS ───────────────────────────────────────────────────────
+# Client project invoicing + product/subscription billing. Company profile is
+# thin (direct db.get_settings/save_settings, same shape as /api/site-settings)
+# since it's just a settings blob; billing.py (added in a later phase) owns the
+# actual clients/orders/invoices/payments logic.
+
+_BILLING_PROFILE_DEFAULTS = {
+    "legal_name": "",
+    "address": "",
+    "state": "",
+    "gstin": "",
+    "pan": "",
+    "bank_account_name": "",
+    "bank_account_number": "",
+    "bank_ifsc": "",
+    "bank_name": "",
+    "upi_id": "",
+    "invoice_number_prefix": "INV",
+    "fy_invoice_counters": {},
+}
+
+@app.get("/api/billing/company-profile")
+def billing_company_profile_get(_admin: dict = Depends(_require_admin)):
+    """Admin-only — unlike /api/site-settings, this carries GSTIN/bank data and
+    must never be reachable by an anonymous visitor."""
+    stored = db.get_settings("billing_company_profile")
+    return {**_BILLING_PROFILE_DEFAULTS, **stored}
+
+@app.post("/api/billing/company-profile")
+def billing_company_profile_save(body: dict, _admin: dict = Depends(_require_admin)):
+    updates = {k: v for k, v in body.items() if k in _BILLING_PROFILE_DEFAULTS}
+    existing = db.get_settings("billing_company_profile")
+    merged = {**existing, **updates}
+    db.save_settings(merged, "billing_company_profile")
+    return {**_BILLING_PROFILE_DEFAULTS, **merged}
+
+
 # ── Wire Lumy's WhatsApp orchestrator to the real backend agents ───────────────
 # Read-only / contained actions run immediately; anything that touches the live
 # site (publishing) requires a "haan"/"yes" confirmation reply first.
