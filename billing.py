@@ -8,6 +8,7 @@ deliberately two separate tables/concepts, not one shared "account" — an
 invoice bills exactly one or the other (see billing_invoices' CHECK constraint).
 """
 import base64
+import io
 import os
 import shutil
 from datetime import datetime, timezone, date
@@ -550,12 +551,42 @@ def _find_system_chromium() -> str | None:
     return None
 
 
+def _upi_payment_qr_svg(upi_id: str, payee_name: str, amount: float, note: str) -> str:
+    """A real scannable UPI deep-link QR (upi://pay?pa=...), not just a QR of
+    the ID as text — encodes the exact balance due and invoice number as the
+    transaction note, so scanning it pre-fills the right amount instead of
+    the payer typing it in by hand. Renders as inline SVG (not PNG) so this
+    only needs the pure-Python `qrcode` package — no Pillow dependency — and
+    stays crisp at any size in the PDF."""
+    if not upi_id:
+        return ""
+    try:
+        import qrcode
+        import qrcode.image.svg
+        params = "&".join([
+            f"pa={quote(upi_id)}",
+            f"pn={quote(payee_name or 'Lumynor Systems')}",
+            f"am={amount:.2f}",
+            "cu=INR",
+            f"tn={quote(note or '')}",
+        ])
+        img = qrcode.make(f"upi://pay?{params}", image_factory=qrcode.image.svg.SvgPathImage, box_size=10)
+        buf = io.BytesIO()
+        img.save(buf)
+        return buf.getvalue().decode("utf-8")
+    except Exception as e:
+        print(f"[billing] UPI QR generation failed: {e}")
+        return ""
+
+
 def build_invoice_html(invoice: dict, company_profile: dict, recipient: dict) -> str:
     """Branded to match the actual site (lumynor-website/tailwind.config.js):
     accent #7c3aed / secondary #00f0ff brand gradient, Space Grotesk for display
-    text, DM Sans for body — same fonts and colors a visitor sees on the site,
-    just on a white page since a printed/emailed legal document needs to stay
-    printable and readable in any mail client, not a dark UI surface."""
+    text, DM Sans for body — same fonts and colors a visitor sees on the site.
+    The header is a dark navy band (the site's actual --background token) so
+    the logo's gradient wordmark pops the way it does on the real site's dark
+    navbar; everything below stays on white since a printed/emailed legal
+    document needs to stay printable and readable in any mail client."""
     items = invoice.get("items", [])
     is_interstate = float(invoice.get("igst_amount") or 0) > 0
     is_paid = invoice.get("status") == "paid"
@@ -584,16 +615,34 @@ def build_invoice_html(invoice: dict, company_profile: dict, recipient: dict) ->
     )
 
     bank = ""
-    if company_profile.get("bank_account_number"):
+    if company_profile.get("bank_account_number") or company_profile.get("upi_id"):
         upi = f'<div class="totrow"><span>UPI</span><span>{company_profile.get("upi_id")}</span></div>' if company_profile.get("upi_id") else ""
+
+        # No QR on an already-settled invoice (contradicts the PAID IN FULL
+        # stamp) or when there's nothing left to collect.
+        qr_svg = ""
+        if not is_paid and balance_due > 0 and company_profile.get("upi_id"):
+            qr_svg = _upi_payment_qr_svg(
+                company_profile.get("upi_id"),
+                company_profile.get("legal_name") or "Lumynor Systems",
+                balance_due,
+                (invoice.get("invoice_number") or "").replace("/", "-"),
+            )
+        qr_block = f'<div class="payment-qr">{qr_svg}<div class="qr-caption">Scan to Pay via UPI</div></div>' if qr_svg else ""
+
         bank = f"""
-          <div class="panel">
+          <div class="panel panel-payment">
             <div class="panel-label">Payment Details</div>
-            <div class="totrow"><span>Account Name</span><span>{company_profile.get('bank_account_name', '')}</span></div>
-            <div class="totrow"><span>Bank</span><span>{company_profile.get('bank_name', '')}</span></div>
-            <div class="totrow"><span>Account No.</span><span class="mono">{company_profile.get('bank_account_number', '')}</span></div>
-            <div class="totrow"><span>IFSC</span><span class="mono">{company_profile.get('bank_ifsc', '')}</span></div>
-            {upi}
+            <div class="payment-row">
+              <div class="payment-text">
+                <div class="totrow"><span>Account Name</span><span>{company_profile.get('bank_account_name', '')}</span></div>
+                <div class="totrow"><span>Bank</span><span>{company_profile.get('bank_name', '')}</span></div>
+                <div class="totrow"><span>Account No.</span><span class="mono">{company_profile.get('bank_account_number', '')}</span></div>
+                <div class="totrow"><span>IFSC</span><span class="mono">{company_profile.get('bank_ifsc', '')}</span></div>
+                {upi}
+              </div>
+              {qr_block}
+            </div>
           </div>
         """
 
@@ -606,33 +655,45 @@ def build_invoice_html(invoice: dict, company_profile: dict, recipient: dict) ->
     logo = _logo_data_uri()
     logo_html = f'<img class="logo" src="{logo}" alt="Lumynor Systems" />' if logo else '<div class="logo-fallback">LUMYNOR</div>'
 
+    # Set once in the Company Billing Profile (Settings), applies to every
+    # invoice — payment terms/late-fee policy/jurisdiction are standing
+    # company policy, not something to retype per invoice. Renders only if
+    # the founder has actually filled it in; no boilerplate is assumed on
+    # their behalf.
+    terms_html = ""
+    if company_profile.get("terms_and_conditions"):
+        terms_text = company_profile["terms_and_conditions"].replace("\n", "<br/>")
+        terms_html = f'<div class="panel panel-wide"><div class="panel-label">Terms &amp; Conditions</div><p class="muted">{terms_text}</p></div>'
+
     notes_html = f'<div class="panel"><div class="panel-label">Notes</div><p class="muted">{invoice.get("notes", "")}</p></div>' if invoice.get("notes") else ""
 
     return f"""<!doctype html><html><head><meta charset="utf-8"/>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
-  :root {{ --accent: #7c3aed; --secondary: #00f0ff; --ink: #16181d; --muted: #6b7280; --line: #e6e4ee; }}
+  :root {{ --accent: #7c3aed; --secondary: #00f0ff; --ink: #16181d; --muted: #6b7280; --line: #e6e4ee; --band: #080c14; }}
   * {{ box-sizing: border-box; }}
-  body {{ font-family: 'DM Sans', -apple-system, Helvetica, Arial, sans-serif; color: var(--ink); margin: 0; font-size: 12.5px; }}
+  body {{ font-family: 'DM Sans', -apple-system, Helvetica, Arial, sans-serif; color: var(--ink); margin: 0; font-size: 12.5px; background: #fff; }}
   .accent-bar {{ height: 6px; background: linear-gradient(90deg, var(--secondary), var(--accent)); }}
-  .page {{ padding: 36px 44px 44px; }}
+  .page {{ padding: 30px 44px 44px; }}
   h1, .display {{ font-family: 'Space Grotesk', 'DM Sans', sans-serif; }}
   .muted {{ color: var(--muted); }}
   .mono {{ font-family: 'SF Mono', Menlo, monospace; }}
   .strong {{ font-weight: 700; }}
 
-  .header {{ display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 30px; }}
+  /* Dark letterhead band — same navy as the site's own background token, so
+     the logo's violet->cyan gradient wordmark pops the way it does on the
+     real dark navbar instead of sitting flat on white. */
+  .header-band {{ background: var(--band); padding: 26px 44px 22px; }}
+  .header {{ display: flex; justify-content: space-between; align-items: flex-start; }}
   .logo {{ height: 34px; }}
   .logo-fallback {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 22px;
     background: linear-gradient(90deg, var(--accent), var(--secondary)); -webkit-background-clip: text; color: transparent; }}
-  .company-meta {{ margin-top: 10px; font-size: 11px; line-height: 1.6; color: var(--muted); }}
+  .header-band .company-meta {{ margin-top: 10px; font-size: 11px; line-height: 1.6; color: rgba(255,255,255,0.55); }}
   .invoice-meta {{ text-align: right; }}
-  .invoice-kicker {{ text-transform: uppercase; letter-spacing: 0.14em; font-size: 10px; font-weight: 700; color: var(--accent); }}
-  .invoice-number {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 22px; margin: 4px 0 8px; }}
-  .invoice-dates {{ font-size: 11px; line-height: 1.6; color: var(--muted); }}
-
-  .divider {{ height: 1px; background: var(--line); margin: 0 0 24px; }}
+  .header-band .invoice-kicker {{ text-transform: uppercase; letter-spacing: 0.14em; font-size: 10px; font-weight: 700; color: var(--secondary); }}
+  .header-band .invoice-number {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 22px; margin: 4px 0 8px; color: #fff; }}
+  .header-band .invoice-dates {{ font-size: 11px; line-height: 1.6; color: rgba(255,255,255,0.5); }}
 
   .bill-to-label {{ text-transform: uppercase; letter-spacing: 0.1em; font-size: 9.5px; font-weight: 700; color: var(--accent); margin-bottom: 6px; }}
   .bill-to-name {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; margin-bottom: 3px; }}
@@ -653,14 +714,22 @@ def build_invoice_html(invoice: dict, company_profile: dict, recipient: dict) ->
   .totrow.balance.paid {{ color: #059669; background: rgba(5,150,105,0.08); }}
 
   .panel {{ margin-top: 22px; padding: 14px 16px; background: #fafafa; border: 1px solid var(--line); max-width: 320px; }}
+  .panel-wide {{ max-width: 100%; }}
+  .panel-payment {{ max-width: 460px; }}
   .panel-label {{ text-transform: uppercase; letter-spacing: 0.1em; font-size: 9px; font-weight: 700; color: var(--accent); margin-bottom: 8px; }}
   .panel .totrow {{ font-size: 11px; }}
+  .panel p {{ margin: 0; font-size: 11px; line-height: 1.6; }}
+  .payment-row {{ display: flex; justify-content: space-between; align-items: center; gap: 18px; }}
+  .payment-text {{ flex: 1; min-width: 0; }}
+  .payment-qr {{ text-align: center; flex-shrink: 0; }}
+  .payment-qr svg {{ width: 92px; height: 92px; display: block; }}
+  .qr-caption {{ font-size: 8px; color: var(--muted); margin-top: 6px; text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; }}
 
   .footer {{ margin-top: 40px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 9.5px; color: var(--muted); text-align: center; }}
 </style></head>
 <body>
   <div class="accent-bar"></div>
-  <div class="page">
+  <div class="header-band">
     <div class="header">
       <div>
         {logo_html}
@@ -680,9 +749,8 @@ def build_invoice_html(invoice: dict, company_profile: dict, recipient: dict) ->
         </div>
       </div>
     </div>
-
-    <div class="divider"></div>
-
+  </div>
+  <div class="page">
     <div>
       <div class="bill-to-label">Billed To</div>
       <div class="bill-to-name">{party_display_name(recipient)}</div>
@@ -713,6 +781,7 @@ def build_invoice_html(invoice: dict, company_profile: dict, recipient: dict) ->
     </div>
 
     {bank}
+    {terms_html}
     {notes_html}
 
     <div class="footer">{company_profile.get('legal_name') or 'Lumynor Systems'} · Generated via the Billing &amp; Accounts OS</div>

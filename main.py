@@ -3479,6 +3479,7 @@ _BILLING_PROFILE_DEFAULTS = {
     "upi_id": "",
     "invoice_number_prefix": "INV",
     "fy_invoice_counters": {},
+    "terms_and_conditions": "",
 }
 
 @app.get("/api/billing/company-profile")

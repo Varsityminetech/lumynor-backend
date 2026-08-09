@@ -20,3 +20,4 @@ beautifulsoup4
 cryptography
 python-multipart
 twilio
+qrcode
