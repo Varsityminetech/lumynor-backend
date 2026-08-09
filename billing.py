@@ -715,7 +715,7 @@ def build_invoice_html(invoice: dict, company_profile: dict, recipient: dict) ->
     {bank}
     {notes_html}
 
-    <div class="footer">{company_profile.get('legal_name', 'Lumynor Systems')} · Generated via the Billing &amp; Accounts OS</div>
+    <div class="footer">{company_profile.get('legal_name') or 'Lumynor Systems'} · Generated via the Billing &amp; Accounts OS</div>
   </div>
 </body></html>"""
 
