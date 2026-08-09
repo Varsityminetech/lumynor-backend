@@ -194,6 +194,96 @@ def delete_order(order_id: str) -> bool:
     return True
 
 
+# ── Plans (product/subscription catalog — reference data only in v1, no
+#    payment gateway is wired) ───────────────────────────────────────────────
+
+_PLAN_FIELDS = {"name", "description", "price", "currency", "billing_interval", "is_active"}
+
+
+def get_plans(is_active: bool = None) -> list:
+    sb = _sb()
+    if not sb:
+        return []
+    q = sb.table("billing_plans").select("*").order("name")
+    if is_active is not None:
+        q = q.eq("is_active", is_active)
+    return q.execute().data or []
+
+
+def create_plan(data: dict) -> dict:
+    sb = _sb()
+    if not sb:
+        return {}
+    payload = {k: v for k, v in data.items() if k in _PLAN_FIELDS}
+    payload.setdefault("currency", "INR")
+    payload.setdefault("billing_interval", "monthly")
+    res = sb.table("billing_plans").insert(payload).execute()
+    return (res.data or [{}])[0]
+
+
+def update_plan(plan_id: str, **kwargs) -> dict:
+    sb = _sb()
+    if not sb:
+        return {}
+    payload = {k: v for k, v in kwargs.items() if k in _PLAN_FIELDS}
+    res = sb.table("billing_plans").update(payload).eq("id", plan_id).execute()
+    return (res.data or [{}])[0]
+
+
+# ── Subscriptions ─────────────────────────────────────────────────────────────
+# Mandate fields (mandate_status etc.) are stored as provided but nothing here
+# ever calls a payment gateway — this is schema + UI scaffolding for the 10+
+# year auto-pay mandates, with the actual Razorpay UPI Autopay/e-mandate
+# wiring deferred to a Phase 2 once merchant KYC is complete.
+
+_SUBSCRIPTION_FIELDS = {
+    "customer_id", "plan_id", "status", "started_at", "current_period_end", "notes",
+    "mandate_status", "mandate_provider", "mandate_id", "mandate_max_amount",
+    "mandate_start_date", "mandate_end_date", "mandate_frequency", "next_charge_date",
+}
+
+
+def get_subscriptions(customer_id: str = None) -> list:
+    sb = _sb()
+    if not sb:
+        return []
+    q = sb.table("billing_subscriptions").select("*").order("created_at", desc=True)
+    if customer_id:
+        q = q.eq("customer_id", customer_id)
+    return q.execute().data or []
+
+
+def get_subscription(subscription_id: str) -> dict | None:
+    sb = _sb()
+    if not sb:
+        return None
+    res = sb.table("billing_subscriptions").select("*").eq("id", subscription_id).limit(1).execute()
+    return res.data[0] if res.data else None
+
+
+def create_subscription(data: dict) -> dict:
+    sb = _sb()
+    if not sb:
+        return {}
+    payload = {k: v for k, v in data.items() if k in _SUBSCRIPTION_FIELDS}
+    payload.setdefault("status", "active")
+    payload.setdefault("mandate_status", "none")
+    # Phase 2: wire to Razorpay Subscriptions / UPI Autopay e-mandate API here —
+    # for now mandate_* fields are just stored as given, no gateway call is made.
+    res = sb.table("billing_subscriptions").insert(payload).execute()
+    return (res.data or [{}])[0]
+
+
+def update_subscription(subscription_id: str, **kwargs) -> dict:
+    sb = _sb()
+    if not sb:
+        return {}
+    payload = {k: v for k, v in kwargs.items() if k in _SUBSCRIPTION_FIELDS}
+    payload["updated_at"] = _now()
+    res = sb.table("billing_subscriptions").update(payload).eq("id", subscription_id).execute()
+    return (res.data or [{}])[0]
+
+
 # ── GST calculation ──────────────────────────────────────────────────────────
 
 def compute_gst_split(company_state: str, recipient_state: str,

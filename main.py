@@ -3715,6 +3715,40 @@ def billing_alert_acknowledge(alert_id: str, user=Depends(_require_admin)):
     return {"ok": True}
 
 
+# Plans ── product/subscription catalog (reference data only, no gateway wired)
+@app.get("/api/billing/plans")
+def billing_plans_list(user=Depends(_require_admin)):
+    return bill.get_plans()
+
+@app.post("/api/billing/plans")
+def billing_plan_create(body: dict, user=Depends(_require_admin)):
+    plan = bill.create_plan(body)
+    if not plan:
+        raise HTTPException(status_code=500, detail="Failed to create plan")
+    return plan
+
+@app.patch("/api/billing/plans/{plan_id}")
+def billing_plan_update(plan_id: str, body: dict, user=Depends(_require_admin)):
+    return bill.update_plan(plan_id, **body)
+
+
+# Subscriptions ── mandate_* fields are Phase-2 scaffolding, stored inert here
+@app.get("/api/billing/subscriptions")
+def billing_subscriptions_list(customer_id: str = None, user=Depends(_require_admin)):
+    return bill.get_subscriptions(customer_id=customer_id)
+
+@app.post("/api/billing/subscriptions")
+def billing_subscription_create(body: dict, user=Depends(_require_admin)):
+    sub = bill.create_subscription(body)
+    if not sub:
+        raise HTTPException(status_code=500, detail="Failed to create subscription")
+    return sub
+
+@app.patch("/api/billing/subscriptions/{subscription_id}")
+def billing_subscription_update(subscription_id: str, body: dict, user=Depends(_require_admin)):
+    return bill.update_subscription(subscription_id, **body)
+
+
 # ── Wire Lumy's WhatsApp orchestrator to the real backend agents ───────────────
 # Read-only / contained actions run immediately; anything that touches the live
 # site (publishing) requires a "haan"/"yes" confirmation reply first.
