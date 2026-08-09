@@ -3441,8 +3441,9 @@ def revenue_catalogue(user=Depends(_require_admin)):
 # ── Billing & Accounts OS ───────────────────────────────────────────────────────
 # Client project invoicing + product/subscription billing. Company profile is
 # thin (direct db.get_settings/save_settings, same shape as /api/site-settings)
-# since it's just a settings blob; billing.py (added in a later phase) owns the
-# actual clients/orders/invoices/payments logic.
+# since it's just a settings blob; billing.py owns the actual
+# clients/customers/orders/invoices/payments logic.
+import billing as bill
 
 _BILLING_PROFILE_DEFAULTS = {
     "legal_name": "",
@@ -3473,6 +3474,92 @@ def billing_company_profile_save(body: dict, _admin: dict = Depends(_require_adm
     merged = {**existing, **updates}
     db.save_settings(merged, "billing_company_profile")
     return {**_BILLING_PROFILE_DEFAULTS, **merged}
+
+# Clients ── project/service engagement accounts
+@app.get("/api/billing/clients")
+def billing_clients_list(status: str = None, user=Depends(_require_admin)):
+    return bill.get_clients(status=status)
+
+@app.post("/api/billing/clients")
+def billing_client_create(body: dict, user=Depends(_require_admin)):
+    client = bill.create_client(body)
+    if not client:
+        raise HTTPException(status_code=500, detail="Failed to create client")
+    return client
+
+@app.get("/api/billing/clients/{client_id}")
+def billing_client_get(client_id: str, user=Depends(_require_admin)):
+    client = bill.get_client(client_id)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return client
+
+@app.patch("/api/billing/clients/{client_id}")
+def billing_client_update(client_id: str, body: dict, user=Depends(_require_admin)):
+    return bill.update_client(client_id, **body)
+
+@app.delete("/api/billing/clients/{client_id}")
+def billing_client_delete(client_id: str, user=Depends(_require_admin)):
+    bill.delete_client(client_id)
+    return {"ok": True}
+
+
+# Customers ── product/subscription billing accounts
+@app.get("/api/billing/customers")
+def billing_customers_list(status: str = None, user=Depends(_require_admin)):
+    return bill.get_customers(status=status)
+
+@app.post("/api/billing/customers")
+def billing_customer_create(body: dict, user=Depends(_require_admin)):
+    customer = bill.create_customer(body)
+    if not customer:
+        raise HTTPException(status_code=500, detail="Failed to create customer")
+    return customer
+
+@app.get("/api/billing/customers/{customer_id}")
+def billing_customer_get(customer_id: str, user=Depends(_require_admin)):
+    customer = bill.get_customer(customer_id)
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    return customer
+
+@app.patch("/api/billing/customers/{customer_id}")
+def billing_customer_update(customer_id: str, body: dict, user=Depends(_require_admin)):
+    return bill.update_customer(customer_id, **body)
+
+@app.delete("/api/billing/customers/{customer_id}")
+def billing_customer_delete(customer_id: str, user=Depends(_require_admin)):
+    bill.delete_customer(customer_id)
+    return {"ok": True}
+
+
+# Orders ── client engagements, delivery/order status tracking
+@app.get("/api/billing/orders")
+def billing_orders_list(client_id: str = None, status: str = None, user=Depends(_require_admin)):
+    return bill.get_orders(client_id=client_id, status=status)
+
+@app.post("/api/billing/orders")
+def billing_order_create(body: dict, user=Depends(_require_admin)):
+    order = bill.create_order(body)
+    if not order:
+        raise HTTPException(status_code=500, detail="Failed to create order")
+    return order
+
+@app.get("/api/billing/orders/{order_id}")
+def billing_order_get(order_id: str, user=Depends(_require_admin)):
+    order = bill.get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return order
+
+@app.patch("/api/billing/orders/{order_id}")
+def billing_order_update(order_id: str, body: dict, user=Depends(_require_admin)):
+    return bill.update_order(order_id, **body)
+
+@app.delete("/api/billing/orders/{order_id}")
+def billing_order_delete(order_id: str, user=Depends(_require_admin)):
+    bill.delete_order(order_id)
+    return {"ok": True}
 
 
 # ── Wire Lumy's WhatsApp orchestrator to the real backend agents ───────────────
