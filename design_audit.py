@@ -298,9 +298,25 @@ _JS_CONTRAST = r"""
     return b && b.a > 0.1 ? b : { r: 255, g: 255, b: 255, a: 1 };
   };
 
+  // Computed `opacity` does NOT inherit: text inside an `opacity: 0` container
+  // (a carousel's hidden slide, content waiting on a scroll animation) reports
+  // opacity 1 on itself. Confirmed live on linear.app: hidden testimonial
+  // slides were measured as visible text and reported as CRITICAL 1:1
+  // "invisible text" failures. Walk ancestors and multiply.
+  const effOpacity = el => {
+    let o = 1, n = el;
+    while (n && n !== document.documentElement) {
+      o *= parseFloat(getComputedStyle(n).opacity);
+      if (o < 0.1) return o;
+      n = n.parentElement;
+    }
+    return o;
+  };
+
   const fails = [];
   let checked = 0;
   let unmeasurable = 0;        // gradient/clipped text — real, but not measurable from `color`
+  const vw = window.innerWidth;
   const els = document.querySelectorAll('p,span,a,li,h1,h2,h3,h4,h5,h6,button,label,td,div');
   for (const el of els) {
     if (el.children.length > 0) continue;                 // leaf text only
@@ -311,9 +327,14 @@ _JS_CONTRAST = r"""
     const txt = (el.innerText || '').trim();
     if (txt.length < 3) continue;
     const st = getComputedStyle(el);
-    if (st.visibility === 'hidden' || st.display === 'none' || parseFloat(st.opacity) < 0.1) continue;
+    if (st.visibility === 'hidden' || st.display === 'none' || effOpacity(el) < 0.1) continue;
     const rect = el.getBoundingClientRect();
     if (rect.width < 2 || rect.height < 2) continue;
+    // Horizontally outside the viewport = a carousel/marquee slide parked
+    // off-screen. It has real size, but no visitor can see it in this state —
+    // measuring it "as displayed" is meaningless. (Vertically off-screen is
+    // just normal page flow below the fold, so only the X axis matters here.)
+    if (rect.right <= 0 || rect.left >= vw) continue;
 
     const fgRaw = parse(st.color);
     if (!fgRaw) continue;
@@ -346,6 +367,19 @@ _JS_CONTRAST = r"""
 
     const L1 = lum(fg.r, fg.g, fg.b), L2 = lum(bg.r, bg.g, bg.b);
     const ratio = (Math.max(L1, L2) + 0.05) / (Math.min(L1, L2) + 0.05);
+
+    // A ~1:1 ratio means the text is literally the same colour as the background
+    // we RESOLVED — which no real site ships on purpose. In practice it means our
+    // ancestor-walk failed to find the actual painted backdrop: white text over a
+    // dark overlay painted by an absolutely-positioned SIBLING (hero images,
+    // testimonial cards), a canvas, or a background-image — none of which an
+    // ancestor walk can see. Same honesty rule as gradient text above: when the
+    // measurement itself failed, count it unmeasurable and let the vision pass
+    // judge — don't fabricate a critical "invisible text" finding.
+    if (ratio < 1.15) {
+      unmeasurable++;
+      continue;
+    }
 
     const size = parseFloat(st.fontSize);
     const bold = (parseInt(st.fontWeight) || 400) >= 700;
