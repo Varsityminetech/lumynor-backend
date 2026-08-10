@@ -377,6 +377,19 @@ def next_invoice_number() -> str:
     return f"{prefix}/{fy}/{counters[fy]:04d}"
 
 
+def next_credit_note_number() -> str:
+    """Own numbering sequence from invoices (CN/2026-27/0001), own counter key
+    in the same settings blob — same v1 no-lock caveat as next_invoice_number."""
+    profile = get_settings("billing_company_profile")
+    prefix = profile.get("credit_note_number_prefix") or "CN"
+    fy = _current_financial_year()
+    counters = dict(profile.get("cn_fy_counters") or {})
+    counters[fy] = int(counters.get(fy, 0)) + 1
+    profile["cn_fy_counters"] = counters
+    save_settings(profile, "billing_company_profile")
+    return f"{prefix}/{fy}/{counters[fy]:04d}"
+
+
 def get_invoices(client_id: str = None, customer_id: str = None, status: str = None) -> list:
     sb = _sb()
     if not sb:
@@ -403,8 +416,11 @@ def get_invoice(invoice_id: str) -> dict | None:
         .eq("invoice_id", invoice_id).order("sort_order").execute()
     payments = sb.table("billing_payments").select("*") \
         .eq("invoice_id", invoice_id).order("paid_at").execute()
+    credit_notes = sb.table("billing_credit_notes").select("*") \
+        .eq("invoice_id", invoice_id).order("created_at").execute()
     invoice["items"] = items.data or []
     invoice["payments"] = payments.data or []
+    invoice["credit_notes"] = credit_notes.data or []
     return invoice
 
 
@@ -579,6 +595,96 @@ def _upi_payment_qr_svg(upi_id: str, payee_name: str, amount: float, note: str) 
         return ""
 
 
+def _pdf_style_block() -> str:
+    """Shared CSS for every generated PDF (invoices, credit notes) — one
+    branded look (lumynor-website/tailwind.config.js's accent #7c3aed /
+    secondary #00f0ff / dark --background #080c14), defined once so a second
+    document type doesn't mean re-pasting ~90 lines of CSS."""
+    return """
+  :root { --accent: #7c3aed; --secondary: #00f0ff; --ink: #16181d; --muted: #6b7280; --line: #e6e4ee; --band: #080c14; }
+  * { box-sizing: border-box; }
+  body { font-family: 'DM Sans', -apple-system, Helvetica, Arial, sans-serif; color: var(--ink); margin: 0; font-size: 12.5px; background: #fff; }
+  .accent-bar { height: 6px; background: linear-gradient(90deg, var(--secondary), var(--accent)); }
+  .page { padding: 30px 44px 44px; }
+  h1, .display { font-family: 'Space Grotesk', 'DM Sans', sans-serif; }
+  .muted { color: var(--muted); }
+  .mono { font-family: 'SF Mono', Menlo, monospace; }
+  .strong { font-weight: 700; }
+
+  /* Dark letterhead band — same navy as the site's own background token, so
+     the logo's violet->cyan gradient wordmark pops the way it does on the
+     real dark navbar instead of sitting flat on white. */
+  .header-band { background: var(--band); padding: 26px 44px 22px; }
+  .header { display: flex; justify-content: space-between; align-items: flex-start; }
+  .logo { height: 34px; }
+  .logo-fallback { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 22px;
+    background: linear-gradient(90deg, var(--accent), var(--secondary)); -webkit-background-clip: text; color: transparent; }
+  .header-band .company-meta { margin-top: 10px; font-size: 11px; line-height: 1.6; color: rgba(255,255,255,0.55); }
+  .invoice-meta { text-align: right; }
+  .header-band .invoice-kicker { text-transform: uppercase; letter-spacing: 0.14em; font-size: 10px; font-weight: 700; color: var(--secondary); }
+  .header-band .invoice-number { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 22px; margin: 4px 0 8px; color: #fff; }
+  .header-band .invoice-dates { font-size: 11px; line-height: 1.6; color: rgba(255,255,255,0.5); }
+
+  .bill-to-label { text-transform: uppercase; letter-spacing: 0.1em; font-size: 9.5px; font-weight: 700; color: var(--accent); margin-bottom: 6px; }
+  .bill-to-name { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; margin-bottom: 3px; }
+  .bill-to-detail { font-size: 11.5px; color: var(--muted); line-height: 1.6; }
+
+  table { width: 100%; border-collapse: collapse; margin: 26px 0 20px; }
+  thead th { text-align: left; text-transform: uppercase; letter-spacing: 0.06em; font-size: 8.5px; font-weight: 700;
+    color: var(--accent); background: rgba(124,58,237,0.06); padding: 9px 10px; border-bottom: 1.5px solid var(--accent); }
+  th.num, td.num { text-align: right; }
+  tbody td { padding: 9px 10px; border-bottom: 1px solid var(--line); font-size: 11.5px; vertical-align: top; }
+  tbody tr:last-child td { border-bottom: 1.5px solid var(--ink); }
+
+  .totals-row { display: flex; justify-content: flex-end; }
+  .totals { width: 280px; }
+  .totrow { display: flex; justify-content: space-between; padding: 5px 0; font-size: 11.5px; }
+  .totrow.grand { font-weight: 700; font-size: 14px; border-top: 1.5px solid var(--ink); padding-top: 10px; margin-top: 6px; }
+  .totrow.balance { font-weight: 700; font-size: 13px; color: #dc2626; background: rgba(220,38,38,0.06); padding: 8px 10px; margin-top: 8px; }
+  .totrow.balance.paid { color: #059669; background: rgba(5,150,105,0.08); }
+
+  .panel { margin-top: 22px; padding: 14px 16px; background: #fafafa; border: 1px solid var(--line); max-width: 320px; }
+  .panel-wide { max-width: 100%; }
+  .panel-payment { max-width: 460px; }
+  .panel-label { text-transform: uppercase; letter-spacing: 0.1em; font-size: 9px; font-weight: 700; color: var(--accent); margin-bottom: 8px; }
+  .panel .totrow { font-size: 11px; }
+  .panel p { margin: 0; font-size: 11px; line-height: 1.6; }
+  .payment-row { display: flex; justify-content: space-between; align-items: center; gap: 18px; }
+  .payment-text { flex: 1; min-width: 0; }
+  .payment-qr { text-align: center; flex-shrink: 0; }
+  .payment-qr svg { width: 92px; height: 92px; display: block; }
+  .qr-caption { font-size: 8px; color: var(--muted); margin-top: 6px; text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; }
+
+  .footer { margin-top: 40px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 9.5px; color: var(--muted); text-align: center; }
+"""
+
+
+def _pdf_header_html(kicker: str, doc_number: str, dates_html: str, company_profile: dict, logo_html: str) -> str:
+    return f"""
+  <div class="header-band">
+    <div class="header">
+      <div>
+        {logo_html}
+        <div class="company-meta">
+          {company_profile.get('legal_name', '')}<br/>
+          {company_profile.get('address', '')}<br/>
+          {company_profile.get('state', '')}
+          {('&nbsp;·&nbsp;GSTIN ' + company_profile.get('gstin', '')) if company_profile.get('gstin') else ''}
+        </div>
+      </div>
+      <div class="invoice-meta">
+        <div class="invoice-kicker">{kicker}</div>
+        <div class="invoice-number mono">{doc_number}</div>
+        <div class="invoice-dates">{dates_html}</div>
+      </div>
+    </div>
+  </div>"""
+
+
+def _pdf_footer_html(company_profile: dict) -> str:
+    return f'<div class="footer">{company_profile.get("legal_name") or "Lumynor Systems"} · Generated via the Billing &amp; Accounts OS</div>'
+
+
 def build_invoice_html(invoice: dict, company_profile: dict, recipient: dict) -> str:
     """Branded to match the actual site (lumynor-website/tailwind.config.js):
     accent #7c3aed / secondary #00f0ff brand gradient, Space Grotesk for display
@@ -590,7 +696,8 @@ def build_invoice_html(invoice: dict, company_profile: dict, recipient: dict) ->
     items = invoice.get("items", [])
     is_interstate = float(invoice.get("igst_amount") or 0) > 0
     is_paid = invoice.get("status") == "paid"
-    balance_due = float(invoice.get("total") or 0) - float(invoice.get("amount_paid") or 0)
+    amount_credited = float(invoice.get("amount_credited") or 0)
+    balance_due = float(invoice.get("total") or 0) - float(invoice.get("amount_paid") or 0) - amount_credited
 
     rows_html = "".join(f"""
         <tr>
@@ -651,6 +758,10 @@ def build_invoice_html(invoice: dict, company_profile: dict, recipient: dict) ->
         if is_paid else
         f'<div class="totrow balance"><span>Balance Due</span><span>₹{_fmt_amount(balance_due)}</span></div>'
     )
+    credited_row = (
+        f'<div class="totrow"><span class="muted">Amount Credited</span><span>−₹{_fmt_amount(amount_credited)}</span></div>'
+        if amount_credited > 0 else ""
+    )
 
     logo = _logo_data_uri()
     logo_html = f'<img class="logo" src="{logo}" alt="Lumynor Systems" />' if logo else '<div class="logo-fallback">LUMYNOR</div>'
@@ -667,89 +778,26 @@ def build_invoice_html(invoice: dict, company_profile: dict, recipient: dict) ->
 
     notes_html = f'<div class="panel"><div class="panel-label">Notes</div><p class="muted">{invoice.get("notes", "")}</p></div>' if invoice.get("notes") else ""
 
+    credit_notes = invoice.get("credit_notes") or []
+    credit_notes_html = ""
+    if credit_notes:
+        cn_rows = "".join(
+            f'<div class="totrow"><span>{cn.get("credit_note_number", "")} — {cn.get("reason", "")}</span>'
+            f'<span>−₹{_fmt_amount(cn.get("total"))}</span></div>'
+            for cn in credit_notes
+        )
+        credit_notes_html = f'<div class="panel panel-wide"><div class="panel-label">Credit Notes Applied</div>{cn_rows}</div>'
+
+    dates_html = f"Issue Date: {invoice.get('issue_date', '')}<br/>Due Date: {invoice.get('due_date', '')}"
+    header_html = _pdf_header_html("Tax Invoice", invoice.get('invoice_number', ''), dates_html, company_profile, logo_html)
+
     return f"""<!doctype html><html><head><meta charset="utf-8"/>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
-<style>
-  :root {{ --accent: #7c3aed; --secondary: #00f0ff; --ink: #16181d; --muted: #6b7280; --line: #e6e4ee; --band: #080c14; }}
-  * {{ box-sizing: border-box; }}
-  body {{ font-family: 'DM Sans', -apple-system, Helvetica, Arial, sans-serif; color: var(--ink); margin: 0; font-size: 12.5px; background: #fff; }}
-  .accent-bar {{ height: 6px; background: linear-gradient(90deg, var(--secondary), var(--accent)); }}
-  .page {{ padding: 30px 44px 44px; }}
-  h1, .display {{ font-family: 'Space Grotesk', 'DM Sans', sans-serif; }}
-  .muted {{ color: var(--muted); }}
-  .mono {{ font-family: 'SF Mono', Menlo, monospace; }}
-  .strong {{ font-weight: 700; }}
-
-  /* Dark letterhead band — same navy as the site's own background token, so
-     the logo's violet->cyan gradient wordmark pops the way it does on the
-     real dark navbar instead of sitting flat on white. */
-  .header-band {{ background: var(--band); padding: 26px 44px 22px; }}
-  .header {{ display: flex; justify-content: space-between; align-items: flex-start; }}
-  .logo {{ height: 34px; }}
-  .logo-fallback {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 22px;
-    background: linear-gradient(90deg, var(--accent), var(--secondary)); -webkit-background-clip: text; color: transparent; }}
-  .header-band .company-meta {{ margin-top: 10px; font-size: 11px; line-height: 1.6; color: rgba(255,255,255,0.55); }}
-  .invoice-meta {{ text-align: right; }}
-  .header-band .invoice-kicker {{ text-transform: uppercase; letter-spacing: 0.14em; font-size: 10px; font-weight: 700; color: var(--secondary); }}
-  .header-band .invoice-number {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 22px; margin: 4px 0 8px; color: #fff; }}
-  .header-band .invoice-dates {{ font-size: 11px; line-height: 1.6; color: rgba(255,255,255,0.5); }}
-
-  .bill-to-label {{ text-transform: uppercase; letter-spacing: 0.1em; font-size: 9.5px; font-weight: 700; color: var(--accent); margin-bottom: 6px; }}
-  .bill-to-name {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px; margin-bottom: 3px; }}
-  .bill-to-detail {{ font-size: 11.5px; color: var(--muted); line-height: 1.6; }}
-
-  table {{ width: 100%; border-collapse: collapse; margin: 26px 0 20px; }}
-  thead th {{ text-align: left; text-transform: uppercase; letter-spacing: 0.06em; font-size: 8.5px; font-weight: 700;
-    color: var(--accent); background: rgba(124,58,237,0.06); padding: 9px 10px; border-bottom: 1.5px solid var(--accent); }}
-  th.num, td.num {{ text-align: right; }}
-  tbody td {{ padding: 9px 10px; border-bottom: 1px solid var(--line); font-size: 11.5px; vertical-align: top; }}
-  tbody tr:last-child td {{ border-bottom: 1.5px solid var(--ink); }}
-
-  .totals-row {{ display: flex; justify-content: flex-end; }}
-  .totals {{ width: 280px; }}
-  .totrow {{ display: flex; justify-content: space-between; padding: 5px 0; font-size: 11.5px; }}
-  .totrow.grand {{ font-weight: 700; font-size: 14px; border-top: 1.5px solid var(--ink); padding-top: 10px; margin-top: 6px; }}
-  .totrow.balance {{ font-weight: 700; font-size: 13px; color: #dc2626; background: rgba(220,38,38,0.06); padding: 8px 10px; margin-top: 8px; }}
-  .totrow.balance.paid {{ color: #059669; background: rgba(5,150,105,0.08); }}
-
-  .panel {{ margin-top: 22px; padding: 14px 16px; background: #fafafa; border: 1px solid var(--line); max-width: 320px; }}
-  .panel-wide {{ max-width: 100%; }}
-  .panel-payment {{ max-width: 460px; }}
-  .panel-label {{ text-transform: uppercase; letter-spacing: 0.1em; font-size: 9px; font-weight: 700; color: var(--accent); margin-bottom: 8px; }}
-  .panel .totrow {{ font-size: 11px; }}
-  .panel p {{ margin: 0; font-size: 11px; line-height: 1.6; }}
-  .payment-row {{ display: flex; justify-content: space-between; align-items: center; gap: 18px; }}
-  .payment-text {{ flex: 1; min-width: 0; }}
-  .payment-qr {{ text-align: center; flex-shrink: 0; }}
-  .payment-qr svg {{ width: 92px; height: 92px; display: block; }}
-  .qr-caption {{ font-size: 8px; color: var(--muted); margin-top: 6px; text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; }}
-
-  .footer {{ margin-top: 40px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 9.5px; color: var(--muted); text-align: center; }}
-</style></head>
+<style>{_pdf_style_block()}</style></head>
 <body>
   <div class="accent-bar"></div>
-  <div class="header-band">
-    <div class="header">
-      <div>
-        {logo_html}
-        <div class="company-meta">
-          {company_profile.get('legal_name', '')}<br/>
-          {company_profile.get('address', '')}<br/>
-          {company_profile.get('state', '')}
-          {('&nbsp;·&nbsp;GSTIN ' + company_profile.get('gstin', '')) if company_profile.get('gstin') else ''}
-        </div>
-      </div>
-      <div class="invoice-meta">
-        <div class="invoice-kicker">Tax Invoice</div>
-        <div class="invoice-number mono">{invoice.get('invoice_number', '')}</div>
-        <div class="invoice-dates">
-          Issue Date: {invoice.get('issue_date', '')}<br/>
-          Due Date: {invoice.get('due_date', '')}
-        </div>
-      </div>
-    </div>
-  </div>
+  {header_html}
   <div class="page">
     <div>
       <div class="bill-to-label">Billed To</div>
@@ -776,15 +824,17 @@ def build_invoice_html(invoice: dict, company_profile: dict, recipient: dict) ->
         {tax_rows}
         <div class="totrow grand"><span>Total</span><span>₹{_fmt_amount(invoice.get('total'))}</span></div>
         <div class="totrow"><span class="muted">Amount Paid</span><span>₹{_fmt_amount(invoice.get('amount_paid'))}</span></div>
+        {credited_row}
         {balance_html}
       </div>
     </div>
 
     {bank}
     {terms_html}
+    {credit_notes_html}
     {notes_html}
 
-    <div class="footer">{company_profile.get('legal_name') or 'Lumynor Systems'} · Generated via the Billing &amp; Accounts OS</div>
+    {_pdf_footer_html(company_profile)}
   </div>
 </body></html>"""
 
@@ -797,6 +847,19 @@ def get_payments(invoice_id: str = None) -> list:
     if invoice_id:
         q = q.eq("invoice_id", invoice_id)
     return q.execute().data or []
+
+
+def _settle_invoice_status(amount_paid: float, amount_credited: float, total: float, fallback_status: str) -> str:
+    """A credit note settles an invoice the same way a payment does — from the
+    client's perspective, ₹5,000 credited and ₹5,000 paid both mean nothing
+    more is owed. Shared by record_payment and create_credit_note so the two
+    paths can never disagree on when an invoice counts as paid."""
+    settled = round(amount_paid + amount_credited, 2)
+    if settled >= total:
+        return "paid"
+    if settled > 0:
+        return "partially_paid"
+    return fallback_status
 
 
 def record_payment(invoice_id: str, amount: float, paid_at: str, method: str = "bank_transfer",
@@ -824,7 +887,8 @@ def record_payment(invoice_id: str, amount: float, paid_at: str, method: str = "
     payments = get_payments(invoice_id)
     amount_paid = round(sum(float(p.get("amount") or 0) for p in payments), 2)
     total = float(invoice.get("total") or 0)
-    new_status = "paid" if amount_paid >= total else ("partially_paid" if amount_paid > 0 else invoice["status"])
+    amount_credited = float(invoice.get("amount_credited") or 0)
+    new_status = _settle_invoice_status(amount_paid, amount_credited, total, invoice["status"])
 
     sb.table("billing_invoices").update({
         "amount_paid": amount_paid,
@@ -836,6 +900,137 @@ def record_payment(invoice_id: str, amount: float, paid_at: str, method: str = "
         update_order(invoice["order_id"], status="paid")
 
     return get_invoice(invoice_id)
+
+
+# ── Credit Notes ──────────────────────────────────────────────────────────────
+# The GST-compliant way to correct a sent invoice: its own numbered document,
+# referencing the original, reducing what's owed — the invoice itself is never
+# rewritten (delete_invoice already refuses anything past draft status).
+
+def get_credit_notes(invoice_id: str = None) -> list:
+    sb = _sb()
+    if not sb:
+        return []
+    q = sb.table("billing_credit_notes").select("*").order("created_at", desc=True)
+    if invoice_id:
+        q = q.eq("invoice_id", invoice_id)
+    return q.execute().data or []
+
+
+def get_credit_note(credit_note_id: str) -> dict | None:
+    sb = _sb()
+    if not sb:
+        return None
+    res = sb.table("billing_credit_notes").select("*").eq("id", credit_note_id).limit(1).execute()
+    if not res.data:
+        return None
+    note = res.data[0]
+    items = sb.table("billing_credit_note_items").select("*") \
+        .eq("credit_note_id", credit_note_id).order("sort_order").execute()
+    note["items"] = items.data or []
+    return note
+
+
+def create_credit_note(invoice_id: str, items: list, reason: str,
+                        issue_date: str = None, notes: str = None) -> dict:
+    """Reuses the ORIGINAL invoice's snapshotted company_state/recipient_state
+    (not a fresh lookup) — a credit note corrects that specific invoice, so
+    its tax jurisdiction facts must match what was actually charged, even if
+    the client's or company's profile has changed since."""
+    sb = _sb()
+    if not sb:
+        return {}
+    invoice = get_invoice(invoice_id)
+    if not invoice:
+        raise ValueError("Invoice not found")
+    if invoice["status"] in ("draft", "cancelled"):
+        raise ValueError(f"Can't issue a credit note against a {invoice['status']} invoice")
+    if not (reason or "").strip():
+        raise ValueError("A reason is required for a credit note")
+
+    company_state = invoice.get("company_state", "")
+    recipient_state = invoice.get("recipient_state", "")
+
+    line_rows = []
+    taxable_total = cgst_total = sgst_total = igst_total = 0.0
+    for idx, item in enumerate(items or []):
+        qty = float(item.get("quantity", 1) or 1)
+        unit_price = float(item.get("unit_price", 0) or 0)
+        taxable_amount = round(qty * unit_price, 2)
+        gst_rate = float(item.get("gst_rate_percent", 18) or 0)
+        split = compute_gst_split(company_state, recipient_state, taxable_amount, gst_rate)
+        line_total = round(taxable_amount + split["cgst"] + split["sgst"] + split["igst"], 2)
+        line_rows.append({
+            "description":      item.get("description", ""),
+            "hsn_sac_code":     item.get("hsn_sac_code", ""),
+            "quantity":         qty,
+            "unit_price":       unit_price,
+            "taxable_amount":   taxable_amount,
+            "gst_rate_percent": gst_rate,
+            "cgst_amount":      split["cgst"],
+            "sgst_amount":      split["sgst"],
+            "igst_amount":      split["igst"],
+            "line_total":       line_total,
+            "sort_order":       idx,
+        })
+        taxable_total += taxable_amount
+        cgst_total += split["cgst"]
+        sgst_total += split["sgst"]
+        igst_total += split["igst"]
+
+    if not line_rows:
+        raise ValueError("A credit note needs at least one line item")
+
+    total_tax = round(cgst_total + sgst_total + igst_total, 2)
+    total = round(taxable_total + total_tax, 2)
+
+    existing_credited = float(invoice.get("amount_credited") or 0)
+    invoice_total = float(invoice.get("total") or 0)
+    if existing_credited + total > invoice_total + 0.01:
+        max_creditable = round(invoice_total - existing_credited, 2)
+        raise ValueError(f"This credit note (₹{total:.2f}) would exceed the invoice total — "
+                          f"at most ₹{max_creditable:.2f} can still be credited")
+
+    note_payload = {
+        "invoice_id":         invoice_id,
+        "credit_note_number": next_credit_note_number(),
+        "issue_date":         issue_date or datetime.now(timezone.utc).date().isoformat(),
+        "reason":             reason.strip(),
+        "currency":           "INR",
+        "taxable_amount":     round(taxable_total, 2),
+        "cgst_amount":        round(cgst_total, 2),
+        "sgst_amount":        round(sgst_total, 2),
+        "igst_amount":        round(igst_total, 2),
+        "total_tax":          total_tax,
+        "total":              total,
+        "notes":              notes or "",
+    }
+    res = sb.table("billing_credit_notes").insert(note_payload).execute()
+    note = (res.data or [{}])[0]
+    if not note.get("id"):
+        return note
+
+    for row in line_rows:
+        row["credit_note_id"] = note["id"]
+    sb.table("billing_credit_note_items").insert(line_rows).execute()
+
+    # Recompute amount_credited from the sum of all credit notes against this
+    # invoice — same "sum from the source table" pattern as amount_paid, so it
+    # self-corrects if a credit note is ever adjusted by hand in Supabase.
+    amount_credited = round(sum(float(n.get("total") or 0) for n in get_credit_notes(invoice_id)), 2)
+    amount_paid = float(invoice.get("amount_paid") or 0)
+    new_status = _settle_invoice_status(amount_paid, amount_credited, invoice_total, invoice["status"])
+
+    sb.table("billing_invoices").update({
+        "amount_credited": amount_credited,
+        "status":          new_status,
+        "updated_at":      _now(),
+    }).eq("id", invoice_id).execute()
+
+    if new_status == "paid" and invoice.get("order_id"):
+        update_order(invoice["order_id"], status="paid")
+
+    return get_credit_note(note["id"])
 
 
 # ── Reminders & delivery (manual-assisted WhatsApp, real email send) ────────────
@@ -956,15 +1151,11 @@ def acknowledge_alert(alert_id: str) -> bool:
     return True
 
 
-def generate_invoice_pdf(invoice_id: str) -> bytes:
+def _render_pdf(html: str) -> bytes:
+    """Shared Playwright HTML->PDF render, used by every document type
+    (invoices, credit notes) — reuses the exact tool design_audit.py already
+    uses for screenshotting, no PDF library dependency needed."""
     from playwright.sync_api import sync_playwright
-
-    invoice = get_invoice(invoice_id)
-    if not invoice:
-        raise ValueError("Invoice not found")
-    recipient = get_client(invoice["client_id"]) if invoice.get("client_id") else get_customer(invoice["customer_id"])
-    company_profile = get_settings("billing_company_profile")
-    html = build_invoice_html(invoice, company_profile, recipient or {})
 
     chromium_path = _find_system_chromium()
     with sync_playwright() as pw:
@@ -981,3 +1172,110 @@ def generate_invoice_pdf(invoice_id: str) -> bytes:
                               margin={"top": "0", "bottom": "0", "left": "0", "right": "0"})
         browser.close()
     return pdf_bytes
+
+
+def generate_invoice_pdf(invoice_id: str) -> bytes:
+    invoice = get_invoice(invoice_id)
+    if not invoice:
+        raise ValueError("Invoice not found")
+    recipient = get_client(invoice["client_id"]) if invoice.get("client_id") else get_customer(invoice["customer_id"])
+    company_profile = get_settings("billing_company_profile")
+    html = build_invoice_html(invoice, company_profile, recipient or {})
+    return _render_pdf(html)
+
+
+def build_credit_note_html(credit_note: dict, invoice: dict, company_profile: dict, recipient: dict) -> str:
+    """Same branded shell as the invoice (shared CSS/header/footer helpers) —
+    a credit note is just as much a formal GST document as the invoice it
+    corrects, so it gets the same rigor: HSN/SAC + tax breakup per line,
+    company letterhead, explicit reference back to the original invoice."""
+    items = credit_note.get("items", [])
+    is_interstate = float(credit_note.get("igst_amount") or 0) > 0
+
+    rows_html = "".join(f"""
+        <tr>
+          <td class="mono muted">{i + 1:02d}</td>
+          <td>{it.get('description', '')}</td>
+          <td class="mono muted">{it.get('hsn_sac_code', '') or '—'}</td>
+          <td class="num">{it.get('quantity', '')}</td>
+          <td class="num">₹{_fmt_amount(it.get('unit_price'))}</td>
+          <td class="num">₹{_fmt_amount(it.get('taxable_amount'))}</td>
+          <td class="num muted">{_fmt_amount(it.get('gst_rate_percent'))}%</td>
+          <td class="num">₹{_fmt_amount((it.get('cgst_amount') or 0) + (it.get('sgst_amount') or 0) + (it.get('igst_amount') or 0))}</td>
+          <td class="num strong">₹{_fmt_amount(it.get('line_total'))}</td>
+        </tr>
+    """ for i, it in enumerate(items))
+
+    tax_rows = (
+        f'<div class="totrow"><span>IGST</span><span>₹{_fmt_amount(credit_note.get("igst_amount"))}</span></div>'
+        if is_interstate else
+        f'<div class="totrow"><span>CGST</span><span>₹{_fmt_amount(credit_note.get("cgst_amount"))}</span></div>'
+        f'<div class="totrow"><span>SGST</span><span>₹{_fmt_amount(credit_note.get("sgst_amount"))}</span></div>'
+    )
+
+    logo = _logo_data_uri()
+    logo_html = f'<img class="logo" src="{logo}" alt="Lumynor Systems" />' if logo else '<div class="logo-fallback">LUMYNOR</div>'
+
+    reason_html = f'<div class="panel panel-wide"><div class="panel-label">Reason</div><p class="muted">{credit_note.get("reason", "")}</p></div>'
+    notes_html = f'<div class="panel panel-wide"><div class="panel-label">Notes</div><p class="muted">{credit_note.get("notes", "")}</p></div>' if credit_note.get("notes") else ""
+
+    dates_html = (
+        f"Issue Date: {credit_note.get('issue_date', '')}<br/>"
+        f"Against Invoice: {invoice.get('invoice_number', '')}"
+    )
+    header_html = _pdf_header_html("Credit Note", credit_note.get('credit_note_number', ''), dates_html, company_profile, logo_html)
+
+    return f"""<!doctype html><html><head><meta charset="utf-8"/>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+<style>{_pdf_style_block()}</style></head>
+<body>
+  <div class="accent-bar"></div>
+  {header_html}
+  <div class="page">
+    <div>
+      <div class="bill-to-label">Issued To</div>
+      <div class="bill-to-name">{party_display_name(recipient)}</div>
+      <div class="bill-to-detail">
+        {recipient.get('billing_address', '')}<br/>
+        {recipient.get('state', '')}
+        {('&nbsp;·&nbsp;GSTIN ' + recipient.get('gstin', '')) if recipient.get('gstin') else ''}
+      </div>
+    </div>
+
+    <table>
+      <thead><tr>
+        <th style="width:28px">#</th><th>Description</th><th>HSN/SAC</th><th class="num">Qty</th>
+        <th class="num">Rate</th><th class="num">Taxable</th>
+        <th class="num">GST</th><th class="num">Tax</th><th class="num">Total</th>
+      </tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+
+    <div class="totals-row">
+      <div class="totals">
+        <div class="totrow"><span>Taxable Amount</span><span>₹{_fmt_amount(credit_note.get('taxable_amount'))}</span></div>
+        {tax_rows}
+        <div class="totrow grand"><span>Total Credited</span><span>₹{_fmt_amount(credit_note.get('total'))}</span></div>
+      </div>
+    </div>
+
+    {reason_html}
+    {notes_html}
+
+    {_pdf_footer_html(company_profile)}
+  </div>
+</body></html>"""
+
+
+def generate_credit_note_pdf(credit_note_id: str) -> bytes:
+    credit_note = get_credit_note(credit_note_id)
+    if not credit_note:
+        raise ValueError("Credit note not found")
+    invoice = get_invoice(credit_note["invoice_id"])
+    if not invoice:
+        raise ValueError("Invoice not found")
+    recipient = get_recipient(invoice)
+    company_profile = get_settings("billing_company_profile")
+    html = build_credit_note_html(credit_note, invoice, company_profile, recipient or {})
+    return _render_pdf(html)

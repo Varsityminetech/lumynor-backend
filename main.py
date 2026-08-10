@@ -3479,6 +3479,8 @@ _BILLING_PROFILE_DEFAULTS = {
     "upi_id": "",
     "invoice_number_prefix": "INV",
     "fy_invoice_counters": {},
+    "credit_note_number_prefix": "CN",
+    "cn_fy_counters": {},
     "terms_and_conditions": "",
 }
 
@@ -3655,6 +3657,39 @@ def billing_invoice_pdf(invoice_id: str, user=Depends(_require_admin)):
         raise HTTPException(status_code=404, detail=str(e))
     invoice = bill.get_invoice(invoice_id)
     filename = f"{invoice['invoice_number'].replace('/', '-')}.pdf" if invoice else "invoice.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+# Credit Notes ── GST-compliant corrections; the invoice itself is never
+# rewritten, this reduces what's owed via its own referenced document
+@app.get("/api/billing/invoices/{invoice_id}/credit-notes")
+def billing_credit_notes_list(invoice_id: str, user=Depends(_require_admin)):
+    return bill.get_credit_notes(invoice_id=invoice_id)
+
+@app.post("/api/billing/invoices/{invoice_id}/credit-notes")
+def billing_credit_note_create(invoice_id: str, body: dict, user=Depends(_require_admin)):
+    try:
+        note = bill.create_credit_note(
+            invoice_id, items=body.get("items") or [], reason=body.get("reason", ""),
+            issue_date=body.get("issue_date"), notes=body.get("notes"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not note:
+        raise HTTPException(status_code=500, detail="Failed to create credit note")
+    return note
+
+@app.get("/api/billing/credit-notes/{credit_note_id}/pdf")
+def billing_credit_note_pdf(credit_note_id: str, user=Depends(_require_admin)):
+    try:
+        pdf_bytes = bill.generate_credit_note_pdf(credit_note_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    note = bill.get_credit_note(credit_note_id)
+    filename = f"{note['credit_note_number'].replace('/', '-')}.pdf" if note else "credit-note.pdf"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
