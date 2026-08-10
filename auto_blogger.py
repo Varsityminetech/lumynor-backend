@@ -16,7 +16,9 @@ from datetime import datetime
 # Gemini API key string (back-compat) or a config dict from _build_llm_cfg().
 
 # Best Ollama Cloud model for long-form blog writing with reliable JSON output.
-_OLLAMA_DEFAULT_MODEL = "gpt-oss:120b"  # alternatives: deepseek-v3.1:671b, glm-4.6, kimi-k2
+# gpt-oss:120b specifically: oldest model in the chain below (Aug 2025) but the
+# most battle-tested in this codebase — kept as the final fallback on purpose.
+_OLLAMA_DEFAULT_MODEL = "gpt-oss:120b"
 
 
 def _build_llm_cfg(settings: dict, gemini_key: str) -> dict:
@@ -38,8 +40,20 @@ def _build_llm_cfg(settings: dict, gemini_key: str) -> dict:
     if ollama_key:
         # Best-quality model chain — all tasks use this, no fast/small model.
         # Override via OLLAMA_WRITING_MODELS env (comma-separated, best first).
+        #
+        # Updated 2026-08-11: the previous chain (cogito-2.1:671b, qwen3-coder:480b,
+        # nemotron-3-super, gpt-oss:120b, devstral-2:123b) had 3 of 5 entries no
+        # longer in Ollama's cloud catalog at all — confirmed by querying
+        # https://ollama.com/v1/models and /api/tags directly (ground truth, not a
+        # scraped page) — so every single _llm() call was wasting 2-3 dead-model
+        # round trips before reaching a model that actually existed. Every model
+        # below was confirmed live in that same query. Newest/most capable first,
+        # spread across providers (DeepSeek/Zhipu/Moonshot/Nvidia/OpenAI) so one
+        # provider's outage or quota exhaustion doesn't take out the whole chain;
+        # ends in the two entries this codebase already has the most production
+        # experience with.
         writing_models = [m.strip() for m in (os.getenv("OLLAMA_WRITING_MODELS", "") or "").split(",") if m.strip()] \
-            or ["cogito-2.1:671b", "qwen3-coder:480b", "nemotron-3-super", "gpt-oss:120b", "devstral-2:123b"]
+            or ["deepseek-v4-flash:0731", "glm-5.2", "kimi-k3", "nemotron-3-ultra", "nemotron-3-super", "gpt-oss:120b"]
         return {
             "provider": "ollama_cloud",
             "model": writing_models[0],
@@ -106,9 +120,11 @@ def _llm(prompt: str, llm_cfg, json_mode: bool = False, timeout: int = 60, max_t
 
 def _gemini_generate(prompt: str, api_key: str, json_mode: bool = False, timeout: int = 60,
                       max_tokens: int = 8192, disable_thinking: bool = False) -> str:
-    """Call Gemini 2.5 Flash with retry/backoff on transient errors (429/503).
+    """Call Gemini 3.6 Flash (upgraded 2026-08-11 from 2.5 Flash — GA, "balances
+    speed with intelligence... strong performance in agentic and multimodal tasks"
+    per Google's own model docs) with retry/backoff on transient errors (429/503).
 
-    disable_thinking: gemini-2.5-flash is a THINKING model — its reasoning tokens are
+    disable_thinking: Gemini Flash models are THINKING models — reasoning tokens are
     billed against the SAME maxOutputTokens budget as the answer. This is opt-in
     (default False, unchanged for every existing caller) because thinking can genuinely
     help on complex tasks. But for a caller with a tight token cap and a task that's
@@ -117,9 +133,17 @@ def _gemini_generate(prompt: str, api_key: str, json_mode: bool = False, timeout
     (thinking consumed the whole budget, leaving no room for the actual answer — not
     even a partial one), and reproduced itself in the main audit-evaluation call the
     day this parameter was added. Callers on a tight max_tokens budget for a
-    non-reasoning task should pass True."""
+    non-reasoning task should pass True.
+
+    IMPORTANT (2026-08-11, 2.5->3.6 upgrade): the old gemini-2.5-flash
+    thinkingBudget:0 was a HARD cap — 0 truly meant zero reasoning tokens. Gemini
+    3.x replaced it with thinkingLevel, and per Google's own docs "minimal" is a
+    SOFT preference: "does not guarantee thinking is off, the model may reason
+    very minimally for complex tasks." If the old budget-exhaustion failure mode
+    reappears on a genuinely complex disable_thinking=True call, that's why — it
+    is no longer a guarantee, just the lowest available setting."""
     import time
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -131,7 +155,7 @@ def _gemini_generate(prompt: str, api_key: str, json_mode: bool = False, timeout
         payload["generationConfig"]["responseMimeType"] = "application/json"
         payload["generationConfig"]["temperature"] = 0.5
     if disable_thinking:
-        payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
+        payload["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "minimal"}
 
     data = json.dumps(payload).encode("utf-8")
     last_err = None
@@ -3967,7 +3991,7 @@ def run_auto_blog_pipeline(settings: dict, gemini_key: str, recent_topics: list 
     if llm_cfg.get("provider") in ("ollama_cloud", "ollama"):
         log.append(f"🧠 LLM: ollama_cloud · models={'/'.join(llm_cfg.get('writing_models', []))} (best-quality chain, no fast model)")
     else:
-        log.append("🧠 LLM: gemini (gemini-2.5-flash)")
+        log.append("🧠 LLM: gemini (gemini-3.6-flash)")
     _serper_key_log = os.getenv("SERPER_API_KEY", "")
     _search_chain = ("Tavily (advanced)" if tavily_key else "") + \
                     (" → Google/Serper" if _serper_key_log else "") + \

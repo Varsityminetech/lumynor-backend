@@ -1589,7 +1589,7 @@ _OPENAI_COMPATIBLE = {
 # Default model per cloud provider (used when the configured model is empty or is
 # the local Ollama default that doesn't apply to a cloud provider).
 _LLM_DEFAULT_MODEL = {
-    "gemini":     "gemini-2.5-flash",
+    "gemini":     "gemini-3.6-flash",
     "openai":     "gpt-4o",
     "anthropic":  "claude-opus-4-8",
     "openrouter": "openai/gpt-4o",
@@ -2118,7 +2118,7 @@ class AutoBlogSettingsUpdateRequest(BaseModel):
     # LLM passthrough (optional, uses system env if omitted)
     llmProvider: str = "api"
     llmApiName: str = "gemini"
-    llmModelName: str = "gemini-2.5-flash"
+    llmModelName: str = "gemini-3.6-flash"
     llmApiKey: str = ""
     llmBaseUrl: str = ""
 
@@ -2695,7 +2695,7 @@ class AutoBlogSettingsUpdateRequestV2(BaseModel):
     tone: str = "Technical Expert"
     llmProvider: str = "api"
     llmApiName: str = "gemini"
-    llmModelName: str = "gemini-2.5-flash"
+    llmModelName: str = "gemini-3.6-flash"
     llmApiKey: str = ""
     llmBaseUrl: str = ""
     nanobanana_key: str = ""

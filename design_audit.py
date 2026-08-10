@@ -997,20 +997,27 @@ def _visual_review(page_data: dict, gemini_key: str) -> dict | None:
         "contents": [{"parts": parts}],
         "generationConfig": {
             "temperature": 0.3,                      # low — this is assessment, not prose
-            # gemini-2.5-flash is a THINKING model: its reasoning tokens are billed
-            # against maxOutputTokens. Reasoning over a screenshot burned the entire
-            # old 1200-token budget, so the API returned finishReason=MAX_TOKENS with a
-            # `content` that has no `parts` at all — the parse below raised KeyError, it
-            # was swallowed, and vision silently never ran. Thinking buys nothing on a
-            # "describe what you see" task, so switch it off and give the budget to the
-            # answer (8192 matches _gemini_generate in auto_blogger.py).
-            "thinkingConfig": {"thinkingBudget": 0},
+            # gemini-3.6-flash is a THINKING model: its reasoning tokens are billed
+            # against maxOutputTokens. Reasoning over a screenshot once burned an
+            # entire 1200-token budget on gemini-2.5-flash, so the API returned
+            # finishReason=MAX_TOKENS with a `content` that has no `parts` at all —
+            # vision silently never ran (see the `if not txt` handling below, added
+            # when that was fixed — it now reports the failure honestly instead of
+            # crashing, which is the safety net for the rest of this comment).
+            # Thinking buys nothing on a "describe what you see" task, so minimize it.
+            # NOTE (2026-08-11 model upgrade from 2.5-flash): 3.x replaced the old
+            # thinkingBudget (a hard token cap — 0 truly meant zero reasoning tokens)
+            # with thinkingLevel. Per Google's own docs, "minimal" is a SOFT
+            # preference — "does not guarantee thinking is off, the model may reason
+            # very minimally for complex tasks." If empty/truncated vision responses
+            # reappear, that's why: this is no longer a hard guarantee.
+            "thinkingConfig": {"thinkingLevel": "minimal"},
             "maxOutputTokens": 8192,
             "responseMimeType": "application/json",
         },
     }
     api = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           f"gemini-2.5-flash:generateContent?key={gemini_key}")
+           f"gemini-3.6-flash:generateContent?key={gemini_key}")
     try:
         r = requests.post(api, json=payload, timeout=90)
         if not r.ok:
@@ -1590,12 +1597,17 @@ Return ONLY valid JSON — no markdown fences, no explanation outside the JSON."
         # json_mode=True: force structured output instead of hoping the "Return ONLY
         # valid JSON" instruction is obeyed — a stray preface or an imperfect markdown
         # fence previously left nothing for the regex extractor below to find at all.
-        # disable_thinking=True: gemini-2.5-flash is a thinking model; its reasoning
-        # tokens bill against this SAME 4000-token cap. This exact combination (tight
-        # cap + thinking enabled) already silently killed the vision pass for weeks
+        # disable_thinking=True: Gemini Flash models think; reasoning tokens bill
+        # against this SAME 4000-token cap. This exact combination (tight cap +
+        # thinking enabled) already silently killed the vision pass for weeks
         # before that call got this same fix, and reproduced itself here — a live
         # "LLM did not return valid JSON" failure on a real audit is what sent me
-        # back to patch it on this call too.
+        # back to patch it on this call too. Since the 2026-08-11 gemini-3.6-flash
+        # upgrade, disable_thinking maps to thinkingLevel:"minimal" — Google's docs
+        # call that a SOFT preference ("may reason very minimally for complex
+        # tasks"), not the old hard thinkingBudget:0 cap. A 41-point evaluation is
+        # exactly the kind of "complex task" that caveat is about — if malformed-JSON
+        # failures reappear here specifically, check this first.
         raw = _llm(
             f"{_system_prompt(mode)}\n\n{user_prompt}",
             llm_cfg,
