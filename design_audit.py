@@ -568,7 +568,21 @@ def _fetch_page_playwright(url: str) -> dict:
             page = context.new_page()
 
             try:
-                resp = page.goto(url, wait_until="networkidle", timeout=30_000)
+                # "networkidle" (0 in-flight connections for 500ms) sounds like the
+                # right thing to wait for but is a known Playwright footgun on real
+                # sites: a WhatsApp/live-chat widget, analytics beacon, or any
+                # persistent/polling connection means network activity never truly
+                # stops, so goto() hard-times-out at 30s and throws — caught by
+                # _fetch_page()'s broad except, silently degrading the ENTIRE audit
+                # to the plain-HTTP fallback (no contrast probe, no mobile pass, no
+                # vision pass — confirmed live on a real Next.js site with a WhatsApp
+                # widget: fast page, real content, 30s Playwright timeout anyway).
+                # UXRay's own audience — small businesses — are exactly the sites
+                # most likely to carry a WhatsApp/chat widget. domcontentloaded
+                # fires on a real, well-defined event instead of "all network
+                # activity everywhere stopped", and the fixed hydration wait right
+                # below already covers giving client-side JS time to mount.
+                resp = page.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 result["status_code"] = resp.status if resp else None
                 # Extra wait for React hydration / lazy mounts
                 page.wait_for_timeout(2_500)
@@ -742,7 +756,9 @@ def _fetch_page_playwright(url: str) -> dict:
                                    "Mobile/15E148 Safari/604.1",
                     )
                     m_page = m_ctx.new_page()
-                    m_page.goto(url, wait_until="networkidle", timeout=30_000)
+                    # Same networkidle footgun as the desktop goto() above — see that
+                    # comment. Kept consistent between both renders on purpose.
+                    m_page.goto(url, wait_until="domcontentloaded", timeout=30_000)
                     m_page.wait_for_timeout(2_000)
                     result["mobile"] = m_page.evaluate(_JS_MOBILE)
                     try:
