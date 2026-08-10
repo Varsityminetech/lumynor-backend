@@ -1482,6 +1482,30 @@ def run_audit(url: str, pages: list = None, notes: str = "", auditor_notes: str 
     if not has_content:
         return {"error": f"Reached {url} but extracted no usable content (empty, bot-blocked, or JS-walled page). No audit was run."}
 
+    # A bot/security interstitial (Cloudflare "Attention Required", a WAF's
+    # "Access Denied", a CAPTCHA challenge, etc.) DOES have a title and text —
+    # a real error page, unlike a blank JS-walled one — so it slips past the
+    # has_content check above. Confirmed live: godaddy.com's headless-browser
+    # block page scored 1/10 with 19 "critical issues" (the LLM's own summary
+    # even said "the site returns a 403 Access Denied error" — it correctly
+    # read the page, but the system still let a fabricated grade of GoDaddy's
+    # actual design through). Refuse to score, same as the other unreachable
+    # cases above — a false "your site is terrible" verdict is worse than no
+    # verdict for a product whose entire pitch is trustworthy grading.
+    status = page_data.get("status_code")
+    block_signals = (
+        "access denied", "attention required", "just a moment", "checking your browser",
+        "verify you are a human", "are you a robot", "pardon our interruption",
+        "request unsuccessful", "you have been blocked", "403 forbidden",
+        "unusual traffic", "security check", "enable javascript and cookies",
+    )
+    page_text = f"{page_data.get('title', '')} {page_data.get('hero_text', '')}".lower()
+    if (isinstance(status, int) and status in (401, 403, 429, 503)) or any(sig in page_text for sig in block_signals):
+        return {"error": f"Reached {url} but got blocked by bot/security protection "
+                          f"(HTTP {status or 'unknown'}) instead of the real page. No audit was run — "
+                          f"this usually means the site's firewall (Cloudflare, etc.) is blocking "
+                          f"automated browsers, not a real design problem."}
+
     pagespeed = _fetch_pagespeed(url)
 
     # Look at the page with actual eyes. This is what makes the visual checkpoints
