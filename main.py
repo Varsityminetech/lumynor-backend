@@ -96,7 +96,13 @@ def quota_check(request: Request, limit: int, window_seconds: int, scope: str) -
 
 def quota_charge(request: Request, scope: str) -> None:
     """Consume one slot — call ONLY after the expensive operation succeeded."""
-    key = f"{scope}:{_client_ip(request)}"
+    quota_charge_ip(_client_ip(request), scope)
+
+
+def quota_charge_ip(ip: str, scope: str) -> None:
+    """Same as quota_charge but takes a raw IP — for background threads that
+    finish after the originating Request object is gone."""
+    key = f"{scope}:{ip}"
     with _rl_lock:
         _rl_hits[key].append(time.time())
 
@@ -892,6 +898,53 @@ def _teaser_from_report(report: dict) -> dict:
     }
 
 
+# A full audit legitimately takes 2-5+ minutes (two headless renders, vision
+# pass, PageSpeed with retries, 41-point LLM evaluation) — but Railway's edge
+# proxy kills any request at ~300s. Running the pipeline inside one synchronous
+# POST meant heavy sites waited five minutes and then got a naked 502 "upstream
+# error" (confirmed live on linear.app), with the audit still completing
+# server-side, invisibly. So: submit returns a job id instantly, the pipeline
+# runs in a background thread, and the frontend polls status. In-memory job
+# store is deliberate — jobs live minutes, and on the rare redeploy mid-audit
+# the poll 404s into a clean "please try again" rather than anything silent.
+_PUBLIC_AUDIT_JOBS: dict = {}
+_PUBLIC_AUDIT_JOBS_LOCK = None  # created lazily; threading imported where used
+
+
+def _audit_jobs_lock():
+    global _PUBLIC_AUDIT_JOBS_LOCK
+    import threading
+    if _PUBLIC_AUDIT_JOBS_LOCK is None:
+        _PUBLIC_AUDIT_JOBS_LOCK = threading.Lock()
+    return _PUBLIC_AUDIT_JOBS_LOCK
+
+
+def _run_public_audit_job(job_id: str, url: str, is_admin: bool, client_ip: str):
+    SCOPE = "public_audit"
+    try:
+        # Always 'generic': it's the visitor's own site, so grade it on its own
+        # merits against universal UX principles — never Lumynor's design system.
+        report = da.run_audit(url, pages=[url], notes="", auditor_notes="", mode="generic")
+        if report.get("error"):
+            # Unreachable/blocked/invalid — nothing was spent, charge nothing.
+            with _audit_jobs_lock():
+                _PUBLIC_AUDIT_JOBS[job_id] = {"status": "error", "error": report["error"], "at": time.time()}
+            return
+        if not is_admin:
+            quota_charge_ip(client_ip, SCOPE)   # only now did we actually spend money
+        saved = da.save_audit(report)
+        with _audit_jobs_lock():
+            _PUBLIC_AUDIT_JOBS[job_id] = {"status": "done", "teaser": _teaser_from_report(saved), "at": time.time()}
+    except Exception as e:
+        print(f"[public_audit] job {job_id} crashed: {e}")
+        with _audit_jobs_lock():
+            _PUBLIC_AUDIT_JOBS[job_id] = {
+                "status": "error",
+                "error": "The audit hit an unexpected error. Please try again in a minute.",
+                "at": time.time(),
+            }
+
+
 @app.post("/api/public/audit")
 def public_audit(
     body: dict,
@@ -900,11 +953,14 @@ def public_audit(
     # with invalid input. Generous, because rejected requests cost us nothing.
     _rl=Depends(rate_limit(20, 3600, "public_audit_hammer")),
 ):
-    """Public: run a design audit, return only the teaser.
+    """Public: start a design audit job, return its id immediately.
 
-    Quota is 3 REAL audits/hour per IP, charged only when an audit actually runs —
-    so typos and blocked URLs (which cost nothing) never eat a visitor's quota.
+    Quota is 3 REAL audits/hour per IP, charged only when an audit actually
+    completes — typos, blocked URLs, and failed runs never eat a visitor's quota.
     """
+    import threading
+    import uuid as _uuid
+
     AUDIT_QUOTA, WINDOW, SCOPE = 3, 3600, "public_audit"
 
     url = (body.get("url") or "").strip()
@@ -921,17 +977,43 @@ def public_audit(
     if not is_admin:
         quota_check(request, AUDIT_QUOTA, WINDOW, SCOPE)
 
-    # Always 'generic': it's the visitor's own site, so grade it on its own merits
-    # against universal UX principles — never against Lumynor's design system.
-    report = da.run_audit(url, pages=[url], notes="", auditor_notes="", mode="generic")
-    if report.get("error"):
-        # Unreachable/invalid/blocked URL — nothing was spent, so charge nothing.
-        raise HTTPException(status_code=400, detail=report["error"])
+    # Prune stale jobs so the store can't grow unboundedly.
+    now = time.time()
+    with _audit_jobs_lock():
+        for jid in [j for j, v in _PUBLIC_AUDIT_JOBS.items() if now - v.get("at", now) > 1800]:
+            del _PUBLIC_AUDIT_JOBS[jid]
 
-    if not is_admin:
-        quota_charge(request, SCOPE)       # only now did we actually spend money
-    saved = da.save_audit(report)          # persist full report; teaser references its id
-    return _teaser_from_report(saved)
+    job_id = str(_uuid.uuid4())
+    with _audit_jobs_lock():
+        _PUBLIC_AUDIT_JOBS[job_id] = {"status": "running", "at": now}
+
+    threading.Thread(
+        target=_run_public_audit_job,
+        args=(job_id, url, is_admin, _client_ip(request)),
+        daemon=True,
+    ).start()
+    return {"job_id": job_id, "status": "running"}
+
+
+@app.get("/api/public/audit/status/{job_id}")
+def public_audit_status(
+    job_id: str,
+    # Polling every few seconds for minutes is normal — this guard only stops
+    # actual abuse, not legitimate polling.
+    _rl=Depends(rate_limit(1200, 3600, "public_audit_poll")),
+):
+    with _audit_jobs_lock():
+        job = _PUBLIC_AUDIT_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail="This audit is no longer tracked (the server may have restarted). Please run it again.",
+        )
+    if job["status"] == "running":
+        return {"status": "running"}
+    if job["status"] == "error":
+        return {"status": "error", "error": job["error"]}
+    return {"status": "done", **job["teaser"]}
 
 
 @app.post("/api/public/audit/unlock")
